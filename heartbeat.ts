@@ -3,15 +3,19 @@
  *
  * Reads `heartbeat.md` from the repo root on a configurable interval,
  * parses pending tasks, and wakes the agent to perform them when idle.
+ * Monitors context window usage and warns at 75%/90% thresholds.
  *
  * Tools:
  *   heartbeat_complete     - Mark a task done and append a log entry
  *   heartbeat_new_session  - Spawn a new session for a complex task
+ *   heartbeat_context      - Check context window usage (tokens/percent/remaining)
  *
  * Commands:
- *   /heartbeat        - Manual trigger (immediate check)
- *   /heartbeat-status - Show interval, next check, pending tasks
- *   /heartbeat-toggle - Enable/disable the timer
+ *   /heartbeat         - Manual trigger (immediate check)
+ *   /heartbeat-context - Show current context window usage
+ *   /heartbeat-status  - Show interval, next check, pending tasks
+ *   /heartbeat-toggle  - Enable/disable the timer
+ *   /heartbeat-handoff - Start a fresh session (preserves heartbeat tasks)
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
@@ -42,6 +46,8 @@ interface ParsedHeartbeat {
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_LOG_DAYS = 7;
+const CONTEXT_WARN_PERCENT = 75;
+const CONTEXT_CRITICAL_PERCENT = 90;
 
 function parseInterval(value: string): number {
   const match = value.trim().match(/^(\d+)\s*(s|m|h)$/i);
@@ -272,6 +278,7 @@ export default function (pi: ExtensionAPI) {
   let lastError: string | null = null;
   let cwd = "";
   let sessionCompletedCount = 0;
+  let lastWarningPercent = 0;
 
   // --- Helpers ---
 
@@ -402,6 +409,7 @@ export default function (pi: ExtensionAPI) {
     pendingWakeup = false;
     lastError = null;
     sessionCompletedCount = 0;
+    lastWarningPercent = 0;
 
     // Read config from heartbeat.md if it exists
     const parsed = await readHeartbeatFile();
@@ -425,6 +433,53 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // Proactive context usage monitoring — warn at 75% and 90%
+  pi.on("turn_end", async (_event, ctx) => {
+    try {
+      const usage = ctx.getContextUsage();
+      if (!usage || usage.contextWindow === 0) return;
+
+      const percent = usage.percent;
+      let warning: string | null = null;
+
+      if (
+        percent >= CONTEXT_CRITICAL_PERCENT &&
+        lastWarningPercent < CONTEXT_CRITICAL_PERCENT
+      ) {
+        warning =
+          `⚠️ **Context window critically full (${percent.toFixed(0)}%)**\n` +
+          `Using ${usage.tokens.toLocaleString()} of ${usage.contextWindow.toLocaleString()} tokens.\n` +
+          `Only ${(usage.contextWindow - usage.tokens).toLocaleString()} tokens remain.\n\n` +
+          `**Action required:** Use \`/heartbeat-handoff\` to start a fresh session, ` +
+          `or finish your current task and call \`heartbeat_complete\`.`;
+        lastWarningPercent = CONTEXT_CRITICAL_PERCENT;
+      } else if (
+        percent >= CONTEXT_WARN_PERCENT &&
+        lastWarningPercent < CONTEXT_WARN_PERCENT
+      ) {
+        warning =
+          `⚡ **Context window ${percent.toFixed(0)}% full** — ` +
+          `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()} tokens.\n` +
+          `Consider wrapping up the current task soon. ` +
+          `Use \`heartbeat_context\` to check exact usage or \`/heartbeat-handoff\` to start fresh.`;
+        lastWarningPercent = CONTEXT_WARN_PERCENT;
+      }
+
+      if (warning) {
+        pi.sendMessage(
+          {
+            customType: "heartbeat-context-warning",
+            content: warning,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      }
+    } catch {
+      // getContextUsage may not be available — ignore silently
+    }
+  });
+
   // Inject heartbeat context before compaction so the LLM retains task awareness
   pi.on("session_before_compact", async (_event, _ctx) => {
     const parsed = await readHeartbeatFile();
@@ -444,6 +499,11 @@ export default function (pi: ExtensionAPI) {
       },
       { triggerTurn: false },
     );
+  });
+
+  // Reset warning threshold after compaction (context shrinks significantly)
+  pi.on("session_compact", async () => {
+    lastWarningPercent = 0;
   });
 
   pi.on("session_shutdown", async () => {
@@ -595,6 +655,70 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // --- Tool: heartbeat_context ---
+
+  pi.registerTool({
+    name: "heartbeat_context",
+    label: "Heartbeat Context Usage",
+    description:
+      "Check current context window usage. Returns token count, context window size, " +
+      "usage percentage, and remaining tokens. Use this to decide whether to wrap up " +
+      "the current task or start a new session via /heartbeat-handoff.",
+    parameters: Type.Object({}),
+
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      try {
+        const usage = ctx.getContextUsage();
+        if (!usage || usage.contextWindow === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Context usage data not available.",
+              },
+            ],
+            details: {},
+          };
+        }
+
+        const remaining = usage.contextWindow - usage.tokens;
+        const percent = usage.percent;
+        const warning =
+          percent >= 80
+            ? `\n\n⚠️ Context is ${percent.toFixed(0)}% full — consider using /heartbeat-handoff to start a fresh session.`
+            : "";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Context usage: ${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()} tokens (${percent.toFixed(1)}%)\n` +
+                `Remaining: ${remaining.toLocaleString()} tokens` +
+                warning,
+            },
+          ],
+          details: {
+            tokens: usage.tokens,
+            contextWindow: usage.contextWindow,
+            percent: Math.round(percent * 10) / 10,
+            remaining,
+          },
+        };
+      } catch {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: unable to retrieve context usage.",
+            },
+          ],
+          details: {},
+        };
+      }
+    },
+  });
+
   // --- Commands ---
 
   pi.registerCommand("heartbeat", {
@@ -619,6 +743,53 @@ export default function (pi: ExtensionAPI) {
         "info",
       );
       pi.sendUserMessage(buildTaskMessage(pending));
+    },
+  });
+
+  pi.registerCommand("heartbeat-context", {
+    description: "Show current context window usage",
+    handler: async (_args, ctx) => {
+      try {
+        const usage = ctx.getContextUsage();
+        if (!usage || usage.contextWindow === 0) {
+          ctx.ui.notify("Context usage data not available", "warning");
+          return;
+        }
+
+        const remaining = usage.contextWindow - usage.tokens;
+        const percent = usage.percent;
+
+        let advisory: string;
+        if (percent >= CONTEXT_CRITICAL_PERCENT) {
+          advisory =
+            "🔴 Critical — start a fresh session with `/heartbeat-handoff`";
+        } else if (percent >= CONTEXT_WARN_PERCENT) {
+          advisory = "🟡 High — consider wrapping up soon";
+        } else if (percent >= 50) {
+          advisory = "🟢 Moderate — plenty of room";
+        } else {
+          advisory = "🟢 Low — full capacity available";
+        }
+
+        const lines = [
+          "**Context Usage**",
+          `- Tokens: ${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()}`,
+          `- Used: ${percent.toFixed(1)}%`,
+          `- Remaining: ${remaining.toLocaleString()} tokens`,
+          `- Status: ${advisory}`,
+        ];
+
+        pi.sendMessage(
+          {
+            customType: "heartbeat-context-usage",
+            content: lines.join("\n"),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } catch {
+        ctx.ui.notify("Unable to retrieve context usage", "error");
+      }
     },
   });
 
@@ -699,6 +870,29 @@ export default function (pi: ExtensionAPI) {
       }
 
       updateStatus(ctx);
+    },
+  });
+
+  pi.registerCommand("heartbeat-handoff", {
+    description:
+      "Start a fresh session, preserving heartbeat tasks for the new context",
+    handler: async (_args, ctx) => {
+      const parsed = await readHeartbeatFile();
+      const pendingCount = parsed ? pendingTasks(parsed).length : 0;
+
+      ctx.ui.notify(
+        `Handing off: ${sessionCompletedCount} completed, ${pendingCount} remaining. Starting fresh session...`,
+        "info",
+      );
+
+      try {
+        ctx.newSession();
+      } catch (e) {
+        ctx.ui.notify(
+          `Handoff failed: ${e instanceof Error ? e.message : String(e)}`,
+          "error",
+        );
+      }
     },
   });
 }
