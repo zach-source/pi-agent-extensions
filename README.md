@@ -4,6 +4,7 @@ Extensions for the [Pi coding agent](https://github.com/badlogic/pi-mono/tree/ma
 
 ## Extensions
 
+- **bmad.ts** - BMAD Method (Breakthrough Method for Agile AI-Driven Development) with 4 phases, 13 workflow commands, and 4 LLM-callable tools
 - **graphiti.ts** - Graphiti temporal knowledge graph integration (search, add memories, status)
 - **heartbeat.ts** - Periodic task runner that reads `heartbeat.md` and wakes the agent to work through tasks
 
