@@ -30,10 +30,21 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { join, basename } from "path";
 import { homedir } from "os";
+
+// Local StringEnum helper (avoids runtime dependency on @mariozechner/pi-ai)
+function StringEnum<T extends readonly string[]>(
+  values: T,
+  options?: Record<string, unknown>,
+) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+    ...options,
+  });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types

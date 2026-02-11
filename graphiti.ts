@@ -14,7 +14,18 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
+
+// Local StringEnum helper (avoids runtime dependency on @mariozechner/pi-ai)
+function StringEnum<T extends readonly string[]>(
+  values: T,
+  options?: Record<string, unknown>,
+) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+    ...options,
+  });
+}
 
 const GRAPHITI_URL = "http://127.0.0.1:51847/mcp/";
 const PROTOCOL_VERSION = "2025-03-26";
@@ -67,7 +78,9 @@ function parseSSE(body: string): JsonRpcResponse {
   };
 }
 
-async function mcpPost(payload: Record<string, unknown>): Promise<JsonRpcResponse> {
+async function mcpPost(
+  payload: Record<string, unknown>,
+): Promise<JsonRpcResponse> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
@@ -154,7 +167,9 @@ async function callTool(
   }
 
   try {
-    const resp = await mcpPost(jsonrpc("tools/call", { name, arguments: args }));
+    const resp = await mcpPost(
+      jsonrpc("tools/call", { name, arguments: args }),
+    );
 
     if (resp.error) {
       return { text: `RPC error: ${resp.error.message}`, isError: true };
@@ -184,7 +199,8 @@ async function callTool(
 const SearchParams = Type.Object({
   query: Type.String({ description: "Search query (natural language)" }),
   mode: StringEnum(["nodes", "facts", "both"] as const, {
-    description: "Search mode: nodes (entities), facts (relationships), or both",
+    description:
+      "Search mode: nodes (entities), facts (relationships), or both",
   }),
   group: Type.Optional(
     Type.String({ description: "Filter by group ID (default: all groups)" }),
@@ -208,7 +224,8 @@ const AddParams = Type.Object({
   ),
   group: Type.Optional(
     Type.String({
-      description: "Group ID for this memory (recommended to avoid mixing projects)",
+      description:
+        "Group ID for this memory (recommended to avoid mixing projects)",
     }),
   ),
 });
@@ -296,7 +313,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "graphiti_status",
     label: "Graphiti Status",
-    description: "Check if the Graphiti knowledge graph server is running and healthy.",
+    description:
+      "Check if the Graphiti knowledge graph server is running and healthy.",
     parameters: Type.Object({}),
 
     async execute() {

@@ -24,19 +24,19 @@ import { join } from "path";
 
 // --- Types ---
 
-interface HeartbeatConfig {
+export interface HeartbeatConfig {
   intervalMs: number;
   logDays: number;
 }
 
-interface HeartbeatTask {
+export interface HeartbeatTask {
   raw: string;
   description: string;
   completed: boolean;
   completedInfo?: string;
 }
 
-interface ParsedHeartbeat {
+export interface ParsedHeartbeat {
   config: HeartbeatConfig;
   tasks: HeartbeatTask[];
   rawContent: string;
@@ -44,12 +44,12 @@ interface ParsedHeartbeat {
 
 // --- Parsing ---
 
-const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-const DEFAULT_LOG_DAYS = 7;
-const CONTEXT_WARN_PERCENT = 75;
-const CONTEXT_CRITICAL_PERCENT = 90;
+export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+export const DEFAULT_LOG_DAYS = 7;
+export const CONTEXT_WARN_PERCENT = 75;
+export const CONTEXT_CRITICAL_PERCENT = 90;
 
-function parseInterval(value: string): number {
+export function parseInterval(value: string): number {
   const match = value.trim().match(/^(\d+)\s*(s|m|h)$/i);
   if (!match) return DEFAULT_INTERVAL_MS;
   const num = parseInt(match[1], 10);
@@ -65,7 +65,7 @@ function parseInterval(value: string): number {
   }
 }
 
-function parseHeartbeat(content: string): ParsedHeartbeat {
+export function parseHeartbeat(content: string): ParsedHeartbeat {
   const config: HeartbeatConfig = {
     intervalMs: DEFAULT_INTERVAL_MS,
     logDays: DEFAULT_LOG_DAYS,
@@ -106,12 +106,12 @@ function parseHeartbeat(content: string): ParsedHeartbeat {
   return { config, tasks, rawContent: content };
 }
 
-function formatTimestamp(): string {
+export function formatTimestamp(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
   if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
   return `${(ms / 3_600_000).toFixed(1)}h`;
@@ -119,11 +119,11 @@ function formatDuration(ms: number): string {
 
 // --- Daily log helpers ---
 
-function formatDateStr(date: Date): string {
+export function formatDateStr(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function formatTimeStr(date: Date): string {
+export function formatTimeStr(date: Date): string {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
@@ -216,7 +216,7 @@ async function getLogStats(
 
 // --- Compaction preamble ---
 
-function buildCompactionPreamble(
+export function buildCompactionPreamble(
   pending: HeartbeatTask[],
   completed: HeartbeatTask[],
 ): string {
