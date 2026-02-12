@@ -27,7 +27,7 @@ function StringEnum<T extends readonly string[]>(
   });
 }
 
-const GRAPHITI_URL = "http://127.0.0.1:51847/mcp/";
+const GRAPHITI_URL = process.env.GRAPHITI_URL || "http://127.0.0.1:51847/mcp/";
 const PROTOCOL_VERSION = "2025-03-26";
 
 // --- MCP-over-HTTP client ---
