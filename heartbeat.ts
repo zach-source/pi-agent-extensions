@@ -44,7 +44,7 @@ export interface ParsedHeartbeat {
 
 // --- Parsing ---
 
-export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+export const DEFAULT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 export const DEFAULT_LOG_DAYS = 7;
 export const CONTEXT_WARN_PERCENT = 75;
 export const CONTEXT_CRITICAL_PERCENT = 90;

@@ -267,7 +267,7 @@ describe("buildCompactionPreamble", () => {
 
 describe("constants", () => {
   it("exports expected default values", () => {
-    expect(DEFAULT_INTERVAL_MS).toBe(30 * 60 * 1000);
+    expect(DEFAULT_INTERVAL_MS).toBe(15 * 60 * 1000);
     expect(DEFAULT_LOG_DAYS).toBe(7);
     expect(CONTEXT_WARN_PERCENT).toBe(75);
     expect(CONTEXT_CRITICAL_PERCENT).toBe(90);
