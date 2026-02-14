@@ -22,6 +22,8 @@ import {
   parseGoalFile,
   serializeGoalFile,
   buildProgressSummary,
+  goalFileName,
+  fuzzyMatchOne,
   HARNESS_ROLES,
   PI_AGENT_DIR,
   WORKTREE_DIR,
@@ -1667,5 +1669,291 @@ describe("standalone harness (no submodules)", () => {
       answered: true,
       answer: "Yes to Beta",
     });
+  });
+
+  // --- Worker independence: continues achievable goals while questions are pending ---
+
+  it("worker independence: completes achievable goals while questions for other goals remain unanswered", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // ---------------------------------------------------------------
+    // Phase 1 — Launch with a seed goal; worker discovers more work
+    // ---------------------------------------------------------------
+
+    // Create researcher task with initial seed goal
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "security-audit",
+      goals: ["Audit auth module for vulnerabilities"],
+      role: "researcher",
+      context:
+        "Perform a security audit of the authentication system. " +
+        "Produce markdown findings for each area reviewed.",
+    });
+
+    // Verify goal file
+    const goalPath = join(repo, PI_AGENT_DIR, "security-audit.md");
+    let goalContent = await readFile(goalPath, "utf-8");
+    expect(goalContent).toContain("role: researcher");
+
+    // Launch harness — capture worker prompt
+    const piPrompts: string[] = [];
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          piPrompts.push(args[1]);
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    const wtPath = join(repo, WORKTREE_DIR, "security-audit");
+    expect(git("branch --show-current", wtPath)).toBe(
+      "pi-agent/security-audit",
+    );
+
+    // Worker prompt includes question instructions
+    const workerPrompt = piPrompts.find(
+      (p) => p.includes("security-audit") && !p.includes("Launch Manager"),
+    );
+    expect(workerPrompt).toContain("## Asking Questions");
+
+    // Worker discovers more work → adds 3 goals via harness_update_goal
+    const updateTool = mock.getTool("harness_update_goal")!;
+    await updateTool.execute("d1", {
+      submodule: "security-audit",
+      action: "add",
+      goal: "Review input validation",
+    });
+    await updateTool.execute("d2", {
+      submodule: "security-audit",
+      action: "add",
+      goal: "Assess session management",
+    });
+    await updateTool.execute("d3", {
+      submodule: "security-audit",
+      action: "add",
+      goal: "Write findings report",
+    });
+
+    // Now we have 4 goals total, 0 complete
+    let statusTool = mock.getTool("harness_status")!;
+    let status = await statusTool.execute("s1", {});
+    expect(status.details.totalGoals).toBe(4);
+    expect(status.details.completedGoals).toBe(0);
+
+    // ---------------------------------------------------------------
+    // Phase 2 — Worker produces while questions are pending
+    // ---------------------------------------------------------------
+
+    // Worker completes seed goal: commits auth-audit.md in worktree
+    execSync(
+      `echo "# Auth Audit\\n\\nFound SQL injection in login handler." > auth-audit.md && git add . && git commit -m "audit auth module"`,
+      { cwd: wtPath, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    await updateTool.execute("d4", {
+      submodule: "security-audit",
+      action: "complete",
+      goal: "Audit auth module for vulnerabilities",
+    });
+
+    // Worker completes "Review input validation": commits input-validation.md
+    execSync(
+      `echo "# Input Validation Review\\n\\nXSS vectors in search params." > input-validation.md && git add . && git commit -m "review input validation"`,
+      { cwd: wtPath, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    await updateTool.execute("d5", {
+      submodule: "security-audit",
+      action: "complete",
+      goal: "Review input validation",
+    });
+
+    // Worker hits decision point for "Assess session management" — writes a question
+    goalContent = await readFile(goalPath, "utf-8");
+    const withQuestions =
+      goalContent.trimEnd() +
+      "\n\n## Questions\n" +
+      "- ? Should session management audit include OAuth token lifecycle?\n" +
+      "- ? Should findings report follow OWASP format or internal template?\n";
+    await writeFile(goalPath, withQuestions, "utf-8");
+
+    // KEY ASSERTION: 2/4 goals complete AND 2 unanswered questions
+    status = await statusTool.execute("s2", {});
+    expect(status.details.completedGoals).toBe(2);
+    expect(status.details.totalGoals).toBe(4);
+    expect(status.details.unansweredQuestions).toBe(2);
+
+    // KEY ASSERTION: Progress summary shows both [x] completed goals AND ? questions
+    const progressText = status.content[0].text;
+    expect(progressText).toContain("[x] Audit auth module for vulnerabilities");
+    expect(progressText).toContain("[x] Review input validation");
+    expect(progressText).toContain(
+      "? Should session management audit include OAuth token lifecycle?",
+    );
+    expect(progressText).toContain(
+      "? Should findings report follow OWASP format or internal template?",
+    );
+
+    // KEY ASSERTION: Git commits exist in worktree BEFORE questions are answered
+    const worktreeLog = git("log --oneline", wtPath);
+    expect(worktreeLog).toContain("audit auth module");
+    expect(worktreeLog).toContain("review input validation");
+
+    // KEY ASSERTION: Manager prompt says "Unanswered questions" and "NOT stalled"
+    piPrompts.length = 0;
+    mock.api.exec.mockClear();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          piPrompts.push(args[1]);
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const recoverCmd = mock.getCommand("harness:recover")!;
+    await recoverCmd.handler("", ctx);
+
+    const managerPrompt = piPrompts.find((p) => p.includes("Launch Manager"));
+    expect(managerPrompt).toBeDefined();
+    expect(managerPrompt).toContain("Unanswered questions (2)");
+    expect(managerPrompt).toContain("OAuth token lifecycle");
+    expect(managerPrompt).toContain("NOT stalled");
+
+    // KEY ASSERTION: turn_end status bar shows question count suffix
+    // Pre-seed manager status for turn_end
+    const managerStatus: ManagerStatusFile = {
+      status: "running",
+      updatedAt: new Date().toISOString(),
+      submodules: {
+        "security-audit": { completed: 2, total: 4, allDone: false },
+      },
+      stallCount: 0,
+    };
+    await writeFile(
+      join(repo, MANAGER_STATUS_FILE),
+      JSON.stringify(managerStatus),
+      "utf-8",
+    );
+
+    ctx.ui.setStatus.mockClear();
+    await mock.emit("turn_end", {}, ctx);
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: 2/4 goals, running, 2?",
+    );
+
+    // ---------------------------------------------------------------
+    // Phase 3 — User answers first question, worker resumes
+    // ---------------------------------------------------------------
+
+    const answerTool = mock.getTool("harness_answer")!;
+    const ans1 = await answerTool.execute("a1", {
+      submodule: "security-audit",
+      question: "OAuth token lifecycle",
+      answer: "Yes, include OAuth token lifecycle and refresh token handling",
+    });
+    expect(ans1.content[0].text).toContain("Answered");
+    expect(ans1.details.remaining).toBe(1);
+
+    // Verify goal file reflects answered question (- ! format)
+    goalContent = await readFile(goalPath, "utf-8");
+    expect(goalContent).toContain(
+      "- ! Should session management audit include OAuth token lifecycle? → Yes, include OAuth token lifecycle and refresh token handling",
+    );
+    // Second question still unanswered
+    expect(goalContent).toContain(
+      "- ? Should findings report follow OWASP format or internal template?",
+    );
+
+    // Status now shows 1 unanswered
+    status = await statusTool.execute("s3", {});
+    expect(status.details.unansweredQuestions).toBe(1);
+
+    // Worker reads answer, completes "Assess session management": commits session-mgmt.md
+    execSync(
+      `echo "# Session Management Assessment\\n\\nOAuth token lifecycle: refresh tokens expire after 24h.\\nIncluded per user direction." > session-mgmt.md && git add . && git commit -m "assess session management"`,
+      { cwd: wtPath, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    await updateTool.execute("d6", {
+      submodule: "security-audit",
+      action: "complete",
+      goal: "Assess session management",
+    });
+
+    // 3/4 done
+    status = await statusTool.execute("s4", {});
+    expect(status.details.completedGoals).toBe(3);
+    expect(status.details.totalGoals).toBe(4);
+
+    // ---------------------------------------------------------------
+    // Phase 4 — User answers remaining question, worker finishes
+    // ---------------------------------------------------------------
+
+    const ans2 = await answerTool.execute("a2", {
+      submodule: "security-audit",
+      question: "OWASP format",
+      answer: "Use OWASP format with severity ratings",
+    });
+    expect(ans2.details.remaining).toBe(0);
+
+    // 0 unanswered
+    status = await statusTool.execute("s5", {});
+    expect(status.details.unansweredQuestions).toBe(0);
+
+    // Worker completes "Write findings report": commits findings.md
+    execSync(
+      `echo "# Security Audit Findings\\n\\n## Critical\\n- SQL injection in login\\n\\n## High\\n- XSS in search params\\n\\nFormat: OWASP with severity ratings per user direction." > findings.md && git add . && git commit -m "write findings report"`,
+      { cwd: wtPath, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    await updateTool.execute("d7", {
+      submodule: "security-audit",
+      action: "complete",
+      goal: "Write findings report",
+    });
+
+    // Status shows DONE + "2 question(s) answered"
+    status = await statusTool.execute("s6", {});
+    expect(status.content[0].text).toContain("DONE");
+    expect(status.content[0].text).toContain("2 question(s) answered");
+    expect(status.details.completedGoals).toBe(4);
+
+    // Merge worktree branch to main
+    const mergeCmd = mock.getCommand("harness:merge")!;
+    await mergeCmd.handler("security-audit", ctx);
+
+    // All 4 files exist in main repo
+    const mainFiles = git("ls-files", repo);
+    expect(mainFiles).toContain("auth-audit.md");
+    expect(mainFiles).toContain("input-validation.md");
+    expect(mainFiles).toContain("session-mgmt.md");
+    expect(mainFiles).toContain("findings.md");
+
+    // Branch cleaned up
+    const branches = git("branch", repo);
+    expect(branches).not.toContain("pi-agent/security-audit");
+
+    // Final goal file state: 4/4 complete, 2/2 answered, role=researcher
+    goalContent = await readFile(goalPath, "utf-8");
+    const finalParsed = parseGoalFile(goalContent, "security-audit.md");
+    expect(finalParsed.role).toBe("researcher");
+    expect(finalParsed.goals).toHaveLength(4);
+    expect(finalParsed.goals.every((g) => g.completed)).toBe(true);
+    expect(finalParsed.questions).toHaveLength(2);
+    expect(finalParsed.questions.every((q) => q.answered)).toBe(true);
+    expect(finalParsed.questions[0].answer).toBe(
+      "Yes, include OAuth token lifecycle and refresh token handling",
+    );
+    expect(finalParsed.questions[1].answer).toBe(
+      "Use OWASP format with severity ratings",
+    );
   });
 });

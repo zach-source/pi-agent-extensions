@@ -41,7 +41,8 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { readFile, writeFile, readdir, mkdir, rm } from "fs/promises";
+import { Value } from "@sinclair/typebox/value";
+import { readFile, writeFile, readdir, mkdir, rm, rename } from "fs/promises";
 import { join, resolve } from "path";
 
 // --- Types ---
@@ -196,6 +197,7 @@ export interface ManagerStatusFile {
       completed: number;
       total: number;
       allDone: boolean;
+      unansweredQuestions?: number;
     }
   >;
   mergeResults?: string[];
@@ -214,6 +216,98 @@ export const MANAGER_DIR = ".pi-agent/.manager";
 export const MANAGER_STATUS_FILE = ".pi-agent/.manager-status.json";
 export const STOP_SIGNAL_FILE = ".pi-agent/.stop-signal";
 export const MANAGER_STALE_THRESHOLD_MS = 5 * 60 * 1000;
+
+// --- Validation Schemas (Typebox) ---
+
+const LaunchStateSchema = Type.Object({
+  active: Type.Boolean(),
+  sessions: Type.Record(
+    Type.String(),
+    Type.Object({
+      worktreePath: Type.String(),
+      branch: Type.String(),
+      spawned: Type.Boolean(),
+      spawnedAt: Type.Union([Type.String(), Type.Null()]),
+    }),
+  ),
+  managerSpawned: Type.Boolean(),
+  managerCwd: Type.String(),
+  managerSpawnedAt: Type.Union([Type.String(), Type.Null()]),
+});
+
+const ManagerStatusSchema = Type.Object({
+  status: Type.Union([
+    Type.Literal("running"),
+    Type.Literal("stalled"),
+    Type.Literal("all_complete"),
+    Type.Literal("stopped"),
+    Type.Literal("error"),
+  ]),
+  updatedAt: Type.String(),
+  submodules: Type.Record(
+    Type.String(),
+    Type.Object({
+      completed: Type.Number(),
+      total: Type.Number(),
+      allDone: Type.Boolean(),
+      unansweredQuestions: Type.Optional(Type.Number()),
+    }),
+  ),
+  stallCount: Type.Number(),
+  mergeResults: Type.Optional(Type.Array(Type.String())),
+  message: Type.Optional(Type.String()),
+});
+
+// --- Shared Helpers ---
+
+/** Derive goal filename from a config/task name. Single source of truth. */
+export function goalFileName(name: string): string {
+  return name.toLowerCase().replace(/\s+/g, "-") + ".md";
+}
+
+/** Write file atomically: write to temp, then rename (POSIX-atomic). */
+async function atomicWriteFile(
+  filePath: string,
+  content: string,
+): Promise<void> {
+  const tmp = filePath + ".tmp." + process.pid;
+  await writeFile(tmp, content, "utf-8");
+  await rename(tmp, filePath);
+}
+
+/**
+ * Tiered fuzzy match: exact → starts-with → substring.
+ * Returns the single match, or null if zero or ambiguous matches.
+ */
+export function fuzzyMatchOne<T>(
+  items: T[],
+  getText: (item: T) => string,
+  query: string,
+): { match: T } | { ambiguous: T[] } | null {
+  const q = query.toLowerCase();
+
+  // Tier 1: exact match
+  const exact = items.filter((item) => getText(item).toLowerCase() === q);
+  if (exact.length === 1) return { match: exact[0] };
+  if (exact.length > 1) return { ambiguous: exact };
+
+  // Tier 2: starts-with match
+  const startsWith = items.filter((item) =>
+    getText(item).toLowerCase().startsWith(q),
+  );
+  if (startsWith.length === 1) return { match: startsWith[0] };
+  if (startsWith.length > 1) return { ambiguous: startsWith };
+
+  // Tier 3: bidirectional substring match
+  const substring = items.filter((item) => {
+    const t = getText(item).toLowerCase();
+    return t.includes(q) || q.includes(t);
+  });
+  if (substring.length === 1) return { match: substring[0] };
+  if (substring.length > 1) return { ambiguous: substring };
+
+  return null;
+}
 
 // --- Pure Functions ---
 
@@ -501,20 +595,21 @@ export function buildManagerPrompt(
     "   {",
     '     "status": "running|stalled|all_complete|stopped|error",',
     '     "updatedAt": "<ISO timestamp>",',
-    '     "submodules": { "<name>": { "completed": N, "total": N, "allDone": bool } },',
+    '     "submodules": { "<name>": { "completed": N, "total": N, "allDone": bool, "unansweredQuestions": N } },',
     '     "stallCount": N,',
     '     "message": "<human-readable status>"',
     "   }",
     "   ```",
     `5. Check for \`${stopSignalPath}\` — if present, write final status with status: "stopped" and exit`,
-    '6. If all goals are complete across all submodules, set status to "all_complete", auto-merge branches, and exit',
+    '6. If all goals are complete across all submodules AND all questions are answered, set status to "all_complete", auto-merge branches, and exit',
     "7. Track progress: if no goals change between cycles, increment stallCount",
     "   - **Exception**: workers with unanswered questions (- ? lines in their goal file) are NOT stalled — they are waiting for user input",
     "   - Include `unansweredQuestions` count per submodule in the status file",
     `8. If stallCount reaches ${MAX_STALLS}, set status to "stalled" and exit`,
     "",
     "## Auto-Merge",
-    "When all goals for a submodule are complete, merge its worktree branch back:",
+    "When all goals for a submodule are complete AND it has no unanswered questions, merge its worktree branch back:",
+    "- **Do NOT merge** if the submodule has any unanswered questions (- ? lines), even if all goals are complete",
     `- Run \`git merge <branch> --no-edit\` from the submodule's path under \`${baseCwd}\``,
     `- Run \`git worktree remove <worktree-path>\` from \`${baseCwd}\``,
     `- Run \`git branch -d <branch>\` from \`${baseCwd}\``,
@@ -532,7 +627,11 @@ export async function readManagerStatus(
 ): Promise<ManagerStatusFile | null> {
   try {
     const content = await readFile(join(baseCwd, MANAGER_STATUS_FILE), "utf-8");
-    return JSON.parse(content) as ManagerStatusFile;
+    const parsed = JSON.parse(content);
+    if (!Value.Check(ManagerStatusSchema, parsed)) {
+      return null;
+    }
+    return parsed as ManagerStatusFile;
   } catch {
     return null;
   }
@@ -606,6 +705,25 @@ export default function (pi: ExtensionAPI) {
   let sessions: Map<string, SubmoduleSession> = new Map();
   let managerSpawned = false;
   let managerSpawnedAt: Date | null = null;
+
+  // Last context reference for notifying on background errors
+  let lastCtx: { ui: { notify: Function; setStatus: Function } } | null = null;
+
+  // Cache for turn_end reads (recommendation 8)
+  let cachedManagerStatus: {
+    data: ManagerStatusFile | null;
+    at: number;
+  } | null = null;
+  let cachedGoalConfigs: {
+    data: SubmoduleConfig[];
+    at: number;
+  } | null = null;
+  const CACHE_TTL_MS = 15_000;
+
+  function invalidateCache(): void {
+    cachedManagerStatus = null;
+    cachedGoalConfigs = null;
+  }
 
   // --- Helpers ---
 
@@ -708,20 +826,30 @@ export default function (pi: ExtensionAPI) {
     }
     try {
       await mkdir(piAgentDir(), { recursive: true });
-      await writeFile(
+      await atomicWriteFile(
         statePath(),
         JSON.stringify(state, null, 2) + "\n",
-        "utf-8",
       );
-    } catch {
-      // Silently fail
+    } catch (e) {
+      lastCtx?.ui.notify(
+        `Harness state save failed: ${e instanceof Error ? e.message : String(e)}`,
+        "warning",
+      );
     }
   }
 
   async function restoreState(): Promise<void> {
     try {
       const content = await readFile(statePath(), "utf-8");
-      const state: LaunchState = JSON.parse(content);
+      const parsed = JSON.parse(content);
+      if (!Value.Check(LaunchStateSchema, parsed)) {
+        lastCtx?.ui.notify(
+          "Harness state file is malformed — starting fresh",
+          "warning",
+        );
+        return;
+      }
+      const state = parsed as LaunchState;
       loopActive = state.active;
       managerSpawned = state.managerSpawned ?? false;
       managerSpawnedAt = state.managerSpawnedAt
@@ -738,7 +866,7 @@ export default function (pi: ExtensionAPI) {
         });
       }
     } catch {
-      // No saved state
+      // No saved state — first run
     }
   }
 
@@ -783,8 +911,11 @@ export default function (pi: ExtensionAPI) {
           "utf-8",
         );
       }
-    } catch {
-      // Worktree path might not exist yet
+    } catch (e) {
+      lastCtx?.ui.notify(
+        `Failed to write heartbeat for ${name}: ${e instanceof Error ? e.message : String(e)}`,
+        "warning",
+      );
     }
 
     const session: SubmoduleSession = {
@@ -822,11 +953,7 @@ export default function (pi: ExtensionAPI) {
         : "";
 
     // Goal file path for worker to write questions
-    const goalFilePath = resolve(
-      cwd,
-      PI_AGENT_DIR,
-      config.name.toLowerCase().replace(/\s+/g, "-") + ".md",
-    );
+    const goalFilePath = resolve(cwd, PI_AGENT_DIR, goalFileName(config.name));
 
     const prompt = [
       `You are ${role.persona}, working on "${config.name}".`,
@@ -860,47 +987,21 @@ export default function (pi: ExtensionAPI) {
   async function mergeWorktree(
     session: SubmoduleSession,
     config: SubmoduleConfig,
-  ): Promise<string> {
+  ): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
+    // Block merge if unanswered questions exist
+    const unanswered =
+      config.questions?.filter((q) => !q.answered).length ?? 0;
+    if (unanswered > 0) {
+      return {
+        ok: false,
+        message: `Cannot merge ${config.name}: ${unanswered} unanswered question(s). Answer all questions before merging.`,
+      };
+    }
+
     const submodulePath = join(cwd, config.path);
     try {
-      // Remove heartbeat.md from the branch before merge to prevent
-      // conflicts (heartbeat.md is a working file, not project code).
-      try {
-        await pi.exec(
-          "git",
-          [
-            "-C",
-            session.worktreePath,
-            "rm",
-            "-f",
-            "--ignore-unmatch",
-            "heartbeat.md",
-          ],
-          { cwd },
-        );
-        // Only commit if there are staged changes (heartbeat.md was tracked)
-        await pi
-          .exec(
-            "git",
-            ["-C", session.worktreePath, "diff", "--cached", "--quiet"],
-            { cwd },
-          )
-          .then(null, async () => {
-            await pi.exec(
-              "git",
-              [
-                "-C",
-                session.worktreePath,
-                "commit",
-                "-m",
-                "chore: remove heartbeat.md before merge",
-              ],
-              { cwd },
-            );
-          });
-      } catch {
-        // heartbeat.md may not exist or not be tracked — that's fine
-      }
+      // heartbeat.md is gitignored at worktree creation time, so it's
+      // never tracked — no cleanup needed before merge.
 
       await pi.exec("git", ["merge", session.branch, "--no-edit"], {
         cwd: submodulePath,
@@ -908,12 +1009,13 @@ export default function (pi: ExtensionAPI) {
       await pi.exec("git", ["worktree", "remove", session.worktreePath], {
         cwd,
       });
-      // Use -D (force) since the pre-merge cleanup commit makes -d think
-      // the branch isn't fully merged even though all real work is merged.
-      await pi.exec("git", ["branch", "-D", session.branch], { cwd });
-      return `Merged ${session.branch} into ${config.path}`;
+      await pi.exec("git", ["branch", "-d", session.branch], { cwd });
+      return { ok: true, message: `Merged ${session.branch} into ${config.path}` };
     } catch (e) {
-      return `Failed to merge ${session.branch}: ${e instanceof Error ? e.message : String(e)}`;
+      return {
+        ok: false,
+        message: `Failed to merge ${session.branch}: ${e instanceof Error ? e.message : String(e)}`,
+      };
     }
   }
 
@@ -955,6 +1057,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
+    lastCtx = ctx;
     await restoreState();
 
     if (loopActive) {
@@ -992,6 +1095,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_event, ctx) => {
     if (!loopActive) return;
+    lastCtx = ctx;
 
     // Check context usage
     try {
@@ -1000,14 +1104,22 @@ export default function (pi: ExtensionAPI) {
         loopActive = false;
         await persistState();
         ctx.ui.setStatus("harness", "harness: context-full");
+        ctx.ui.notify("Harness deactivated — context window nearly full", "warning");
         return;
       }
     } catch {
       // getContextUsage may not be available
     }
 
-    // Read manager status
-    const status = await readManagerStatus(cwd);
+    // Read manager status (with cache)
+    const now = Date.now();
+    let status: ManagerStatusFile | null;
+    if (cachedManagerStatus && now - cachedManagerStatus.at < CACHE_TTL_MS) {
+      status = cachedManagerStatus.data;
+    } else {
+      status = await readManagerStatus(cwd);
+      cachedManagerStatus = { data: status, at: now };
+    }
 
     if (!status) {
       if (managerSpawned) {
@@ -1017,7 +1129,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Check liveness
-    const age = Date.now() - new Date(status.updatedAt).getTime();
+    const age = now - new Date(status.updatedAt).getTime();
     if (age > MANAGER_STALE_THRESHOLD_MS) {
       ctx.ui.setStatus("harness", "harness: manager stale");
       return;
@@ -1033,10 +1145,16 @@ export default function (pi: ExtensionAPI) {
       0,
     );
 
-    // Check for unanswered questions
+    // Check for unanswered questions (with cache)
     let questionSuffix = "";
     try {
-      const configs = await readGoalFiles();
+      let configs: SubmoduleConfig[];
+      if (cachedGoalConfigs && now - cachedGoalConfigs.at < CACHE_TTL_MS) {
+        configs = cachedGoalConfigs.data;
+      } else {
+        configs = await readGoalFiles();
+        cachedGoalConfigs = { data: configs, at: now };
+      }
       const unanswered = configs.reduce(
         (sum, c) => sum + (c.questions?.filter((q) => !q.answered).length ?? 0),
         0,
@@ -1146,12 +1264,12 @@ export default function (pi: ExtensionAPI) {
           config.goals.push({ text: params.goal, completed: false });
           break;
         case "complete": {
-          const goal = config.goals.find(
-            (g) =>
-              g.text.toLowerCase().includes(params.goal.toLowerCase()) ||
-              params.goal.toLowerCase().includes(g.text.toLowerCase()),
+          const result = fuzzyMatchOne(
+            config.goals,
+            (g) => g.text,
+            params.goal,
           );
-          if (!goal) {
+          if (!result) {
             return {
               content: [
                 {
@@ -1162,16 +1280,27 @@ export default function (pi: ExtensionAPI) {
               details: {},
             };
           }
-          goal.completed = true;
+          if ("ambiguous" in result) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Ambiguous match for "${params.goal}" in ${config.name}. Matches: ${result.ambiguous.map((g) => g.text).join("; ")}`,
+                },
+              ],
+              details: {},
+            };
+          }
+          result.match.completed = true;
           break;
         }
         case "remove": {
-          const idx = config.goals.findIndex(
-            (g) =>
-              g.text.toLowerCase().includes(params.goal.toLowerCase()) ||
-              params.goal.toLowerCase().includes(g.text.toLowerCase()),
+          const result = fuzzyMatchOne(
+            config.goals,
+            (g) => g.text,
+            params.goal,
           );
-          if (idx === -1) {
+          if (!result) {
             return {
               content: [
                 {
@@ -1182,16 +1311,29 @@ export default function (pi: ExtensionAPI) {
               details: {},
             };
           }
+          if ("ambiguous" in result) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Ambiguous match for "${params.goal}" in ${config.name}. Matches: ${result.ambiguous.map((g) => g.text).join("; ")}`,
+                },
+              ],
+              details: {},
+            };
+          }
+          const idx = config.goals.indexOf(result.match);
           config.goals.splice(idx, 1);
           break;
         }
       }
 
       // Write back
+      invalidateCache();
       const serialized = serializeGoalFile(config);
-      const filename = config.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      const filename = goalFileName(config.name);
       try {
-        await writeFile(join(piAgentDir(), filename), serialized, "utf-8");
+        await atomicWriteFile(join(piAgentDir(), filename), serialized);
       } catch (e) {
         return {
           content: [
@@ -1239,14 +1381,14 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const goalFile = join(piAgentDir(), `${name}.md`);
+      const goalFile = join(piAgentDir(), goalFileName(name));
       try {
         await readFile(goalFile, "utf-8");
         return {
           content: [
             {
               type: "text",
-              text: `Task "${name}" already exists at .pi-agent/${name}.md. Use harness_update_goal to modify it.`,
+              text: `Task "${name}" already exists at .pi-agent/${goalFileName(name)}. Use harness_update_goal to modify it.`,
             },
           ],
           details: {},
@@ -1273,7 +1415,7 @@ export default function (pi: ExtensionAPI) {
       const content = serializeGoalFile(config);
       try {
         await mkdir(piAgentDir(), { recursive: true });
-        await writeFile(goalFile, content, "utf-8");
+        await atomicWriteFile(goalFile, content);
       } catch (e) {
         return {
           content: [
@@ -1285,6 +1427,7 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
+      invalidateCache();
 
       return {
         content: [
@@ -1329,10 +1472,11 @@ export default function (pi: ExtensionAPI) {
         answered: false,
       });
 
+      invalidateCache();
       const serialized = serializeGoalFile(config);
-      const filename = config.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      const filename = goalFileName(config.name);
       try {
-        await writeFile(join(piAgentDir(), filename), serialized, "utf-8");
+        await atomicWriteFile(join(piAgentDir(), filename), serialized);
       } catch (e) {
         return {
           content: [
@@ -1384,34 +1528,45 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Fuzzy-match: find unanswered question whose text includes the search or vice versa
-      const match = config.questions.find(
-        (q) =>
-          !q.answered &&
-          (q.text.toLowerCase().includes(params.question.toLowerCase()) ||
-            params.question.toLowerCase().includes(q.text.toLowerCase())),
+      // Tiered fuzzy match against unanswered questions
+      const unansweredQs = config.questions.filter((q) => !q.answered);
+      const result = fuzzyMatchOne(
+        unansweredQs,
+        (q) => q.text,
+        params.question,
       );
 
-      if (!match) {
-        const unanswered = config.questions.filter((q) => !q.answered);
+      if (!result) {
         return {
           content: [
             {
               type: "text",
-              text: `No matching unanswered question for "${params.question}" in ${config.name}. Unanswered: ${unanswered.map((q) => q.text).join("; ") || "none"}`,
+              text: `No matching unanswered question for "${params.question}" in ${config.name}. Unanswered: ${unansweredQs.map((q) => q.text).join("; ") || "none"}`,
+            },
+          ],
+          details: {},
+        };
+      }
+      if ("ambiguous" in result) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Ambiguous match for "${params.question}" in ${config.name}. Matches: ${result.ambiguous.map((q) => q.text).join("; ")}`,
             },
           ],
           details: {},
         };
       }
 
-      match.answered = true;
-      match.answer = params.answer;
+      result.match.answered = true;
+      result.match.answer = params.answer;
 
+      invalidateCache();
       const serialized = serializeGoalFile(config);
-      const filename = config.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      const filename = goalFileName(config.name);
       try {
-        await writeFile(join(piAgentDir(), filename), serialized, "utf-8");
+        await atomicWriteFile(join(piAgentDir(), filename), serialized);
       } catch (e) {
         return {
           content: [
@@ -1429,7 +1584,7 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Answered "${match.text}" → "${params.answer}" for ${config.name} (${remaining} unanswered remaining)`,
+            text: `Answered "${result.match.text}" → "${params.answer}" for ${config.name} (${remaining} unanswered remaining)`,
           },
         ],
         details: { remaining },
@@ -1444,6 +1599,7 @@ export default function (pi: ExtensionAPI) {
       "Read .pi-agent/*.md goals, create worktrees, spawn workers + manager",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
 
       if (loopActive) {
         const configs = await readGoalFiles();
@@ -1520,6 +1676,7 @@ export default function (pi: ExtensionAPI) {
     description: "Show progress of all submodule launches",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
       const configs = await readGoalFiles();
 
       if (configs.length === 0) {
@@ -1557,6 +1714,7 @@ export default function (pi: ExtensionAPI) {
     description: "Write stop signal to gracefully stop the manager",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
 
       if (!loopActive) {
         ctx.ui.notify("Harness is not active", "info");
@@ -1571,11 +1729,15 @@ export default function (pi: ExtensionAPI) {
           new Date().toISOString() + "\n",
           "utf-8",
         );
-      } catch {
-        // Best effort
+      } catch (e) {
+        ctx.ui.notify(
+          `Failed to write stop signal: ${e instanceof Error ? e.message : String(e)}`,
+          "warning",
+        );
       }
 
       loopActive = false;
+      invalidateCache();
       await persistState();
       ctx.ui.setStatus("harness", undefined);
       ctx.ui.notify(
@@ -1589,6 +1751,7 @@ export default function (pi: ExtensionAPI) {
     description: "Discover git submodules and scaffold .pi-agent/ goal files",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
 
       let stdout: string;
       try {
@@ -1666,6 +1829,7 @@ export default function (pi: ExtensionAPI) {
       "Merge a specific submodule's worktree branch back (pass submodule name)",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
       const name = args?.trim();
 
       if (!name) {
@@ -1687,13 +1851,18 @@ export default function (pi: ExtensionAPI) {
       }
 
       const result = await mergeWorktree(session, config);
-      sessions.delete(name);
-      await persistState();
+
+      // Only clean up session on successful merge
+      if (result.ok) {
+        sessions.delete(name);
+        invalidateCache();
+        await persistState();
+      }
 
       pi.sendMessage(
         {
           customType: "harness-merge-result",
-          content: result,
+          content: result.message,
           display: true,
         },
         { triggerTurn: false },
@@ -1705,6 +1874,7 @@ export default function (pi: ExtensionAPI) {
     description: "Respawn a stale or dead manager session",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
 
       if (!loopActive) {
         ctx.ui.notify("No active harness to recover", "warning");
@@ -1745,6 +1915,7 @@ export default function (pi: ExtensionAPI) {
       "Create a standalone worktree task: /harness:add <name> [goals...]",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
+      lastCtx = ctx;
       const trimmed = (args ?? "").trim();
 
       if (!trimmed) {
@@ -1781,11 +1952,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const goalFile = join(piAgentDir(), `${name}.md`);
+      const gfn = goalFileName(name);
+      const goalFile = join(piAgentDir(), gfn);
       try {
         await readFile(goalFile, "utf-8");
         ctx.ui.notify(
-          `Task "${name}" already exists at .pi-agent/${name}.md`,
+          `Task "${name}" already exists at .pi-agent/${gfn}`,
           "warning",
         );
         return;
@@ -1814,7 +1986,7 @@ export default function (pi: ExtensionAPI) {
       const content = serializeGoalFile(config);
       try {
         await mkdir(piAgentDir(), { recursive: true });
-        await writeFile(goalFile, content, "utf-8");
+        await atomicWriteFile(goalFile, content);
       } catch (e) {
         ctx.ui.notify(
           `Error writing goal file: ${e instanceof Error ? e.message : String(e)}`,
@@ -1822,6 +1994,7 @@ export default function (pi: ExtensionAPI) {
         );
         return;
       }
+      invalidateCache();
 
       pi.sendMessage(
         {
@@ -1829,7 +2002,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             `## Task Added: ${name}`,
             "",
-            `Created \`.pi-agent/${name}.md\` with ${goals.length} goal(s):`,
+            `Created \`.pi-agent/${gfn}\` with ${goals.length} goal(s):`,
             ...goals.map((g) => `- [ ] ${g.text}`),
             "",
             "Run `/harness:launch` to start workers.",
