@@ -10,12 +10,14 @@
  * Tools:
  *   harness_status      - LLM-callable progress check across all submodules
  *   harness_update_goal - Add/complete/remove goals for a submodule
+ *   harness_add_task    - Create a standalone worktree task (AI-callable)
  *
  * Commands:
  *   /harness:launch    - Read goals, create worktrees, spawn workers + manager
  *   /harness:status    - Show progress of all submodules
  *   /harness:stop      - Write stop signal, deactivate loop
  *   /harness:init      - Discover submodules, scaffold .pi-agent/
+ *   /harness:add       - Create a standalone worktree task
  *   /harness:merge     - Merge a specific submodule's worktree branch back
  *   /harness:recover   - Respawn stale/dead manager
  *
@@ -111,8 +113,8 @@ export function parseGoalFile(
     name = headingMatch[1].trim();
   }
 
-  // Extract path from "path:" field
-  let path = "";
+  // Extract path from "path:" field (default to "." for standalone worktrees)
+  let path = ".";
   const pathMatch = content.match(/^path:\s*(.+)$/m);
   if (pathMatch) {
     path = pathMatch[1].trim();
@@ -317,6 +319,23 @@ const UpdateGoalParams = Type.Object({
 });
 
 type UpdateGoalInput = Static<typeof UpdateGoalParams>;
+
+const AddTaskParams = Type.Object({
+  name: Type.String({
+    description: "Task name (used as filename and branch name, kebab-case)",
+  }),
+  goals: Type.Array(Type.String(), {
+    description: "List of goals for this task",
+  }),
+  context: Type.Optional(
+    Type.String({ description: "Context for the worker agent" }),
+  ),
+  path: Type.Optional(
+    Type.String({ description: "Subdirectory focus (default: '.')" }),
+  ),
+});
+
+type AddTaskInput = Static<typeof AddTaskParams>;
 
 // --- Extension ---
 
@@ -818,6 +837,80 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "harness_add_task",
+    label: "Add Harness Task",
+    description:
+      "Create a standalone worktree task. Writes a .pi-agent/<name>.md " +
+      "goal file that can be launched with /harness:launch.",
+    parameters: AddTaskParams,
+
+    async execute(_toolCallId, params: AddTaskInput) {
+      const name = params.name.trim();
+      if (!name || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid task name "${name}". Use kebab-case (e.g., "refactor-auth").`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      const goalFile = join(piAgentDir(), `${name}.md`);
+      try {
+        await readFile(goalFile, "utf-8");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task "${name}" already exists at .pi-agent/${name}.md. Use harness_update_goal to modify it.`,
+            },
+          ],
+          details: {},
+        };
+      } catch {
+        // File doesn't exist — proceed
+      }
+
+      const config: SubmoduleConfig = {
+        name,
+        path: params.path ?? ".",
+        goals: params.goals.map((g) => ({ text: g, completed: false })),
+        context: params.context ?? "",
+        rawContent: "",
+      };
+
+      const content = serializeGoalFile(config);
+      try {
+        await mkdir(piAgentDir(), { recursive: true });
+        await writeFile(goalFile, content, "utf-8");
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error writing goal file: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Created task "${name}" with ${config.goals.length} goal(s) at .pi-agent/${name}.md`,
+          },
+        ],
+        details: { name, goals: config.goals, path: config.path },
+      };
+    },
+  });
+
   // --- Commands ---
 
   pi.registerCommand("harness:launch", {
@@ -1107,6 +1200,92 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.setStatus("harness", "harness: active");
       ctx.ui.notify("Manager respawned", "info");
+    },
+  });
+
+  pi.registerCommand("harness:add", {
+    description:
+      "Create a standalone worktree task: /harness:add <name> [goals...]",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      const trimmed = (args ?? "").trim();
+
+      if (!trimmed) {
+        ctx.ui.notify(
+          "Usage: /harness:add <name> [goal1, goal2, ...]",
+          "warning",
+        );
+        return;
+      }
+
+      // First token is the name, rest are goals (comma-separated or single string)
+      const spaceIdx = trimmed.indexOf(" ");
+      const name = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+      const goalsRaw = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name)) {
+        ctx.ui.notify(
+          `Invalid task name "${name}". Use kebab-case (e.g., "refactor-auth").`,
+          "warning",
+        );
+        return;
+      }
+
+      const goalFile = join(piAgentDir(), `${name}.md`);
+      try {
+        await readFile(goalFile, "utf-8");
+        ctx.ui.notify(
+          `Task "${name}" already exists at .pi-agent/${name}.md`,
+          "warning",
+        );
+        return;
+      } catch {
+        // File doesn't exist — proceed
+      }
+
+      const goals: SubmoduleGoal[] = goalsRaw
+        ? goalsRaw
+            .split(",")
+            .map((g) => g.trim())
+            .filter((g) => g.length > 0)
+            .map((g) => ({ text: g, completed: false }))
+        : [{ text: "Define goals for this task", completed: false }];
+
+      const config: SubmoduleConfig = {
+        name,
+        path: ".",
+        goals,
+        context: "",
+        rawContent: "",
+      };
+
+      const content = serializeGoalFile(config);
+      try {
+        await mkdir(piAgentDir(), { recursive: true });
+        await writeFile(goalFile, content, "utf-8");
+      } catch (e) {
+        ctx.ui.notify(
+          `Error writing goal file: ${e instanceof Error ? e.message : String(e)}`,
+          "error",
+        );
+        return;
+      }
+
+      pi.sendMessage(
+        {
+          customType: "harness-add",
+          content: [
+            `## Task Added: ${name}`,
+            "",
+            `Created \`.pi-agent/${name}.md\` with ${goals.length} goal(s):`,
+            ...goals.map((g) => `- [ ] ${g.text}`),
+            "",
+            "Run `/harness:launch` to start workers.",
+          ].join("\n"),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
     },
   });
 }

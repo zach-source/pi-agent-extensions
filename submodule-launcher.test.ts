@@ -200,6 +200,14 @@ describe("parseGoalFile", () => {
     const result = parseGoalFile(content, "my-module.md");
     expect(result.name).toBe("my-module");
   });
+
+  it("defaults path to '.' when path field is missing", () => {
+    const content = "# standalone-task\n\n## Goals\n- [ ] Do something\n";
+    const result = parseGoalFile(content, "standalone-task.md");
+    expect(result.name).toBe("standalone-task");
+    expect(result.path).toBe(".");
+    expect(result.goals).toHaveLength(1);
+  });
 });
 
 describe("serializeGoalFile", () => {
@@ -400,6 +408,7 @@ describe("extension registration", () => {
 
     expect(mock.getTool("harness_status")).toBeDefined();
     expect(mock.getTool("harness_update_goal")).toBeDefined();
+    expect(mock.getTool("harness_add_task")).toBeDefined();
   });
 
   it("registers expected commands", () => {
@@ -411,6 +420,7 @@ describe("extension registration", () => {
       "harness:status",
       "harness:stop",
       "harness:init",
+      "harness:add",
       "harness:merge",
       "harness:recover",
     ]) {
@@ -1386,6 +1396,236 @@ describe("file-based operations", () => {
     const content = await readFile(join(piDir, "api.md"), "utf-8");
     expect(content).toContain("Added via tool");
     expect(content).toContain("Original goal");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. /harness:add command tests
+// ---------------------------------------------------------------------------
+
+describe("/harness:add command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-add-cmd-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("creates goal file with path: .", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("refactor-auth", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "refactor-auth.md"),
+      "utf-8",
+    );
+    expect(content).toContain("# refactor-auth");
+    expect(content).toContain("path: .");
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-add",
+        content: expect.stringContaining("refactor-auth"),
+      }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("parses name and goals from args", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("add-tests Write integration tests, Add e2e coverage", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "add-tests.md"),
+      "utf-8",
+    );
+    expect(content).toContain("# add-tests");
+    expect(content).toContain("path: .");
+    expect(content).toContain("Write integration tests");
+    expect(content).toContain("Add e2e coverage");
+  });
+
+  it("scaffolds placeholder goal when no goals provided", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("my-task", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "my-task.md"),
+      "utf-8",
+    );
+    expect(content).toContain("Define goals for this task");
+  });
+
+  it("refuses to overwrite existing file", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(join(piDir, "existing.md"), "# existing\npath: .\n", "utf-8");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("existing", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("already exists"),
+      "warning",
+    );
+  });
+
+  it("shows usage when no args provided", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Usage"),
+      "warning",
+    );
+  });
+
+  it("rejects invalid name", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("Invalid_Name", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid task name"),
+      "warning",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. harness_add_task tool tests
+// ---------------------------------------------------------------------------
+
+describe("harness_add_task tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-add-task-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("creates goal file", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    const result = await tool.execute("call-1", {
+      name: "refactor-auth",
+      goals: ["Refactor auth module", "Add tests"],
+    });
+
+    expect(result.content[0].text).toContain("Created task");
+    expect(result.content[0].text).toContain("2 goal(s)");
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "refactor-auth.md"),
+      "utf-8",
+    );
+    expect(content).toContain("# refactor-auth");
+    expect(content).toContain("path: .");
+    expect(content).toContain("Refactor auth module");
+    expect(content).toContain("Add tests");
+  });
+
+  it("creates goal file with custom path", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    const result = await tool.execute("call-1", {
+      name: "api-work",
+      goals: ["Fix endpoints"],
+      path: "services/api",
+    });
+
+    expect(result.content[0].text).toContain("Created task");
+    expect(result.details.path).toBe("services/api");
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "api-work.md"),
+      "utf-8",
+    );
+    expect(content).toContain("path: services/api");
+  });
+
+  it("creates goal file with context", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    const result = await tool.execute("call-1", {
+      name: "add-caching",
+      goals: ["Add Redis caching"],
+      context: "Use the existing Redis connection pool.",
+    });
+
+    expect(result.content[0].text).toContain("Created task");
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "add-caching.md"),
+      "utf-8",
+    );
+    expect(content).toContain("## Context");
+    expect(content).toContain("Use the existing Redis connection pool.");
+  });
+
+  it("rejects invalid name", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    const result = await tool.execute("call-1", {
+      name: "Invalid_Name",
+      goals: ["Do something"],
+    });
+
+    expect(result.content[0].text).toContain("Invalid task name");
+  });
+
+  it("refuses to overwrite existing file", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(join(piDir, "existing.md"), "# existing\npath: .\n", "utf-8");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    const result = await tool.execute("call-1", {
+      name: "existing",
+      goals: ["Do something"],
+    });
+
+    expect(result.content[0].text).toContain("already exists");
   });
 });
 

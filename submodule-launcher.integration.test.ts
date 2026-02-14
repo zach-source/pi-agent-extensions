@@ -326,6 +326,85 @@ describe("submodule-launcher integration", () => {
     expect(parsed.context).toBe(config.context);
   });
 
+  it("standalone worktree: add task, launch, verify worktree created", async () => {
+    // Create a plain repo WITHOUT submodules
+    const standaloneRepo = join(baseDir, "standalone");
+    git(`init ${standaloneRepo}`, baseDir);
+    git("commit --allow-empty -m init", standaloneRepo);
+
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    const ctx = createMockContext(standaloneRepo);
+    await mock.emit("session_start", {}, ctx);
+
+    // Use /harness:add to create a task
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("refactor-auth Fix login flow, Add session handling", ctx);
+
+    // Verify goal file was created with path: .
+    const goalContent = await readFile(
+      join(standaloneRepo, PI_AGENT_DIR, "refactor-auth.md"),
+      "utf-8",
+    );
+    const parsed = parseGoalFile(goalContent, "refactor-auth.md");
+    expect(parsed.name).toBe("refactor-auth");
+    expect(parsed.path).toBe(".");
+    expect(parsed.goals).toHaveLength(2);
+    expect(parsed.goals[0].text).toBe("Fix login flow");
+    expect(parsed.goals[1].text).toBe("Add session handling");
+
+    // Override pi.exec to NOT actually spawn pi sessions (just let git through)
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          // Don't actually spawn pi — just record the call
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    // Launch the harness
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Verify worktree was created
+    const wtPath = join(standaloneRepo, WORKTREE_DIR, "refactor-auth");
+    const branch = git("branch --show-current", wtPath);
+    expect(branch).toBe("pi-agent/refactor-auth");
+
+    // Verify the harness-started message was sent
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-started",
+        content: expect.stringContaining("refactor-auth"),
+      }),
+      { triggerTurn: false },
+    );
+
+    // Verify launch state
+    const stateContent = await readFile(
+      join(standaloneRepo, LAUNCH_STATE_FILE),
+      "utf-8",
+    );
+    const state: LaunchState = JSON.parse(stateContent);
+    expect(state.active).toBe(true);
+    expect(state.sessions["refactor-auth"]).toBeDefined();
+    expect(state.sessions["refactor-auth"].branch).toBe(
+      "pi-agent/refactor-auth",
+    );
+
+    // Clean up worktree
+    try {
+      git(`worktree remove ${wtPath} --force`, standaloneRepo);
+      git("branch -D pi-agent/refactor-auth", standaloneRepo);
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
   it("buildProgressSummary formats multi-submodule state", async () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
