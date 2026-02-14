@@ -21,6 +21,7 @@ import {
   MANAGER_STALE_THRESHOLD_MS,
   type SubmoduleConfig,
   type SubmoduleGoal,
+  type SubmoduleQuestion,
   type HarnessRole,
   type LaunchState,
   type ManagerStatusFile,
@@ -233,7 +234,8 @@ describe("parseGoalFile", () => {
   });
 
   it('defaults invalid role to "developer"', () => {
-    const content = "# task\npath: .\nrole: ninja\n\n## Goals\n- [ ] Do something\n";
+    const content =
+      "# task\npath: .\nrole: ninja\n\n## Goals\n- [ ] Do something\n";
     const result = parseGoalFile(content, "task.md");
     expect(result.role).toBe("developer");
   });
@@ -249,6 +251,7 @@ describe("serializeGoalFile", () => {
         { text: "Implement login form", completed: false },
         { text: "Add unit tests", completed: true },
       ],
+      questions: [],
       context: "React + TypeScript frontend.",
       rawContent: "",
     };
@@ -260,6 +263,7 @@ describe("serializeGoalFile", () => {
     expect(parsed.path).toBe(original.path);
     expect(parsed.role).toBe(original.role);
     expect(parsed.goals).toEqual(original.goals);
+    expect(parsed.questions).toEqual(original.questions);
     expect(parsed.context).toBe(original.context);
   });
 
@@ -269,6 +273,7 @@ describe("serializeGoalFile", () => {
       path: "test/path",
       role: "developer",
       goals: [{ text: "Do something", completed: false }],
+      questions: [],
       context: "",
       rawContent: "",
     };
@@ -283,6 +288,7 @@ describe("serializeGoalFile", () => {
       path: ".",
       role: "developer",
       goals: [{ text: "Do something", completed: false }],
+      questions: [],
       context: "",
       rawContent: "",
     };
@@ -297,6 +303,7 @@ describe("serializeGoalFile", () => {
       path: ".",
       role: "architect",
       goals: [{ text: "Refactor module", completed: false }],
+      questions: [],
       context: "",
       rawContent: "",
     };
@@ -321,6 +328,7 @@ describe("buildProgressSummary", () => {
           { text: "Fix auth", completed: true },
           { text: "Add caching", completed: false },
         ],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -329,6 +337,7 @@ describe("buildProgressSummary", () => {
         path: "apps/web",
         role: "developer",
         goals: [{ text: "Login form", completed: false }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -349,6 +358,7 @@ describe("buildProgressSummary", () => {
         path: "services/api",
         role: "developer",
         goals: [{ text: "Done", completed: true }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -366,6 +376,7 @@ describe("buildProgressSummary", () => {
         path: ".",
         role: "architect",
         goals: [{ text: "Extract module", completed: false }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -374,6 +385,7 @@ describe("buildProgressSummary", () => {
         path: ".",
         role: "developer",
         goals: [{ text: "Write tests", completed: false }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -397,6 +409,7 @@ describe("buildManagerPrompt", () => {
           { text: "Fix auth", completed: false },
           { text: "Add tests", completed: true },
         ],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -429,6 +442,7 @@ describe("buildManagerPrompt", () => {
         path: "apps/web",
         role: "developer",
         goals: [{ text: "Task", completed: false }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -446,6 +460,7 @@ describe("buildManagerPrompt", () => {
         path: ".",
         role: "architect",
         goals: [{ text: "Restructure", completed: false }],
+        questions: [],
         context: "",
         rawContent: "",
       },
@@ -1388,6 +1403,7 @@ describe("file-based operations", () => {
         { text: "Goal A", completed: false },
         { text: "Goal B", completed: true },
       ],
+      questions: [],
       context: "Test context",
       rawContent: "",
     });
@@ -1556,7 +1572,10 @@ describe("/harness:add command", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:add")!;
-    await cmd.handler("add-tests Write integration tests, Add e2e coverage", ctx);
+    await cmd.handler(
+      "add-tests Write integration tests, Add e2e coverage",
+      ctx,
+    );
 
     const content = await readFile(
       join(tmpDir, PI_AGENT_DIR, "add-tests.md"),
@@ -1585,7 +1604,11 @@ describe("/harness:add command", () => {
   it("refuses to overwrite existing file", async () => {
     const piDir = join(tmpDir, PI_AGENT_DIR);
     await mkdir(piDir, { recursive: true });
-    await writeFile(join(piDir, "existing.md"), "# existing\npath: .\n", "utf-8");
+    await writeFile(
+      join(piDir, "existing.md"),
+      "# existing\npath: .\n",
+      "utf-8",
+    );
 
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -1725,7 +1748,11 @@ describe("harness_add_task tool", () => {
   it("refuses to overwrite existing file", async () => {
     const piDir = join(tmpDir, PI_AGENT_DIR);
     await mkdir(piDir, { recursive: true });
-    await writeFile(join(piDir, "existing.md"), "# existing\npath: .\n", "utf-8");
+    await writeFile(
+      join(piDir, "existing.md"),
+      "# existing\npath: .\n",
+      "utf-8",
+    );
 
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -1826,7 +1853,7 @@ describe("spawnSession uses role persona and instructions", () => {
 
     const prompt = piCalls[0][1][1]; // pi -p <prompt>
     expect(prompt).toContain("a software architect focused on structure");
-    expect(prompt).toContain("working on \"refactor\"");
+    expect(prompt).toContain('working on "refactor"');
     expect(prompt).toContain("Focus on code organization");
     expect(prompt).toContain("Reduce duplication");
     expect(prompt).not.toContain("Write tests first (red)");
@@ -1962,7 +1989,10 @@ describe("/harness:add with --role flag", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:add")!;
-    await cmd.handler("refactor-auth --role architect Improve module boundaries, Extract interfaces", ctx);
+    await cmd.handler(
+      "refactor-auth --role architect Improve module boundaries, Extract interfaces",
+      ctx,
+    );
 
     const content = await readFile(
       join(tmpDir, PI_AGENT_DIR, "refactor-auth.md"),
@@ -1979,7 +2009,10 @@ describe("/harness:add with --role flag", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:add")!;
-    await cmd.handler("--role tester add-tests Write unit tests, Write e2e tests", ctx);
+    await cmd.handler(
+      "--role tester add-tests Write unit tests, Write e2e tests",
+      ctx,
+    );
 
     const content = await readFile(
       join(tmpDir, PI_AGENT_DIR, "add-tests.md"),
@@ -2018,6 +2051,595 @@ describe("/harness:add with --role flag", () => {
 
     const parsed = parseGoalFile(content, "bad-role.md");
     expect(parsed.role).toBe("developer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. Question parsing, serialization, and tools
+// ---------------------------------------------------------------------------
+
+describe("parseGoalFile questions", () => {
+  it("parses unanswered questions", () => {
+    const content = [
+      "# research-task",
+      "path: .",
+      "role: researcher",
+      "",
+      "## Goals",
+      "- [ ] Investigate approach",
+      "",
+      "## Questions",
+      "- ? What auth provider should we use?",
+      "- ? Which database?",
+      "",
+      "## Context",
+      "Some context.",
+    ].join("\n");
+
+    const result = parseGoalFile(content, "research-task.md");
+    expect(result.questions).toHaveLength(2);
+    expect(result.questions[0]).toEqual({
+      text: "What auth provider should we use?",
+      answered: false,
+    });
+    expect(result.questions[1]).toEqual({
+      text: "Which database?",
+      answered: false,
+    });
+  });
+
+  it("parses answered questions", () => {
+    const content = [
+      "# task",
+      "path: .",
+      "",
+      "## Goals",
+      "- [ ] Do something",
+      "",
+      "## Questions",
+      "- ! What database? → PostgreSQL",
+      "- ? What auth provider?",
+    ].join("\n");
+
+    const result = parseGoalFile(content, "task.md");
+    expect(result.questions).toHaveLength(2);
+    expect(result.questions[0]).toEqual({
+      text: "What database?",
+      answered: true,
+      answer: "PostgreSQL",
+    });
+    expect(result.questions[1]).toEqual({
+      text: "What auth provider?",
+      answered: false,
+    });
+  });
+
+  it("defaults questions to empty array when section missing", () => {
+    const content = "# task\npath: .\n\n## Goals\n- [ ] Do something\n";
+    const result = parseGoalFile(content, "task.md");
+    expect(result.questions).toEqual([]);
+  });
+});
+
+describe("serializeGoalFile questions", () => {
+  it("round-trips questions", () => {
+    const original: SubmoduleConfig = {
+      name: "test",
+      path: ".",
+      role: "developer",
+      goals: [{ text: "Do something", completed: false }],
+      questions: [
+        { text: "What framework?", answered: false },
+        { text: "What DB?", answered: true, answer: "PostgreSQL" },
+      ],
+      context: "Some context",
+      rawContent: "",
+    };
+
+    const serialized = serializeGoalFile(original);
+    const parsed = parseGoalFile(serialized, "test.md");
+
+    expect(parsed.questions).toEqual(original.questions);
+    expect(parsed.goals).toEqual(original.goals);
+    expect(parsed.context).toBe(original.context);
+  });
+
+  it("omits Questions section when empty", () => {
+    const config: SubmoduleConfig = {
+      name: "test",
+      path: ".",
+      role: "developer",
+      goals: [{ text: "Do something", completed: false }],
+      questions: [],
+      context: "",
+      rawContent: "",
+    };
+
+    const serialized = serializeGoalFile(config);
+    expect(serialized).not.toContain("## Questions");
+  });
+});
+
+describe("buildProgressSummary with questions", () => {
+  it("shows unanswered questions", () => {
+    const configs: SubmoduleConfig[] = [
+      {
+        name: "research",
+        path: ".",
+        role: "researcher",
+        goals: [{ text: "Investigate", completed: false }],
+        questions: [
+          { text: "What auth provider?", answered: false },
+          { text: "What DB?", answered: true, answer: "PostgreSQL" },
+        ],
+        context: "",
+        rawContent: "",
+      },
+    ];
+
+    const summary = buildProgressSummary(configs);
+    expect(summary).toContain("? What auth provider?");
+    expect(summary).toContain("1 question(s) answered");
+    expect(summary).not.toContain("? What DB?");
+  });
+});
+
+describe("buildManagerPrompt with questions", () => {
+  it("includes questions and stall-exemption", () => {
+    const configs: SubmoduleConfig[] = [
+      {
+        name: "api",
+        path: "services/api",
+        role: "developer",
+        goals: [{ text: "Fix auth", completed: false }],
+        questions: [{ text: "OAuth2 or JWT?", answered: false }],
+        context: "",
+        rawContent: "",
+      },
+    ];
+
+    const prompt = buildManagerPrompt(configs, [], "/tmp/project");
+    expect(prompt).toContain("OAuth2 or JWT?");
+    expect(prompt).toContain("Unanswered questions (1)");
+    expect(prompt).toContain("unanswered questions");
+    expect(prompt).toContain("NOT stalled");
+  });
+});
+
+describe("harness_ask tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-ask-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("stages a question in goal file", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: services/api\n\n## Goals\n- [ ] Fix auth\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_ask")!;
+    const result = await tool.execute("call-1", {
+      submodule: "api",
+      question: "OAuth2 or JWT?",
+    });
+
+    expect(result.content[0].text).toContain("Question staged");
+    expect(result.content[0].text).toContain("1 unanswered");
+
+    const content = await readFile(join(piDir, "api.md"), "utf-8");
+    expect(content).toContain("## Questions");
+    expect(content).toContain("- ? OAuth2 or JWT?");
+  });
+
+  it("appends multiple questions", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: services/api\n\n## Goals\n- [ ] Fix auth\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_ask")!;
+    await tool.execute("call-1", {
+      submodule: "api",
+      question: "OAuth2 or JWT?",
+    });
+    await tool.execute("call-2", {
+      submodule: "api",
+      question: "Which database?",
+    });
+
+    const content = await readFile(join(piDir, "api.md"), "utf-8");
+    expect(content).toContain("- ? OAuth2 or JWT?");
+    expect(content).toContain("- ? Which database?");
+  });
+
+  it("errors for nonexistent submodule", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_ask")!;
+    const result = await tool.execute("call-1", {
+      submodule: "nonexistent",
+      question: "Any question?",
+    });
+
+    expect(result.content[0].text).toContain('"nonexistent" not found');
+  });
+});
+
+describe("harness_answer tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-answer-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("answers a staged question", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: .\n\n## Goals\n- [ ] Fix auth\n\n## Questions\n- ? OAuth2 or JWT?\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_answer")!;
+    const result = await tool.execute("call-1", {
+      submodule: "api",
+      question: "OAuth2 or JWT?",
+      answer: "Use JWT with refresh tokens",
+    });
+
+    expect(result.content[0].text).toContain("Answered");
+    expect(result.content[0].text).toContain("0 unanswered remaining");
+
+    const content = await readFile(join(piDir, "api.md"), "utf-8");
+    expect(content).toContain(
+      "- ! OAuth2 or JWT? → Use JWT with refresh tokens",
+    );
+    expect(content).not.toContain("- ? OAuth2 or JWT?");
+  });
+
+  it("fuzzy-matches question text", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: .\n\n## Goals\n- [ ] Fix auth\n\n## Questions\n- ? What auth provider should we use?\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_answer")!;
+    const result = await tool.execute("call-1", {
+      submodule: "api",
+      question: "auth provider",
+      answer: "Firebase Auth",
+    });
+
+    expect(result.content[0].text).toContain("Answered");
+    expect(result.details.remaining).toBe(0);
+  });
+
+  it("errors for no matching unanswered question", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: .\n\n## Goals\n- [ ] Fix auth\n\n## Questions\n- ! OAuth2 or JWT? → JWT\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_answer")!;
+    const result = await tool.execute("call-1", {
+      submodule: "api",
+      question: "OAuth2 or JWT?",
+      answer: "OAuth2",
+    });
+
+    expect(result.content[0].text).toContain("No matching unanswered question");
+  });
+
+  it("skips already-answered questions", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      [
+        "# api",
+        "path: .",
+        "",
+        "## Goals",
+        "- [ ] Fix auth",
+        "",
+        "## Questions",
+        "- ! What DB? → PostgreSQL",
+        "- ? What cache?",
+      ].join("\n") + "\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_answer")!;
+    const result = await tool.execute("call-1", {
+      submodule: "api",
+      question: "What cache?",
+      answer: "Redis",
+    });
+
+    expect(result.content[0].text).toContain("Answered");
+    expect(result.details.remaining).toBe(0);
+
+    // Verify the already-answered one is untouched
+    const content = await readFile(join(piDir, "api.md"), "utf-8");
+    expect(content).toContain("- ! What DB? → PostgreSQL");
+    expect(content).toContain("- ! What cache? → Redis");
+  });
+});
+
+describe("spawnSession with questions", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-spawn-q-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes harness_ask instruction and answered questions", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    const wtDir = join(tmpDir, WORKTREE_DIR);
+    await mkdir(piDir, { recursive: true });
+    await mkdir(wtDir, { recursive: true });
+    await writeFile(
+      join(piDir, "research.md"),
+      [
+        "# research",
+        "path: .",
+        "role: researcher",
+        "",
+        "## Goals",
+        "- [ ] Investigate approach",
+        "",
+        "## Questions",
+        "- ! What DB? → PostgreSQL",
+        "- ? What cache?",
+      ].join("\n") + "\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "add") {
+        await mkdir(args[2], { recursive: true });
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const cmd = mock.getCommand("harness:launch")!;
+    await cmd.handler("", ctx);
+
+    const piCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "pi" && !c[2]?.cwd?.includes(".manager"),
+    );
+    expect(piCalls.length).toBe(1);
+
+    const prompt = piCalls[0][1][1]; // pi -p <prompt>
+    expect(prompt).toContain("## Asking Questions");
+    expect(prompt).toContain("- ? Your question here");
+    expect(prompt).toContain("## Answered Questions");
+    expect(prompt).toContain("- ! What DB? → PostgreSQL");
+  });
+});
+
+describe("tool registration: harness_ask and harness_answer", () => {
+  it("registers both tools", () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    expect(mock.getTool("harness_ask")).toBeDefined();
+    expect(mock.getTool("harness_answer")).toBeDefined();
+  });
+});
+
+describe("harness_status with questions", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-status-q-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes question counts in details", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      [
+        "# api",
+        "path: .",
+        "",
+        "## Goals",
+        "- [ ] Fix auth",
+        "",
+        "## Questions",
+        "- ? OAuth2 or JWT?",
+        "- ! What DB? → PostgreSQL",
+      ].join("\n") + "\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_status")!;
+    const result = await tool.execute("call-1", {});
+
+    expect(result.details.totalQuestions).toBe(2);
+    expect(result.details.unansweredQuestions).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. Full flow: independence integration test
+// ---------------------------------------------------------------------------
+
+describe("full flow: researcher discovers work, stages questions, user answers, worker continues", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-independence-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("complete independence flow", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // 1. Create research task with researcher role
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "auth-research",
+      goals: ["Investigate auth options"],
+      role: "researcher",
+    });
+
+    // Verify goal file created
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    let goalContent = await readFile(join(piDir, "auth-research.md"), "utf-8");
+    expect(goalContent).toContain("role: researcher");
+
+    // 2. Simulate researcher discovering additional goals
+    const updateTool = mock.getTool("harness_update_goal")!;
+    await updateTool.execute("c2", {
+      submodule: "auth-research",
+      action: "add",
+      goal: "Compare OAuth2 vs JWT vs custom",
+    });
+    await updateTool.execute("c3", {
+      submodule: "auth-research",
+      action: "add",
+      goal: "Write recommendation doc",
+    });
+
+    // 3. Researcher stages 2 questions
+    const askTool = mock.getTool("harness_ask")!;
+    await askTool.execute("c4", {
+      submodule: "auth-research",
+      question: "What auth provider should we use? (OAuth2, JWT, custom)",
+    });
+    await askTool.execute("c5", {
+      submodule: "auth-research",
+      question: "What database for session storage?",
+    });
+
+    // 4. Verify questions surfaced in harness_status
+    const statusTool = mock.getTool("harness_status")!;
+    let statusResult = await statusTool.execute("c6", {});
+    expect(statusResult.details.unansweredQuestions).toBe(2);
+    expect(statusResult.details.totalQuestions).toBe(2);
+    expect(statusResult.content[0].text).toContain(
+      "? What auth provider should we use?",
+    );
+    expect(statusResult.content[0].text).toContain(
+      "? What database for session storage?",
+    );
+
+    // 5. User answers first question
+    const answerTool = mock.getTool("harness_answer")!;
+    const answer1 = await answerTool.execute("c7", {
+      submodule: "auth-research",
+      question: "auth provider",
+      answer: "OAuth2 with Auth0",
+    });
+    expect(answer1.content[0].text).toContain("Answered");
+
+    // 6. Verify goal file reflects answer
+    goalContent = await readFile(join(piDir, "auth-research.md"), "utf-8");
+    expect(goalContent).toContain(
+      "- ! What auth provider should we use? (OAuth2, JWT, custom) → OAuth2 with Auth0",
+    );
+
+    // 7. User answers second question
+    const answer2 = await answerTool.execute("c8", {
+      submodule: "auth-research",
+      question: "database for session",
+      answer: "PostgreSQL",
+    });
+    expect(answer2.content[0].text).toContain("0 unanswered remaining");
+
+    // 8. Verify all questions answered
+    statusResult = await statusTool.execute("c9", {});
+    expect(statusResult.details.unansweredQuestions).toBe(0);
+    expect(statusResult.details.totalQuestions).toBe(2);
+
+    // 9. Complete original goal
+    await updateTool.execute("c10", {
+      submodule: "auth-research",
+      action: "complete",
+      goal: "Investigate auth options",
+    });
+
+    // 10. Verify final state: goals, questions, role all consistent
+    goalContent = await readFile(join(piDir, "auth-research.md"), "utf-8");
+    const finalParsed = parseGoalFile(goalContent, "auth-research.md");
+    expect(finalParsed.role).toBe("researcher");
+    expect(finalParsed.goals).toHaveLength(3);
+    expect(finalParsed.goals[0].completed).toBe(true); // Investigate auth options
+    expect(finalParsed.goals[1].completed).toBe(false); // Compare OAuth2 vs JWT
+    expect(finalParsed.goals[2].completed).toBe(false); // Write recommendation doc
+    expect(finalParsed.questions).toHaveLength(2);
+    expect(finalParsed.questions.every((q) => q.answered)).toBe(true);
+    expect(finalParsed.questions[0].answer).toBe("OAuth2 with Auth0");
+    expect(finalParsed.questions[1].answer).toBe("PostgreSQL");
   });
 });
 

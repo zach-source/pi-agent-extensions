@@ -5,7 +5,15 @@
  * the extension end-to-end, including actual git operations.
  * Also tests standalone worktree support (no submodules required).
  */
-import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeAll,
+  beforeEach,
+  afterAll,
+} from "vitest";
 import { mkdtemp, readFile, readdir, mkdir, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -22,6 +30,7 @@ import {
   MANAGER_DIR,
   MANAGER_STATUS_FILE,
   type SubmoduleConfig,
+  type SubmoduleQuestion,
   type LaunchState,
   type ManagerStatusFile,
 } from "./submodule-launcher.js";
@@ -319,6 +328,7 @@ describe("submodule-launcher integration", () => {
         { text: "Setup CI", completed: true },
         { text: "Deploy to staging", completed: false },
       ],
+      questions: [],
       context:
         "This is a test service for integration testing.\nIt uses TypeScript.",
       rawContent: "",
@@ -348,7 +358,10 @@ describe("submodule-launcher integration", () => {
 
     // Use /harness:add to create a task
     const addCmd = mock.getCommand("harness:add")!;
-    await addCmd.handler("refactor-auth Fix login flow, Add session handling", ctx);
+    await addCmd.handler(
+      "refactor-auth Fix login flow, Add session handling",
+      ctx,
+    );
 
     // Verify goal file was created with path: .
     const goalContent = await readFile(
@@ -547,7 +560,10 @@ describe("standalone harness (no submodules)", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:add")!;
-    await cmd.handler("feature-flags Add feature flag system, Add toggle UI", ctx);
+    await cmd.handler(
+      "feature-flags Add feature flag system, Add toggle UI",
+      ctx,
+    );
 
     const content = await readFile(
       join(repo, PI_AGENT_DIR, "feature-flags.md"),
@@ -681,9 +697,7 @@ describe("standalone harness (no submodules)", () => {
     );
 
     // Verify pi was called 3 times: 2 workers + 1 manager
-    const piCalls = mock.api.exec.mock.calls.filter(
-      (c: any) => c[0] === "pi",
-    );
+    const piCalls = mock.api.exec.mock.calls.filter((c: any) => c[0] === "pi");
     expect(piCalls).toHaveLength(3);
 
     // Clean up
@@ -925,9 +939,7 @@ describe("standalone harness (no submodules)", () => {
     await recoverCmd.handler("", ctx);
 
     // Verify a new manager pi session was spawned
-    const piCalls = mock.api.exec.mock.calls.filter(
-      (c: any) => c[0] === "pi",
-    );
+    const piCalls = mock.api.exec.mock.calls.filter((c: any) => c[0] === "pi");
     expect(piCalls).toHaveLength(1);
     expect(piCalls[0][2].cwd).toContain(".manager");
 
@@ -1023,7 +1035,10 @@ describe("standalone harness (no submodules)", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:add")!;
-    await cmd.handler("review-security --role reviewer Audit auth module, Check for XSS", ctx);
+    await cmd.handler(
+      "review-security --role reviewer Audit auth module, Check for XSS",
+      ctx,
+    );
 
     const content = await readFile(
       join(repo, PI_AGENT_DIR, "review-security.md"),
@@ -1090,7 +1105,10 @@ describe("standalone harness (no submodules)", () => {
 
     // 1. Add a task
     const addCmd = mock.getCommand("harness:add")!;
-    await addCmd.handler("lifecycle-test Add new API endpoint, Write tests for endpoint", ctx);
+    await addCmd.handler(
+      "lifecycle-test Add new API endpoint, Write tests for endpoint",
+      ctx,
+    );
 
     // 2. Launch
     interceptPiSpawns(mock);

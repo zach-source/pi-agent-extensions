@@ -51,11 +51,18 @@ export interface SubmoduleGoal {
   completed: boolean;
 }
 
+export interface SubmoduleQuestion {
+  text: string;
+  answered: boolean;
+  answer?: string;
+}
+
 export interface SubmoduleConfig {
   name: string;
   path: string;
   role: string;
   goals: SubmoduleGoal[];
+  questions: SubmoduleQuestion[];
   context: string;
   rawContent: string;
 }
@@ -82,7 +89,8 @@ export const HARNESS_ROLES: HarnessRole[] = [
   {
     name: "architect",
     label: "Architect",
-    persona: "a software architect focused on structure, patterns, and maintainability",
+    persona:
+      "a software architect focused on structure, patterns, and maintainability",
     instructions: [
       "Focus on code organization, module boundaries, and clean interfaces",
       "Reduce duplication by extracting shared abstractions",
@@ -104,7 +112,8 @@ export const HARNESS_ROLES: HarnessRole[] = [
   {
     name: "reviewer",
     label: "Reviewer",
-    persona: "a code quality auditor focused on correctness, security, and performance",
+    persona:
+      "a code quality auditor focused on correctness, security, and performance",
     instructions: [
       "Systematically review code for bugs, security vulnerabilities, and performance issues",
       "Check for OWASP top 10 vulnerabilities and common security pitfalls",
@@ -115,7 +124,8 @@ export const HARNESS_ROLES: HarnessRole[] = [
   {
     name: "researcher",
     label: "Researcher",
-    persona: "a technical researcher focused on exploration, analysis, and documentation",
+    persona:
+      "a technical researcher focused on exploration, analysis, and documentation",
     instructions: [
       "Investigate approaches thoroughly before committing to a direction",
       "Read documentation, explore APIs, and prototype solutions",
@@ -126,7 +136,8 @@ export const HARNESS_ROLES: HarnessRole[] = [
   {
     name: "designer",
     label: "Designer",
-    persona: "a frontend developer focused on UI/UX quality and user experience",
+    persona:
+      "a frontend developer focused on UI/UX quality and user experience",
     instructions: [
       "Prioritize user experience, accessibility (WCAG 2.1 AA), and responsive design",
       "Follow the project's design system and component patterns",
@@ -137,7 +148,8 @@ export const HARNESS_ROLES: HarnessRole[] = [
   {
     name: "builder",
     label: "Builder",
-    persona: "a platform engineer focused on tooling, automation, and developer experience",
+    persona:
+      "a platform engineer focused on tooling, automation, and developer experience",
     instructions: [
       "Focus on CI/CD pipelines, build configurations, and development tooling",
       "Automate repetitive processes and improve developer workflow",
@@ -258,6 +270,40 @@ export function parseGoalFile(
     }
   }
 
+  // Extract questions from ## Questions section
+  const questions: SubmoduleQuestion[] = [];
+  let inQuestions = false;
+  for (const line of lines) {
+    if (/^##\s+Questions/i.test(line)) {
+      inQuestions = true;
+      continue;
+    }
+    if (inQuestions && /^##\s+/.test(line)) {
+      inQuestions = false;
+      continue;
+    }
+    if (inQuestions) {
+      // Answered: - ! question text → answer text
+      const answeredMatch = line.match(/^- ! (.+?) → (.+)$/);
+      if (answeredMatch) {
+        questions.push({
+          text: answeredMatch[1].trim(),
+          answered: true,
+          answer: answeredMatch[2].trim(),
+        });
+        continue;
+      }
+      // Unanswered: - ? question text
+      const unansweredMatch = line.match(/^- \? (.+)$/);
+      if (unansweredMatch) {
+        questions.push({
+          text: unansweredMatch[1].trim(),
+          answered: false,
+        });
+      }
+    }
+  }
+
   // Extract context from ## Context section
   let context = "";
   let inContext = false;
@@ -277,7 +323,7 @@ export function parseGoalFile(
   }
   context = contextLines.join("\n").trim();
 
-  return { name, path, role, goals, context, rawContent: content };
+  return { name, path, role, goals, questions, context, rawContent: content };
 }
 
 export function serializeGoalFile(config: SubmoduleConfig): string {
@@ -292,6 +338,17 @@ export function serializeGoalFile(config: SubmoduleConfig): string {
   for (const goal of config.goals) {
     const check = goal.completed ? "x" : " ";
     lines.push(`- [${check}] ${goal.text}`);
+  }
+  if (config.questions && config.questions.length > 0) {
+    lines.push("");
+    lines.push("## Questions");
+    for (const q of config.questions) {
+      if (q.answered && q.answer) {
+        lines.push(`- ! ${q.text} → ${q.answer}`);
+      } else {
+        lines.push(`- ? ${q.text}`);
+      }
+    }
   }
   if (config.context) {
     lines.push("");
@@ -322,6 +379,17 @@ export function buildProgressSummary(configs: SubmoduleConfig[]): string {
     for (const goal of config.goals) {
       const check = goal.completed ? "x" : " ";
       lines.push(`- [${check}] ${goal.text}`);
+    }
+
+    const unanswered = config.questions?.filter((q) => !q.answered) ?? [];
+    const answered = config.questions?.filter((q) => q.answered) ?? [];
+    if (unanswered.length > 0) {
+      for (const q of unanswered) {
+        lines.push(`- ? ${q.text}`);
+      }
+    }
+    if (answered.length > 0) {
+      lines.push(`(${answered.length} question(s) answered)`);
     }
     lines.push("");
 
@@ -363,6 +431,15 @@ export function buildManagerPrompt(
       config.role && config.role !== "developer"
         ? `Role: ${getRole(config.role).label}`
         : "";
+    const unanswered = config.questions?.filter((q) => !q.answered) ?? [];
+    const questionLines: string[] = [];
+    if (unanswered.length > 0) {
+      questionLines.push(`Unanswered questions (${unanswered.length}):`);
+      for (const q of unanswered) {
+        questionLines.push(`  - ? ${q.text}`);
+      }
+    }
+
     goalSections.push(
       [
         `### ${config.name}`,
@@ -371,6 +448,7 @@ export function buildManagerPrompt(
         branchInfo,
         "",
         goalList,
+        ...questionLines,
       ].join("\n"),
     );
   }
@@ -383,9 +461,7 @@ export function buildManagerPrompt(
   const roleSummaries: string[] = [];
   for (const config of configs) {
     const role = getRole(config.role);
-    roleSummaries.push(
-      `- **${config.name}** — ${role.label}: ${role.persona}`,
-    );
+    roleSummaries.push(`- **${config.name}** — ${role.label}: ${role.persona}`);
   }
 
   return [
@@ -433,6 +509,8 @@ export function buildManagerPrompt(
     `5. Check for \`${stopSignalPath}\` — if present, write final status with status: "stopped" and exit`,
     '6. If all goals are complete across all submodules, set status to "all_complete", auto-merge branches, and exit',
     "7. Track progress: if no goals change between cycles, increment stallCount",
+    "   - **Exception**: workers with unanswered questions (- ? lines in their goal file) are NOT stalled — they are waiting for user input",
+    "   - Include `unansweredQuestions` count per submodule in the status file",
     `8. If stallCount reaches ${MAX_STALLS}, set status to "stalled" and exit`,
     "",
     "## Auto-Merge",
@@ -498,6 +576,28 @@ const AddTaskParams = Type.Object({
 
 type AddTaskInput = Static<typeof AddTaskParams>;
 
+const AskParams = Type.Object({
+  submodule: Type.String({
+    description: "Submodule name (matches filename or # heading)",
+  }),
+  question: Type.String({ description: "Question to stage for the user" }),
+});
+
+type AskInput = Static<typeof AskParams>;
+
+const AnswerParams = Type.Object({
+  submodule: Type.String({
+    description: "Submodule name (matches filename or # heading)",
+  }),
+  question: Type.String({
+    description:
+      "Question text to match (fuzzy match against unanswered questions)",
+  }),
+  answer: Type.String({ description: "Answer to provide" }),
+});
+
+type AnswerInput = Static<typeof AnswerParams>;
+
 // --- Extension ---
 
 export default function (pi: ExtensionAPI) {
@@ -560,6 +660,14 @@ export default function (pi: ExtensionAPI) {
     for (const goal of config.goals) {
       if (!goal.completed) {
         lines.push(`- [ ] ${goal.text}`);
+      }
+    }
+    const answeredQuestions = config.questions?.filter((q) => q.answered) ?? [];
+    if (answeredQuestions.length > 0) {
+      lines.push("");
+      lines.push("## Answered Questions");
+      for (const q of answeredQuestions) {
+        lines.push(`- ! ${q.text} → ${q.answer}`);
       }
     }
     if (config.context) {
@@ -701,6 +809,25 @@ export default function (pi: ExtensionAPI) {
       .map((g) => `- ${g.text}`)
       .join("\n");
 
+    // Build answered questions context
+    const answeredQuestions = config.questions?.filter((q) => q.answered) ?? [];
+    const answeredSection =
+      answeredQuestions.length > 0
+        ? [
+            "",
+            "## Answered Questions",
+            ...answeredQuestions.map((q) => `- ! ${q.text} → ${q.answer}`),
+            "",
+          ].join("\n")
+        : "";
+
+    // Goal file path for worker to write questions
+    const goalFilePath = resolve(
+      cwd,
+      PI_AGENT_DIR,
+      config.name.toLowerCase().replace(/\s+/g, "-") + ".md",
+    );
+
     const prompt = [
       `You are ${role.persona}, working on "${config.name}".`,
       "",
@@ -708,11 +835,17 @@ export default function (pi: ExtensionAPI) {
       goalList,
       "",
       config.context ? `## Context\n${config.context}\n` : "",
+      answeredSection,
       "## Instructions",
       ...role.instructions.map((i) => `- ${i}`),
       `- You are working in a git worktree on branch \`${session.branch}\``,
       "- Update heartbeat.md as you complete tasks",
       "- Do not switch branches",
+      "",
+      "## Asking Questions",
+      `If you need a decision or clarification from the user, write your question to the goal file at \`${goalFilePath}\`.`,
+      "Append to the `## Questions` section using the format: `- ? Your question here`",
+      "Then periodically re-read the goal file to check for answers (lines starting with `- !`).",
     ].join("\n");
 
     pi.exec("pi", ["-p", prompt], {
@@ -735,21 +868,36 @@ export default function (pi: ExtensionAPI) {
       try {
         await pi.exec(
           "git",
-          ["-C", session.worktreePath, "rm", "-f", "--ignore-unmatch", "heartbeat.md"],
+          [
+            "-C",
+            session.worktreePath,
+            "rm",
+            "-f",
+            "--ignore-unmatch",
+            "heartbeat.md",
+          ],
           { cwd },
         );
         // Only commit if there are staged changes (heartbeat.md was tracked)
-        await pi.exec(
-          "git",
-          ["-C", session.worktreePath, "diff", "--cached", "--quiet"],
-          { cwd },
-        ).then(null, async () => {
-          await pi.exec(
+        await pi
+          .exec(
             "git",
-            ["-C", session.worktreePath, "commit", "-m", "chore: remove heartbeat.md before merge"],
+            ["-C", session.worktreePath, "diff", "--cached", "--quiet"],
             { cwd },
-          );
-        });
+          )
+          .then(null, async () => {
+            await pi.exec(
+              "git",
+              [
+                "-C",
+                session.worktreePath,
+                "commit",
+                "-m",
+                "chore: remove heartbeat.md before merge",
+              ],
+              { cwd },
+            );
+          });
       } catch {
         // heartbeat.md may not exist or not be tracked — that's fine
       }
@@ -884,9 +1032,25 @@ export default function (pi: ExtensionAPI) {
       (sum, s) => sum + s.completed,
       0,
     );
+
+    // Check for unanswered questions
+    let questionSuffix = "";
+    try {
+      const configs = await readGoalFiles();
+      const unanswered = configs.reduce(
+        (sum, c) => sum + (c.questions?.filter((q) => !q.answered).length ?? 0),
+        0,
+      );
+      if (unanswered > 0) {
+        questionSuffix = `, ${unanswered}?`;
+      }
+    } catch {
+      // ignore
+    }
+
     ctx.ui.setStatus(
       "harness",
-      `harness: ${doneGoals}/${totalGoals} goals, ${status.status}`,
+      `harness: ${doneGoals}/${totalGoals} goals, ${status.status}${questionSuffix}`,
     );
 
     // Check terminal states
@@ -928,6 +1092,14 @@ export default function (pi: ExtensionAPI) {
       const summary = buildProgressSummary(configs);
       const totalGoals = configs.reduce((sum, c) => sum + c.goals.length, 0);
       const totalDone = configs.reduce((sum, c) => sum + countCompleted(c), 0);
+      const totalQuestions = configs.reduce(
+        (sum, c) => sum + (c.questions?.length ?? 0),
+        0,
+      );
+      const unansweredQuestions = configs.reduce(
+        (sum, c) => sum + (c.questions?.filter((q) => !q.answered).length ?? 0),
+        0,
+      );
 
       return {
         content: [{ type: "text", text: summary }],
@@ -935,6 +1107,8 @@ export default function (pi: ExtensionAPI) {
           submodules: configs.length,
           totalGoals,
           completedGoals: totalDone,
+          totalQuestions,
+          unansweredQuestions,
           loopActive,
         },
       };
@@ -1091,6 +1265,7 @@ export default function (pi: ExtensionAPI) {
         path: params.path ?? ".",
         role: validRole,
         goals: params.goals.map((g) => ({ text: g, completed: false })),
+        questions: [],
         context: params.context ?? "",
         rawContent: "",
       };
@@ -1119,6 +1294,145 @@ export default function (pi: ExtensionAPI) {
           },
         ],
         details: { name, goals: config.goals, path: config.path },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_ask",
+    label: "Ask Harness Question",
+    description:
+      "Stage a question in a submodule's goal file for the user to answer. " +
+      "Workers waiting on answers are not considered stalled.",
+    parameters: AskParams,
+
+    async execute(_toolCallId, params: AskInput) {
+      const configs = await readGoalFiles();
+      const config = configs.find(
+        (c) => c.name.toLowerCase() === params.submodule.toLowerCase(),
+      );
+
+      if (!config) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Submodule "${params.submodule}" not found. Available: ${configs.map((c) => c.name).join(", ") || "none"}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      config.questions.push({
+        text: params.question,
+        answered: false,
+      });
+
+      const serialized = serializeGoalFile(config);
+      const filename = config.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      try {
+        await writeFile(join(piAgentDir(), filename), serialized, "utf-8");
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error writing goal file: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      const unanswered = config.questions.filter((q) => !q.answered).length;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Question staged for ${config.name}: "${params.question}" (${unanswered} unanswered)`,
+          },
+        ],
+        details: { unanswered },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_answer",
+    label: "Answer Harness Question",
+    description:
+      "Answer a staged question in a submodule's goal file. " +
+      "Fuzzy-matches the question text against unanswered questions.",
+    parameters: AnswerParams,
+
+    async execute(_toolCallId, params: AnswerInput) {
+      const configs = await readGoalFiles();
+      const config = configs.find(
+        (c) => c.name.toLowerCase() === params.submodule.toLowerCase(),
+      );
+
+      if (!config) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Submodule "${params.submodule}" not found. Available: ${configs.map((c) => c.name).join(", ") || "none"}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      // Fuzzy-match: find unanswered question whose text includes the search or vice versa
+      const match = config.questions.find(
+        (q) =>
+          !q.answered &&
+          (q.text.toLowerCase().includes(params.question.toLowerCase()) ||
+            params.question.toLowerCase().includes(q.text.toLowerCase())),
+      );
+
+      if (!match) {
+        const unanswered = config.questions.filter((q) => !q.answered);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No matching unanswered question for "${params.question}" in ${config.name}. Unanswered: ${unanswered.map((q) => q.text).join("; ") || "none"}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      match.answered = true;
+      match.answer = params.answer;
+
+      const serialized = serializeGoalFile(config);
+      const filename = config.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      try {
+        await writeFile(join(piAgentDir(), filename), serialized, "utf-8");
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error writing goal file: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      const remaining = config.questions.filter((q) => !q.answered).length;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Answered "${match.text}" → "${params.answer}" for ${config.name} (${remaining} unanswered remaining)`,
+          },
+        ],
+        details: { remaining },
       };
     },
   });
@@ -1219,10 +1533,19 @@ export default function (pi: ExtensionAPI) {
         ? `Loop: active (manager: ${managerStatus?.status ?? "unknown"})`
         : "Loop: inactive";
 
+      const unanswered = configs.reduce(
+        (sum, c) => sum + (c.questions?.filter((q) => !q.answered).length ?? 0),
+        0,
+      );
+      const questionAlert =
+        unanswered > 0
+          ? `\n\n**${unanswered} unanswered question(s)** — use \`harness_answer\` to respond.`
+          : "";
+
       pi.sendMessage(
         {
           customType: "harness-status",
-          content: `${summary}\n${statusLine}`,
+          content: `${summary}\n${statusLine}${questionAlert}`,
           display: true,
         },
         { triggerTurn: false },
@@ -1309,6 +1632,7 @@ export default function (pi: ExtensionAPI) {
             goals: [
               { text: "Define goals for this submodule", completed: false },
             ],
+            questions: [],
             context: "Add context for the agent working on this submodule.",
             rawContent: "",
           });
@@ -1446,7 +1770,8 @@ export default function (pi: ExtensionAPI) {
       // First token is the name, rest are goals (comma-separated or single string)
       const spaceIdx = remaining.indexOf(" ");
       const name = spaceIdx === -1 ? remaining : remaining.slice(0, spaceIdx);
-      const goalsRaw = spaceIdx === -1 ? "" : remaining.slice(spaceIdx + 1).trim();
+      const goalsRaw =
+        spaceIdx === -1 ? "" : remaining.slice(spaceIdx + 1).trim();
 
       if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name)) {
         ctx.ui.notify(
@@ -1481,6 +1806,7 @@ export default function (pi: ExtensionAPI) {
         path: ".",
         role: roleArg,
         goals,
+        questions: [],
         context: "",
         rawContent: "",
       };
