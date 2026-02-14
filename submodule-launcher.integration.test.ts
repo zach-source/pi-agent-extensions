@@ -1268,4 +1268,404 @@ describe("standalone harness (no submodules)", () => {
       "info",
     );
   });
+
+  // --- Question flow with real git operations ---
+
+  it("full question lifecycle: launch worker, worker writes questions to goal file, user answers, worker sees answers", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // 1. Create a researcher task via the tool
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "auth-spike",
+      goals: ["Research auth options", "Write recommendation"],
+      role: "researcher",
+      context: "We need SSO for enterprise customers.",
+    });
+
+    // Verify goal file created with researcher role
+    const goalPath = join(repo, PI_AGENT_DIR, "auth-spike.md");
+    let goalContent = await readFile(goalPath, "utf-8");
+    expect(goalContent).toContain("role: researcher");
+    expect(goalContent).toContain("SSO for enterprise");
+    expect(goalContent).not.toContain("## Questions");
+
+    // 2. Launch the harness (creates real worktree, intercepts pi spawn)
+    const piPrompts: string[] = [];
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          piPrompts.push(args[1]);
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Verify real worktree was created on disk
+    const wtPath = join(repo, WORKTREE_DIR, "auth-spike");
+    const workerBranch = git("branch --show-current", wtPath);
+    expect(workerBranch).toBe("pi-agent/auth-spike");
+
+    // Verify worker prompt includes question instructions
+    const workerPrompt = piPrompts.find(
+      (p) => p.includes("auth-spike") && !p.includes("Launch Manager"),
+    );
+    expect(workerPrompt).toBeDefined();
+    expect(workerPrompt).toContain("## Asking Questions");
+    expect(workerPrompt).toContain("- ? Your question here");
+    expect(workerPrompt).toContain("a technical researcher");
+
+    // 3. Simulate worker discovering it needs decisions — writes questions
+    //    directly to the goal file (as a real worker would via file I/O)
+    const parsed = parseGoalFile(goalContent, "auth-spike.md");
+    expect(parsed.questions).toHaveLength(0);
+
+    // Worker appends a Questions section by re-reading and editing the file
+    goalContent = await readFile(goalPath, "utf-8");
+    // Worker writes questions using the - ? format
+    const withQuestions =
+      goalContent.trimEnd() +
+      "\n\n## Questions\n- ? Should we support SAML or just OIDC?\n- ? Is there a budget constraint for auth provider?\n";
+    await writeFile(goalPath, withQuestions, "utf-8");
+
+    // 4. Verify harness_status surfaces the questions from disk
+    const statusTool = mock.getTool("harness_status")!;
+    let statusResult = await statusTool.execute("c2", {});
+
+    expect(statusResult.details.unansweredQuestions).toBe(2);
+    expect(statusResult.details.totalQuestions).toBe(2);
+    expect(statusResult.content[0].text).toContain(
+      "? Should we support SAML or just OIDC?",
+    );
+    expect(statusResult.content[0].text).toContain(
+      "? Is there a budget constraint",
+    );
+
+    // 5. Verify /harness:status command shows question alert
+    mock.api.sendMessage.mockClear();
+    const statusCmd = mock.getCommand("harness:status")!;
+    await statusCmd.handler("", ctx);
+
+    const statusMsg = mock.api.sendMessage.mock.calls[0][0];
+    expect(statusMsg.content).toContain("2 unanswered question(s)");
+    expect(statusMsg.content).toContain("harness_answer");
+
+    // 6. Verify manager prompt includes questions and stall-exemption
+    //    (simulate recover to capture the new manager prompt)
+    piPrompts.length = 0;
+    mock.api.exec.mockClear();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          piPrompts.push(args[1]);
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const recoverCmd = mock.getCommand("harness:recover")!;
+    await recoverCmd.handler("", ctx);
+
+    const managerPrompt = piPrompts.find((p) => p.includes("Launch Manager"));
+    expect(managerPrompt).toBeDefined();
+    expect(managerPrompt).toContain("Unanswered questions (2)");
+    expect(managerPrompt).toContain("SAML or just OIDC");
+    expect(managerPrompt).toContain("NOT stalled");
+
+    // 7. User answers first question via harness_answer
+    const answerTool = mock.getTool("harness_answer")!;
+    const ans1 = await answerTool.execute("c3", {
+      submodule: "auth-spike",
+      question: "Should we support SAML or just OIDC?",
+      answer: "Support both SAML and OIDC via Auth0",
+    });
+    expect(ans1.content[0].text).toContain("Answered");
+    expect(ans1.details.remaining).toBe(1);
+
+    // 8. Verify the goal file on disk reflects the answer
+    goalContent = await readFile(goalPath, "utf-8");
+    expect(goalContent).toContain(
+      "- ! Should we support SAML or just OIDC? → Support both SAML and OIDC via Auth0",
+    );
+    expect(goalContent).toContain("- ? Is there a budget constraint");
+
+    // 9. User answers second question
+    const ans2 = await answerTool.execute("c4", {
+      submodule: "auth-spike",
+      question: "budget constraint",
+      answer: "Max $500/mo for auth provider",
+    });
+    expect(ans2.details.remaining).toBe(0);
+
+    // 10. Verify all questions answered in status
+    statusResult = await statusTool.execute("c5", {});
+    expect(statusResult.details.unansweredQuestions).toBe(0);
+    expect(statusResult.details.totalQuestions).toBe(2);
+
+    // 11. Simulate worker doing work in the worktree based on answers
+    execSync(
+      `echo "# Auth Recommendation\n\nUse Auth0 with SAML+OIDC, budget max $500/mo" > auth-recommendation.md && git add . && git commit -m "add auth recommendation based on answered questions"`,
+      { cwd: wtPath, shell: "/bin/bash", encoding: "utf-8" },
+    );
+
+    // 12. Complete goals via the tool
+    const updateTool = mock.getTool("harness_update_goal")!;
+    await updateTool.execute("c6", {
+      submodule: "auth-spike",
+      action: "complete",
+      goal: "Research auth options",
+    });
+    await updateTool.execute("c7", {
+      submodule: "auth-spike",
+      action: "complete",
+      goal: "Write recommendation",
+    });
+
+    // 13. Verify status shows DONE with answered questions
+    statusResult = await statusTool.execute("c8", {});
+    expect(statusResult.content[0].text).toContain("DONE");
+    expect(statusResult.content[0].text).toContain("2 question(s) answered");
+    expect(statusResult.details.completedGoals).toBe(2);
+
+    // 14. Merge the worktree branch back to main
+    const mergeCmd = mock.getCommand("harness:merge")!;
+    await mergeCmd.handler("auth-spike", ctx);
+
+    // 15. Verify the recommendation file made it to main
+    const mainFiles = git("ls-files", repo);
+    expect(mainFiles).toContain("auth-recommendation.md");
+
+    // Verify the branch was cleaned up
+    const branches = git("branch", repo);
+    expect(branches).not.toContain("pi-agent/auth-spike");
+
+    // 16. Final goal file state should have everything
+    goalContent = await readFile(goalPath, "utf-8");
+    const finalParsed = parseGoalFile(goalContent, "auth-spike.md");
+    expect(finalParsed.role).toBe("researcher");
+    expect(finalParsed.goals.every((g) => g.completed)).toBe(true);
+    expect(finalParsed.questions).toHaveLength(2);
+    expect(finalParsed.questions.every((q) => q.answered)).toBe(true);
+    expect(finalParsed.questions[0].answer).toBe(
+      "Support both SAML and OIDC via Auth0",
+    );
+    expect(finalParsed.questions[1].answer).toBe(
+      "Max $500/mo for auth provider",
+    );
+  });
+
+  it("turn_end status bar includes question count when questions exist", async () => {
+    const { mock, ctx } = freshHarness();
+
+    // Pre-seed active state
+    await mkdir(join(repo, PI_AGENT_DIR), { recursive: true });
+    await writeFile(
+      join(repo, LAUNCH_STATE_FILE),
+      JSON.stringify({
+        active: true,
+        sessions: {},
+        managerSpawned: true,
+        managerCwd: join(repo, MANAGER_DIR),
+        managerSpawnedAt: new Date().toISOString(),
+      }),
+    );
+
+    // Write a goal file with unanswered questions
+    await writeFile(
+      join(repo, PI_AGENT_DIR, "task.md"),
+      [
+        "# task",
+        "path: .",
+        "",
+        "## Goals",
+        "- [ ] Do something",
+        "",
+        "## Questions",
+        "- ? What approach?",
+        "- ? What priority?",
+        "- ! What DB? → PostgreSQL",
+      ].join("\n") + "\n",
+    );
+
+    // Write a manager status file
+    const status: ManagerStatusFile = {
+      status: "running",
+      updatedAt: new Date().toISOString(),
+      submodules: {
+        task: { completed: 0, total: 1, allDone: false },
+      },
+      stallCount: 0,
+    };
+    await writeFile(
+      join(repo, MANAGER_STATUS_FILE),
+      JSON.stringify(status),
+      "utf-8",
+    );
+
+    await mock.emit("session_start", {}, ctx);
+    ctx.ui.setStatus.mockClear();
+
+    await mock.emit("turn_end", {}, ctx);
+
+    // Status bar should include question count
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: 0/1 goals, running, 2?",
+    );
+  });
+
+  it("heartbeat.md includes answered questions for worker reference", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // Create a task with pre-answered questions via goal file
+    await mkdir(join(repo, PI_AGENT_DIR), { recursive: true });
+    await writeFile(
+      join(repo, PI_AGENT_DIR, "worker-task.md"),
+      [
+        "# worker-task",
+        "path: .",
+        "",
+        "## Goals",
+        "- [ ] Implement feature",
+        "",
+        "## Questions",
+        "- ! What framework? → React",
+        "- ? What testing lib?",
+      ].join("\n") + "\n",
+    );
+
+    interceptPiSpawns(mock);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Read the heartbeat.md written to the worktree
+    const wtPath = join(repo, WORKTREE_DIR, "worker-task");
+    const heartbeat = await readFile(join(wtPath, "heartbeat.md"), "utf-8");
+
+    // Should include answered questions
+    expect(heartbeat).toContain("## Answered Questions");
+    expect(heartbeat).toContain("- ! What framework? → React");
+
+    // Should NOT include unanswered questions in heartbeat
+    expect(heartbeat).not.toContain("What testing lib?");
+
+    // Clean up
+    try {
+      git(`worktree remove ${wtPath} --force`, repo);
+      git("branch -D pi-agent/worker-task", repo);
+    } catch {
+      // ignore
+    }
+  });
+
+  it("worker writes questions directly to goal file, parent reads them back via tool", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // Create task
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "direct-write",
+      goals: ["Build the thing"],
+    });
+
+    // Simulate a worker process writing questions directly to the
+    // goal file (as workers do — they don't have harness_ask, they
+    // use file I/O)
+    const goalPath = join(repo, PI_AGENT_DIR, "direct-write.md");
+    let content = await readFile(goalPath, "utf-8");
+    content =
+      content.trimEnd() +
+      "\n\n## Questions\n- ? Should I use REST or GraphQL?\n";
+    await writeFile(goalPath, content, "utf-8");
+
+    // Parent reads the question via harness_status
+    const statusTool = mock.getTool("harness_status")!;
+    const result = await statusTool.execute("c2", {});
+    expect(result.details.unansweredQuestions).toBe(1);
+    expect(result.content[0].text).toContain("REST or GraphQL");
+
+    // Parent answers via harness_answer
+    const answerTool = mock.getTool("harness_answer")!;
+    await answerTool.execute("c3", {
+      submodule: "direct-write",
+      question: "REST or GraphQL",
+      answer: "Use GraphQL with Apollo Server",
+    });
+
+    // Verify the file on disk — the worker would re-read this
+    content = await readFile(goalPath, "utf-8");
+    const parsed = parseGoalFile(content, "direct-write.md");
+    expect(parsed.questions[0].answered).toBe(true);
+    expect(parsed.questions[0].answer).toBe("Use GraphQL with Apollo Server");
+    expect(content).toContain(
+      "- ! Should I use REST or GraphQL? → Use GraphQL with Apollo Server",
+    );
+  });
+
+  it("harness_ask tool writes question that round-trips through real file I/O", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // Create task
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "roundtrip-test",
+      goals: ["Test round-trip"],
+      context: "Testing question persistence.",
+    });
+
+    // Stage questions via the tool
+    const askTool = mock.getTool("harness_ask")!;
+    await askTool.execute("c2", {
+      submodule: "roundtrip-test",
+      question: "Question Alpha?",
+    });
+    await askTool.execute("c3", {
+      submodule: "roundtrip-test",
+      question: "Question Beta?",
+    });
+
+    // Read raw file and parse it fresh — full disk round-trip
+    const goalPath = join(repo, PI_AGENT_DIR, "roundtrip-test.md");
+    const raw = await readFile(goalPath, "utf-8");
+    const parsed = parseGoalFile(raw, "roundtrip-test.md");
+
+    expect(parsed.questions).toHaveLength(2);
+    expect(parsed.questions[0].text).toBe("Question Alpha?");
+    expect(parsed.questions[0].answered).toBe(false);
+    expect(parsed.questions[1].text).toBe("Question Beta?");
+    expect(parsed.questions[1].answered).toBe(false);
+    expect(parsed.context).toBe("Testing question persistence.");
+    expect(parsed.goals).toHaveLength(1);
+
+    // Answer one, verify ordering preserved
+    const answerTool = mock.getTool("harness_answer")!;
+    await answerTool.execute("c4", {
+      submodule: "roundtrip-test",
+      question: "Beta",
+      answer: "Yes to Beta",
+    });
+
+    const raw2 = await readFile(goalPath, "utf-8");
+    const parsed2 = parseGoalFile(raw2, "roundtrip-test.md");
+    expect(parsed2.questions[0]).toEqual({
+      text: "Question Alpha?",
+      answered: false,
+    });
+    expect(parsed2.questions[1]).toEqual({
+      text: "Question Beta?",
+      answered: true,
+      answer: "Yes to Beta",
+    });
+  });
 });
