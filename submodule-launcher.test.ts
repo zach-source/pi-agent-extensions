@@ -8,6 +8,8 @@ import {
   buildProgressSummary,
   buildManagerPrompt,
   readManagerStatus,
+  getRole,
+  HARNESS_ROLES,
   MAX_STALLS,
   CONTEXT_CRITICAL_PERCENT,
   PI_AGENT_DIR,
@@ -19,6 +21,7 @@ import {
   MANAGER_STALE_THRESHOLD_MS,
   type SubmoduleConfig,
   type SubmoduleGoal,
+  type HarnessRole,
   type LaunchState,
   type ManagerStatusFile,
 } from "./submodule-launcher.js";
@@ -208,6 +211,32 @@ describe("parseGoalFile", () => {
     expect(result.path).toBe(".");
     expect(result.goals).toHaveLength(1);
   });
+
+  it("parses role field", () => {
+    const content = [
+      "# refactor-auth",
+      "path: .",
+      "role: architect",
+      "",
+      "## Goals",
+      "- [ ] Extract auth logic",
+    ].join("\n");
+
+    const result = parseGoalFile(content, "refactor-auth.md");
+    expect(result.role).toBe("architect");
+  });
+
+  it('defaults role to "developer" when missing', () => {
+    const content = "# task\npath: .\n\n## Goals\n- [ ] Do something\n";
+    const result = parseGoalFile(content, "task.md");
+    expect(result.role).toBe("developer");
+  });
+
+  it('defaults invalid role to "developer"', () => {
+    const content = "# task\npath: .\nrole: ninja\n\n## Goals\n- [ ] Do something\n";
+    const result = parseGoalFile(content, "task.md");
+    expect(result.role).toBe("developer");
+  });
 });
 
 describe("serializeGoalFile", () => {
@@ -215,6 +244,7 @@ describe("serializeGoalFile", () => {
     const original: SubmoduleConfig = {
       name: "web-client",
       path: "apps/web",
+      role: "developer",
       goals: [
         { text: "Implement login form", completed: false },
         { text: "Add unit tests", completed: true },
@@ -228,6 +258,7 @@ describe("serializeGoalFile", () => {
 
     expect(parsed.name).toBe(original.name);
     expect(parsed.path).toBe(original.path);
+    expect(parsed.role).toBe(original.role);
     expect(parsed.goals).toEqual(original.goals);
     expect(parsed.context).toBe(original.context);
   });
@@ -236,6 +267,7 @@ describe("serializeGoalFile", () => {
     const config: SubmoduleConfig = {
       name: "test",
       path: "test/path",
+      role: "developer",
       goals: [{ text: "Do something", completed: false }],
       context: "",
       rawContent: "",
@@ -243,6 +275,38 @@ describe("serializeGoalFile", () => {
 
     const serialized = serializeGoalFile(config);
     expect(serialized).not.toContain("## Context");
+  });
+
+  it('omits role when "developer"', () => {
+    const config: SubmoduleConfig = {
+      name: "test",
+      path: ".",
+      role: "developer",
+      goals: [{ text: "Do something", completed: false }],
+      context: "",
+      rawContent: "",
+    };
+
+    const serialized = serializeGoalFile(config);
+    expect(serialized).not.toContain("role:");
+  });
+
+  it("includes role when non-default", () => {
+    const config: SubmoduleConfig = {
+      name: "test",
+      path: ".",
+      role: "architect",
+      goals: [{ text: "Refactor module", completed: false }],
+      context: "",
+      rawContent: "",
+    };
+
+    const serialized = serializeGoalFile(config);
+    expect(serialized).toContain("role: architect");
+
+    // Verify round-trip
+    const parsed = parseGoalFile(serialized, "test.md");
+    expect(parsed.role).toBe("architect");
   });
 });
 
@@ -252,6 +316,7 @@ describe("buildProgressSummary", () => {
       {
         name: "api",
         path: "services/api",
+        role: "developer",
         goals: [
           { text: "Fix auth", completed: true },
           { text: "Add caching", completed: false },
@@ -262,6 +327,7 @@ describe("buildProgressSummary", () => {
       {
         name: "web",
         path: "apps/web",
+        role: "developer",
         goals: [{ text: "Login form", completed: false }],
         context: "",
         rawContent: "",
@@ -281,6 +347,7 @@ describe("buildProgressSummary", () => {
       {
         name: "api",
         path: "services/api",
+        role: "developer",
         goals: [{ text: "Done", completed: true }],
         context: "",
         rawContent: "",
@@ -291,6 +358,32 @@ describe("buildProgressSummary", () => {
     expect(summary).toContain("DONE");
     expect(summary).toContain("All submodule goals are complete");
   });
+
+  it("shows role tag for non-default roles", () => {
+    const configs: SubmoduleConfig[] = [
+      {
+        name: "refactor-auth",
+        path: ".",
+        role: "architect",
+        goals: [{ text: "Extract module", completed: false }],
+        context: "",
+        rawContent: "",
+      },
+      {
+        name: "add-tests",
+        path: ".",
+        role: "developer",
+        goals: [{ text: "Write tests", completed: false }],
+        context: "",
+        rawContent: "",
+      },
+    ];
+
+    const summary = buildProgressSummary(configs);
+    expect(summary).toContain("refactor-auth [Architect]");
+    expect(summary).not.toContain("add-tests [Developer]");
+    expect(summary).toContain("add-tests (0/1");
+  });
 });
 
 describe("buildManagerPrompt", () => {
@@ -299,6 +392,7 @@ describe("buildManagerPrompt", () => {
       {
         name: "api",
         path: "services/api",
+        role: "developer",
         goals: [
           { text: "Fix auth", completed: false },
           { text: "Add tests", completed: true },
@@ -333,6 +427,7 @@ describe("buildManagerPrompt", () => {
       {
         name: "web",
         path: "apps/web",
+        role: "developer",
         goals: [{ text: "Task", completed: false }],
         context: "",
         rawContent: "",
@@ -342,6 +437,22 @@ describe("buildManagerPrompt", () => {
     const prompt = buildManagerPrompt(configs, [], "/tmp/project");
     expect(prompt).toContain("No active session");
     expect(prompt).toContain("web");
+  });
+
+  it("includes role info for non-default roles", () => {
+    const configs: SubmoduleConfig[] = [
+      {
+        name: "refactor",
+        path: ".",
+        role: "architect",
+        goals: [{ text: "Restructure", completed: false }],
+        context: "",
+        rawContent: "",
+      },
+    ];
+
+    const prompt = buildManagerPrompt(configs, [], "/tmp/project");
+    expect(prompt).toContain("Role: Architect");
   });
 });
 
@@ -1626,6 +1737,287 @@ describe("harness_add_task tool", () => {
     });
 
     expect(result.content[0].text).toContain("already exists");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Role-related tests
+// ---------------------------------------------------------------------------
+
+describe("HARNESS_ROLES", () => {
+  it("has expected roles", () => {
+    const names = HARNESS_ROLES.map((r) => r.name);
+    expect(names).toEqual([
+      "developer",
+      "architect",
+      "tester",
+      "reviewer",
+      "researcher",
+      "designer",
+      "builder",
+    ]);
+  });
+
+  it("each role has required fields", () => {
+    for (const role of HARNESS_ROLES) {
+      expect(role.name).toBeTruthy();
+      expect(role.label).toBeTruthy();
+      expect(role.persona).toBeTruthy();
+      expect(role.instructions.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("getRole", () => {
+  it("returns matching role", () => {
+    const role = getRole("architect");
+    expect(role.name).toBe("architect");
+    expect(role.label).toBe("Architect");
+  });
+
+  it("falls back to developer for unknown role", () => {
+    const role = getRole("unknown");
+    expect(role.name).toBe("developer");
+  });
+});
+
+describe("spawnSession uses role persona and instructions", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-spawn-role-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("injects architect persona into worker prompt", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    const wtDir = join(tmpDir, WORKTREE_DIR);
+    await mkdir(piDir, { recursive: true });
+    await mkdir(wtDir, { recursive: true });
+    await writeFile(
+      join(piDir, "refactor.md"),
+      "# refactor\npath: .\nrole: architect\n\n## Goals\n- [ ] Extract module\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "add") {
+        await mkdir(args[2], { recursive: true });
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const cmd = mock.getCommand("harness:launch")!;
+    await cmd.handler("", ctx);
+
+    // Find the worker pi call (not the manager)
+    const piCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "pi" && !c[2]?.cwd?.includes(".manager"),
+    );
+    expect(piCalls.length).toBe(1);
+
+    const prompt = piCalls[0][1][1]; // pi -p <prompt>
+    expect(prompt).toContain("a software architect focused on structure");
+    expect(prompt).toContain("working on \"refactor\"");
+    expect(prompt).toContain("Focus on code organization");
+    expect(prompt).toContain("Reduce duplication");
+    expect(prompt).not.toContain("Write tests first (red)");
+  });
+
+  it("uses developer role by default", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    const wtDir = join(tmpDir, WORKTREE_DIR);
+    await mkdir(piDir, { recursive: true });
+    await mkdir(wtDir, { recursive: true });
+    await writeFile(
+      join(piDir, "task.md"),
+      "# task\npath: .\n\n## Goals\n- [ ] Build feature\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "add") {
+        await mkdir(args[2], { recursive: true });
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const cmd = mock.getCommand("harness:launch")!;
+    await cmd.handler("", ctx);
+
+    const piCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "pi" && !c[2]?.cwd?.includes(".manager"),
+    );
+    expect(piCalls.length).toBe(1);
+
+    const prompt = piCalls[0][1][1];
+    expect(prompt).toContain("a methodical software developer");
+    expect(prompt).toContain("Write tests first (red)");
+  });
+});
+
+describe("harness_add_task with role parameter", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-add-role-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("creates goal file with specified role", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    await tool.execute("call-1", {
+      name: "security-audit",
+      goals: ["Audit auth module"],
+      role: "reviewer",
+    });
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "security-audit.md"),
+      "utf-8",
+    );
+    expect(content).toContain("role: reviewer");
+
+    const parsed = parseGoalFile(content, "security-audit.md");
+    expect(parsed.role).toBe("reviewer");
+  });
+
+  it("defaults to developer when role not specified", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    await tool.execute("call-1", {
+      name: "basic-task",
+      goals: ["Do something"],
+    });
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "basic-task.md"),
+      "utf-8",
+    );
+    expect(content).not.toContain("role:");
+
+    const parsed = parseGoalFile(content, "basic-task.md");
+    expect(parsed.role).toBe("developer");
+  });
+
+  it("falls back to developer for invalid role", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_add_task")!;
+    await tool.execute("call-1", {
+      name: "bad-role-task",
+      goals: ["Do something"],
+      role: "ninja",
+    });
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "bad-role-task.md"),
+      "utf-8",
+    );
+    expect(content).not.toContain("role:");
+
+    const parsed = parseGoalFile(content, "bad-role-task.md");
+    expect(parsed.role).toBe("developer");
+  });
+});
+
+describe("/harness:add with --role flag", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-add-role-cmd-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("parses --role flag and creates goal file with role", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("refactor-auth --role architect Improve module boundaries, Extract interfaces", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "refactor-auth.md"),
+      "utf-8",
+    );
+    expect(content).toContain("role: architect");
+    expect(content).toContain("Improve module boundaries");
+    expect(content).toContain("Extract interfaces");
+    expect(content).not.toContain("--role");
+  });
+
+  it("handles --role flag before task name", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("--role tester add-tests Write unit tests, Write e2e tests", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "add-tests.md"),
+      "utf-8",
+    );
+    expect(content).toContain("role: tester");
+    expect(content).toContain("Write unit tests");
+  });
+
+  it("defaults to developer without --role flag", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("simple-task Do something", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "simple-task.md"),
+      "utf-8",
+    );
+    expect(content).not.toContain("role:");
+  });
+
+  it("ignores invalid --role value and defaults to developer", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("bad-role --role ninja Do something", ctx);
+
+    const content = await readFile(
+      join(tmpDir, PI_AGENT_DIR, "bad-role.md"),
+      "utf-8",
+    );
+    expect(content).not.toContain("role:");
+
+    const parsed = parseGoalFile(content, "bad-role.md");
+    expect(parsed.role).toBe("developer");
   });
 });
 

@@ -7,6 +7,19 @@
  * worker progress, writes status to `.manager-status.json`, and auto-merges
  * completed branches. The parent session reads status passively.
  *
+ * Worker Roles:
+ *   Each worker can be assigned a role that shapes its behavioral persona
+ *   and instructions. Roles are specified via `role:` in goal files or
+ *   the `--role` flag when adding tasks.
+ *
+ *   developer   - (default) General implementation — features, bug fixes, TDD
+ *   architect   - Refactoring, design patterns, API boundaries, code organization
+ *   tester      - Test coverage — unit/integration/e2e tests, edge cases
+ *   reviewer    - Code quality audit — bugs, security, performance, style
+ *   researcher  - Exploration, prototyping, investigation, writing findings
+ *   designer    - UI/UX implementation — components, user flows, accessibility
+ *   builder     - Tooling & infrastructure — CI/CD, Docker, build configs
+ *
  * Tools:
  *   harness_status      - LLM-callable progress check across all submodules
  *   harness_update_goal - Add/complete/remove goals for a submodule
@@ -17,7 +30,7 @@
  *   /harness:status    - Show progress of all submodules
  *   /harness:stop      - Write stop signal, deactivate loop
  *   /harness:init      - Discover submodules, scaffold .pi-agent/
- *   /harness:add       - Create a standalone worktree task
+ *   /harness:add       - Create a standalone worktree task (supports --role flag)
  *   /harness:merge     - Merge a specific submodule's worktree branch back
  *   /harness:recover   - Respawn stale/dead manager
  *
@@ -41,9 +54,101 @@ export interface SubmoduleGoal {
 export interface SubmoduleConfig {
   name: string;
   path: string;
+  role: string;
   goals: SubmoduleGoal[];
   context: string;
   rawContent: string;
+}
+
+export interface HarnessRole {
+  name: string;
+  label: string;
+  persona: string;
+  instructions: string[];
+}
+
+export const HARNESS_ROLES: HarnessRole[] = [
+  {
+    name: "developer",
+    label: "Developer",
+    persona: "a methodical software developer focused on clean, working code",
+    instructions: [
+      "Write tests first (red), then implementation (green), then refactor",
+      "Commit incrementally after each meaningful change",
+      "Follow existing code patterns and conventions in the repository",
+      "Keep changes focused — avoid scope creep beyond the stated goals",
+    ],
+  },
+  {
+    name: "architect",
+    label: "Architect",
+    persona: "a software architect focused on structure, patterns, and maintainability",
+    instructions: [
+      "Focus on code organization, module boundaries, and clean interfaces",
+      "Reduce duplication by extracting shared abstractions",
+      "Ensure changes maintain backward compatibility where possible",
+      "Document architectural decisions and rationale in code comments",
+    ],
+  },
+  {
+    name: "tester",
+    label: "Tester",
+    persona: "a quality engineer focused on comprehensive test coverage",
+    instructions: [
+      "Write thorough tests covering happy paths, edge cases, and error conditions",
+      "Use the project's existing test framework and patterns",
+      "Aim for high coverage of branches and boundary conditions",
+      "Include both unit tests and integration tests where appropriate",
+    ],
+  },
+  {
+    name: "reviewer",
+    label: "Reviewer",
+    persona: "a code quality auditor focused on correctness, security, and performance",
+    instructions: [
+      "Systematically review code for bugs, security vulnerabilities, and performance issues",
+      "Check for OWASP top 10 vulnerabilities and common security pitfalls",
+      "Identify potential race conditions, memory leaks, and error handling gaps",
+      "Create targeted fixes for each issue found, with clear commit messages",
+    ],
+  },
+  {
+    name: "researcher",
+    label: "Researcher",
+    persona: "a technical researcher focused on exploration, analysis, and documentation",
+    instructions: [
+      "Investigate approaches thoroughly before committing to a direction",
+      "Read documentation, explore APIs, and prototype solutions",
+      "Document findings, trade-offs, and recommendations in markdown files",
+      "Focus on understanding before implementation",
+    ],
+  },
+  {
+    name: "designer",
+    label: "Designer",
+    persona: "a frontend developer focused on UI/UX quality and user experience",
+    instructions: [
+      "Prioritize user experience, accessibility (WCAG 2.1 AA), and responsive design",
+      "Follow the project's design system and component patterns",
+      "Test across viewport sizes and interaction modes",
+      "Write semantic HTML and maintain consistent styling",
+    ],
+  },
+  {
+    name: "builder",
+    label: "Builder",
+    persona: "a platform engineer focused on tooling, automation, and developer experience",
+    instructions: [
+      "Focus on CI/CD pipelines, build configurations, and development tooling",
+      "Automate repetitive processes and improve developer workflow",
+      "Ensure configs are reproducible and well-documented",
+      "Test infrastructure changes in isolation before merging",
+    ],
+  },
+];
+
+export function getRole(name: string): HarnessRole {
+  return HARNESS_ROLES.find((r) => r.name === name) ?? HARNESS_ROLES[0];
 }
 
 export interface SubmoduleSession {
@@ -120,6 +225,16 @@ export function parseGoalFile(
     path = pathMatch[1].trim();
   }
 
+  // Extract role from "role:" field (default to "developer")
+  let role = "developer";
+  const roleMatch = content.match(/^role:\s*(.+)$/m);
+  if (roleMatch) {
+    const parsed = roleMatch[1].trim().toLowerCase();
+    if (HARNESS_ROLES.some((r) => r.name === parsed)) {
+      role = parsed;
+    }
+  }
+
   // Extract goals from ## Goals section
   const goals: SubmoduleGoal[] = [];
   let inGoals = false;
@@ -162,13 +277,16 @@ export function parseGoalFile(
   }
   context = contextLines.join("\n").trim();
 
-  return { name, path, goals, context, rawContent: content };
+  return { name, path, role, goals, context, rawContent: content };
 }
 
 export function serializeGoalFile(config: SubmoduleConfig): string {
   const lines: string[] = [];
   lines.push(`# ${config.name}`);
   lines.push(`path: ${config.path}`);
+  if (config.role && config.role !== "developer") {
+    lines.push(`role: ${config.role}`);
+  }
   lines.push("");
   lines.push("## Goals");
   for (const goal of config.goals) {
@@ -195,7 +313,11 @@ export function buildProgressSummary(configs: SubmoduleConfig[]): string {
     const done = config.goals.filter((g) => g.completed).length;
     const pct = total > 0 ? Math.round((done / total) * 100) : 0;
     const status = done === total ? "DONE" : `${done}/${total}`;
-    lines.push(`### ${config.name} (${status}, ${pct}%)`);
+    const roleTag =
+      config.role && config.role !== "developer"
+        ? ` [${getRole(config.role).label}]`
+        : "";
+    lines.push(`### ${config.name}${roleTag} (${status}, ${pct}%)`);
 
     for (const goal of config.goals) {
       const check = goal.completed ? "x" : " ";
@@ -237,10 +359,15 @@ export function buildManagerPrompt(
     const branchInfo = session
       ? `Branch: \`${session.branch}\`, Worktree: \`${session.worktreePath}\``
       : "No active session";
+    const roleInfo =
+      config.role && config.role !== "developer"
+        ? `Role: ${getRole(config.role).label}`
+        : "";
     goalSections.push(
       [
         `### ${config.name}`,
         `Path: ${config.path}`,
+        ...(roleInfo ? [roleInfo] : []),
         branchInfo,
         "",
         goalList,
@@ -252,6 +379,15 @@ export function buildManagerPrompt(
   const statusFilePath = resolve(baseCwd, MANAGER_STATUS_FILE);
   const stopSignalPath = resolve(baseCwd, STOP_SIGNAL_FILE);
 
+  // Build role awareness section if any workers have non-default roles
+  const roleSummaries: string[] = [];
+  for (const config of configs) {
+    const role = getRole(config.role);
+    roleSummaries.push(
+      `- **${config.name}** — ${role.label}: ${role.persona}`,
+    );
+  }
+
   return [
     "You are the Launch Manager for a multi-submodule development orchestration.",
     "",
@@ -261,11 +397,30 @@ export function buildManagerPrompt(
     "## Current Submodules",
     ...goalSections,
     "",
+    "## Worker Roles",
+    "Each worker has a specialized role that determines how they approach their goals:",
+    ...roleSummaries,
+    "",
+    "On each heartbeat cycle, consider each worker's role when evaluating progress:",
+    "- **Architects** may take longer on individual goals but produce structural improvements — don't flag as stalled prematurely",
+    "- **Testers** should be producing test files — check for test coverage artifacts",
+    "- **Reviewers** should be creating targeted fix commits — look for review/audit output",
+    "- **Researchers** should be producing documentation or findings — check for markdown output",
+    "- **Designers** should be focused on UI/UX files — check for component changes",
+    "- **Builders** should be modifying CI/CD and tooling configs — check for infrastructure files",
+    "- **Developers** follow standard TDD workflow — expect incremental commits",
+    "",
+    "When a new worker is launched mid-session, read its goal file to understand its role and dispatch",
+    "role-appropriate guidance: remind architects to document decisions, remind testers to cover edge cases,",
+    "remind reviewers to check OWASP top 10, etc.",
+    "",
     "## Instructions",
     "Every heartbeat cycle:",
     `1. Read each *.md goal file from \`${piAgentPath}\``,
     "2. Count completed vs total goals for each submodule",
-    `3. Write status to \`${statusFilePath}\` as JSON:`,
+    "3. Check for any new goal files that weren't present in the previous cycle (new workers launched)",
+    "   - For new workers: note their role and include role-specific guidance in the status message",
+    `4. Write status to \`${statusFilePath}\` as JSON:`,
     "   ```json",
     "   {",
     '     "status": "running|stalled|all_complete|stopped|error",',
@@ -275,10 +430,10 @@ export function buildManagerPrompt(
     '     "message": "<human-readable status>"',
     "   }",
     "   ```",
-    `4. Check for \`${stopSignalPath}\` — if present, write final status with status: "stopped" and exit`,
-    '5. If all goals are complete across all submodules, set status to "all_complete", auto-merge branches, and exit',
-    "6. Track progress: if no goals change between cycles, increment stallCount",
-    `7. If stallCount reaches ${MAX_STALLS}, set status to "stalled" and exit`,
+    `5. Check for \`${stopSignalPath}\` — if present, write final status with status: "stopped" and exit`,
+    '6. If all goals are complete across all submodules, set status to "all_complete", auto-merge branches, and exit',
+    "7. Track progress: if no goals change between cycles, increment stallCount",
+    `8. If stallCount reaches ${MAX_STALLS}, set status to "stalled" and exit`,
     "",
     "## Auto-Merge",
     "When all goals for a submodule are complete, merge its worktree branch back:",
@@ -332,6 +487,12 @@ const AddTaskParams = Type.Object({
   ),
   path: Type.Optional(
     Type.String({ description: "Subdirectory focus (default: '.')" }),
+  ),
+  role: Type.Optional(
+    Type.String({
+      description:
+        "Worker role: developer (default), architect, tester, reviewer, researcher, designer, builder",
+    }),
   ),
 });
 
@@ -515,23 +676,24 @@ export default function (pi: ExtensionAPI) {
     session: SubmoduleSession,
     config: SubmoduleConfig,
   ): void {
+    const role = getRole(config.role);
+
     const goalList = config.goals
       .filter((g) => !g.completed)
       .map((g) => `- ${g.text}`)
       .join("\n");
 
     const prompt = [
-      `You are working on the "${config.name}" submodule.`,
+      `You are ${role.persona}, working on "${config.name}".`,
       "",
       "## Goals",
       goalList,
       "",
       config.context ? `## Context\n${config.context}\n` : "",
       "## Instructions",
-      "- Work through the goals in order",
-      "- Commit incrementally after each meaningful change",
-      "- Update heartbeat.md as you complete tasks",
+      ...role.instructions.map((i) => `- ${i}`),
       `- You are working in a git worktree on branch \`${session.branch}\``,
+      "- Update heartbeat.md as you complete tasks",
       "- Do not switch branches",
     ].join("\n");
 
@@ -875,9 +1037,15 @@ export default function (pi: ExtensionAPI) {
         // File doesn't exist — proceed
       }
 
+      const roleName = params.role?.trim().toLowerCase() ?? "developer";
+      const validRole = HARNESS_ROLES.some((r) => r.name === roleName)
+        ? roleName
+        : "developer";
+
       const config: SubmoduleConfig = {
         name,
         path: params.path ?? ".",
+        role: validRole,
         goals: params.goals.map((g) => ({ text: g, completed: false })),
         context: params.context ?? "",
         rawContent: "",
@@ -1093,6 +1261,7 @@ export default function (pi: ExtensionAPI) {
           const content = serializeGoalFile({
             name: sub.name,
             path: sub.path,
+            role: "developer",
             goals: [
               { text: "Define goals for this submodule", completed: false },
             ],
@@ -1218,10 +1387,22 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Parse --role <name> flag before splitting name and goals
+      let roleArg = "developer";
+      let remaining = trimmed;
+      const roleFlag = remaining.match(/--role\s+(\S+)/);
+      if (roleFlag) {
+        const parsed = roleFlag[1].toLowerCase();
+        if (HARNESS_ROLES.some((r) => r.name === parsed)) {
+          roleArg = parsed;
+        }
+        remaining = remaining.replace(roleFlag[0], "").trim();
+      }
+
       // First token is the name, rest are goals (comma-separated or single string)
-      const spaceIdx = trimmed.indexOf(" ");
-      const name = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const goalsRaw = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+      const spaceIdx = remaining.indexOf(" ");
+      const name = spaceIdx === -1 ? remaining : remaining.slice(0, spaceIdx);
+      const goalsRaw = spaceIdx === -1 ? "" : remaining.slice(spaceIdx + 1).trim();
 
       if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name)) {
         ctx.ui.notify(
@@ -1254,6 +1435,7 @@ export default function (pi: ExtensionAPI) {
       const config: SubmoduleConfig = {
         name,
         path: ".",
+        role: roleArg,
         goals,
         context: "",
         rawContent: "",

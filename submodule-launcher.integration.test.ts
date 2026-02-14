@@ -14,6 +14,7 @@ import {
   parseGoalFile,
   serializeGoalFile,
   buildProgressSummary,
+  HARNESS_ROLES,
   PI_AGENT_DIR,
   WORKTREE_DIR,
   LAUNCH_STATE_FILE,
@@ -312,6 +313,7 @@ describe("submodule-launcher integration", () => {
     const config: SubmoduleConfig = {
       name: "test-service",
       path: "services/test",
+      role: "tester",
       goals: [
         { text: "Write unit tests", completed: false },
         { text: "Setup CI", completed: true },
@@ -327,6 +329,7 @@ describe("submodule-launcher integration", () => {
 
     expect(parsed.name).toBe(config.name);
     expect(parsed.path).toBe(config.path);
+    expect(parsed.role).toBe(config.role);
     expect(parsed.goals).toEqual(config.goals);
     expect(parsed.context).toBe(config.context);
   });
@@ -945,6 +948,94 @@ describe("standalone harness (no submodules)", () => {
     } catch {
       // ignore
     }
+  });
+
+  // --- standalone worktree with role ---
+
+  it("standalone worktree with role: creates task with architect role, launches, verifies prompt", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // Create a task with architect role via the tool
+    const tool = mock.getTool("harness_add_task")!;
+    await tool.execute("c1", {
+      name: "role-test",
+      goals: ["Restructure auth module", "Define clean interfaces"],
+      role: "architect",
+    });
+
+    // Verify goal file has role
+    const goalContent = await readFile(
+      join(repo, PI_AGENT_DIR, "role-test.md"),
+      "utf-8",
+    );
+    expect(goalContent).toContain("role: architect");
+    const parsed = parseGoalFile(goalContent, "role-test.md");
+    expect(parsed.role).toBe("architect");
+
+    // Override pi.exec to capture the prompt but not actually spawn
+    const piPrompts: string[] = [];
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") {
+          piPrompts.push(args[1]); // -p <prompt>
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    // Launch
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Find the worker prompt (not the manager prompt)
+    const workerPrompt = piPrompts.find(
+      (p) => p.includes("role-test") && !p.includes("Launch Manager"),
+    );
+    expect(workerPrompt).toBeDefined();
+    expect(workerPrompt).toContain("a software architect focused on structure");
+    expect(workerPrompt).toContain('working on "role-test"');
+    expect(workerPrompt).toContain("Focus on code organization");
+    expect(workerPrompt).toContain("Reduce duplication");
+    expect(workerPrompt).not.toContain("Write tests first (red)");
+
+    // Verify status shows the role tag
+    const statusTool = mock.getTool("harness_status")!;
+    const statusResult = await statusTool.execute("c2", {});
+    expect(statusResult.content[0].text).toContain("role-test [Architect]");
+
+    // Clean up worktree
+    const wtPath = join(repo, WORKTREE_DIR, "role-test");
+    try {
+      git(`worktree remove ${wtPath} --force`, repo);
+      git("branch -D pi-agent/role-test", repo);
+    } catch {
+      // ignore
+    }
+  });
+
+  // --- /harness:add with --role flag ---
+
+  it("/harness:add with --role flag creates task with correct role", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:add")!;
+    await cmd.handler("review-security --role reviewer Audit auth module, Check for XSS", ctx);
+
+    const content = await readFile(
+      join(repo, PI_AGENT_DIR, "review-security.md"),
+      "utf-8",
+    );
+    expect(content).toContain("role: reviewer");
+    expect(content).toContain("Audit auth module");
+    expect(content).toContain("Check for XSS");
+
+    const parsed = parseGoalFile(content, "review-security.md");
+    expect(parsed.role).toBe("reviewer");
+    expect(parsed.goals).toHaveLength(2);
   });
 
   // --- turn_end reads manager status for standalone harness ---
