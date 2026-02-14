@@ -653,10 +653,28 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Write heartbeat.md into the worktree
+    // Write heartbeat.md into the worktree (untracked working file for
+    // the heartbeat extension — should NOT be committed/merged).
     const heartbeatContent = buildHeartbeatMd(config);
     try {
       await writeFile(join(wtPath, "heartbeat.md"), heartbeatContent, "utf-8");
+      // Ensure heartbeat.md is gitignored so workers' `git add .` won't
+      // pick it up and cause merge conflicts across parallel worktrees.
+      const gitignorePath = join(wtPath, ".gitignore");
+      let existing = "";
+      try {
+        existing = await readFile(gitignorePath, "utf-8");
+      } catch {
+        // No .gitignore yet
+      }
+      if (!existing.includes("heartbeat.md")) {
+        const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+        await writeFile(
+          gitignorePath,
+          existing + separator + "heartbeat.md\n",
+          "utf-8",
+        );
+      }
     } catch {
       // Worktree path might not exist yet
     }
@@ -712,13 +730,39 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     const submodulePath = join(cwd, config.path);
     try {
+      // Remove heartbeat.md from the branch before merge to prevent
+      // conflicts (heartbeat.md is a working file, not project code).
+      try {
+        await pi.exec(
+          "git",
+          ["-C", session.worktreePath, "rm", "-f", "--ignore-unmatch", "heartbeat.md"],
+          { cwd },
+        );
+        // Only commit if there are staged changes (heartbeat.md was tracked)
+        await pi.exec(
+          "git",
+          ["-C", session.worktreePath, "diff", "--cached", "--quiet"],
+          { cwd },
+        ).then(null, async () => {
+          await pi.exec(
+            "git",
+            ["-C", session.worktreePath, "commit", "-m", "chore: remove heartbeat.md before merge"],
+            { cwd },
+          );
+        });
+      } catch {
+        // heartbeat.md may not exist or not be tracked — that's fine
+      }
+
       await pi.exec("git", ["merge", session.branch, "--no-edit"], {
         cwd: submodulePath,
       });
       await pi.exec("git", ["worktree", "remove", session.worktreePath], {
         cwd,
       });
-      await pi.exec("git", ["branch", "-d", session.branch], { cwd });
+      // Use -D (force) since the pre-merge cleanup commit makes -d think
+      // the branch isn't fully merged even though all real work is merged.
+      await pi.exec("git", ["branch", "-D", session.branch], { cwd });
       return `Merged ${session.branch} into ${config.path}`;
     } catch (e) {
       return `Failed to merge ${session.branch}: ${e instanceof Error ? e.message : String(e)}`;
