@@ -141,6 +141,29 @@ describe("custom-compaction", () => {
         await rm(freshDir, { recursive: true, force: true });
       }
     });
+
+    it("warns when no Graphiti and no local state", async () => {
+      const freshDir = await mkdtemp(join(tmpdir(), "compact-warn-"));
+      try {
+        // Re-init extension so module-level state resets compactionCount
+        const freshMock = createMockExtensionAPI();
+        vi.stubGlobal(
+          "fetch",
+          vi.fn().mockRejectedValue(new Error("no graphiti")),
+        );
+        initExtension(freshMock.api as any);
+
+        const ctx = createMockContext({ cwd: freshDir });
+        await freshMock.emit("session_start", {}, ctx);
+
+        expect(ctx.ui.notify).toHaveBeenCalledWith(
+          expect.stringContaining("no Graphiti connection"),
+          "warning",
+        );
+      } finally {
+        await rm(freshDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("compaction_context tool", () => {
@@ -267,11 +290,11 @@ describe("custom-compaction", () => {
     });
   });
 
-  describe("session.compacting event", () => {
+  describe("session_before_compact event", () => {
     it("increments compaction count and notifies", async () => {
       const ctx = createMockContext({ cwd: tmpDir });
       await mock.emit("session_start", {}, ctx);
-      await mock.emit("session.compacting", {}, ctx);
+      await mock.emit("session_before_compact", {}, ctx);
 
       // Compaction count depends on module-level state; just verify the pattern
       expect(ctx.ui.notify).toHaveBeenCalledWith(
@@ -285,7 +308,7 @@ describe("custom-compaction", () => {
       await mock.emit("session_start", {}, ctx);
 
       const setPreamble = vi.fn();
-      await mock.emit("session.compacting", { setPreamble }, ctx);
+      await mock.emit("session_before_compact", { setPreamble }, ctx);
 
       expect(setPreamble).toHaveBeenCalledWith(
         expect.stringContaining("Session Context"),
@@ -295,7 +318,7 @@ describe("custom-compaction", () => {
     it("falls back to sendMessage when setPreamble not available", async () => {
       const ctx = createMockContext({ cwd: tmpDir });
       await mock.emit("session_start", {}, ctx);
-      await mock.emit("session.compacting", {}, ctx);
+      await mock.emit("session_before_compact", {}, ctx);
 
       expect(mock.api.sendMessage).toHaveBeenCalledWith(
         expect.objectContaining({

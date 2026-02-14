@@ -14,6 +14,8 @@ import {
   DEFAULT_LOG_DAYS,
   CONTEXT_WARN_PERCENT,
   CONTEXT_CRITICAL_PERCENT,
+  MAX_HEARTBEAT_LINES,
+  HEARTBEAT_SOUL,
   type HeartbeatTask,
 } from "./heartbeat.js";
 import initExtension from "./heartbeat.js";
@@ -188,6 +190,62 @@ describe("parseHeartbeat", () => {
     const result = parseHeartbeat(content);
     expect(result.rawContent).toBe(content);
   });
+
+  it("captures multi-line task details", () => {
+    const content = [
+      "- [ ] Load credentials",
+      "      - Secret: AWS Secrets Manager",
+      "      - Option A: ExternalSecret",
+      "      - Option B: CLI",
+      "- [ ] Next task",
+    ].join("\n");
+
+    const result = parseHeartbeat(content);
+    expect(result.tasks).toHaveLength(2);
+    expect(result.tasks[0].description).toBe("Load credentials");
+    expect(result.tasks[0].details).toContain("Secret: AWS Secrets Manager");
+    expect(result.tasks[0].details).toContain("Option A: ExternalSecret");
+    expect(result.tasks[0].details).toContain("Option B: CLI");
+    expect(result.tasks[1].description).toBe("Next task");
+    expect(result.tasks[1].details).toBe("");
+  });
+
+  it("stops details at non-indented lines", () => {
+    const content = [
+      "- [ ] First task",
+      "      - detail line",
+      "",
+      "## Section Header",
+      "",
+      "- [ ] Second task",
+    ].join("\n");
+
+    const result = parseHeartbeat(content);
+    expect(result.tasks).toHaveLength(2);
+    expect(result.tasks[0].details).toContain("detail line");
+    expect(result.tasks[1].details).toBe("");
+  });
+
+  it("trims trailing blank lines from details", () => {
+    const content = [
+      "- [ ] Task with trailing blanks",
+      "      - detail",
+      "",
+      "",
+      "## Next section",
+    ].join("\n");
+
+    const result = parseHeartbeat(content);
+    expect(result.tasks).toHaveLength(1);
+    expect(result.tasks[0].details).toBe("      - detail");
+  });
+
+  it("sets empty details for tasks without continuation", () => {
+    const content = "- [ ] Simple task\n- [ ] Another task\n";
+    const result = parseHeartbeat(content);
+    expect(result.tasks[0].details).toBe("");
+    expect(result.tasks[1].details).toBe("");
+  });
 });
 
 describe("formatDuration", () => {
@@ -234,11 +292,13 @@ describe("buildCompactionPreamble", () => {
       {
         raw: "- [ ] Task A",
         description: "Task A",
+        details: "",
         completed: false,
       },
       {
         raw: "- [ ] Task B",
         description: "Task B",
+        details: "",
         completed: false,
       },
     ];
@@ -246,6 +306,7 @@ describe("buildCompactionPreamble", () => {
       {
         raw: "- [x] Task C",
         description: "Task C",
+        details: "",
         completed: true,
       },
     ];
@@ -271,6 +332,7 @@ describe("constants", () => {
     expect(DEFAULT_LOG_DAYS).toBe(7);
     expect(CONTEXT_WARN_PERCENT).toBe(75);
     expect(CONTEXT_CRITICAL_PERCENT).toBe(90);
+    expect(MAX_HEARTBEAT_LINES).toBe(200);
   });
 });
 
@@ -888,6 +950,45 @@ describe("session_start lifecycle", () => {
       "heartbeat: 10s",
     );
   });
+
+  it("warns when heartbeat.md exceeds MAX_HEARTBEAT_LINES", async () => {
+    // Generate a file with more than MAX_HEARTBEAT_LINES lines
+    const lines = ["interval: 15m", "- [ ] Task"];
+    for (let i = 0; i < MAX_HEARTBEAT_LINES + 50; i++) {
+      lines.push(`### Log entry ${i}`);
+    }
+    await writeFile(join(tmpDir, "heartbeat.md"), lines.join("\n"));
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    vi.useRealTimers();
+    await mock.emit("session_start", {}, ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "heartbeat-file-warning",
+        content: expect.stringContaining(`${lines.length} lines`),
+      }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("does not warn when heartbeat.md is under MAX_HEARTBEAT_LINES", async () => {
+    await writeFile(
+      join(tmpDir, "heartbeat.md"),
+      "interval: 15m\n- [ ] Task\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    vi.useRealTimers();
+    await mock.emit("session_start", {}, ctx);
+
+    // Should not have sent any file warning message
+    const calls = mock.api.sendMessage.mock.calls;
+    const warningCalls = calls.filter(
+      (c: any) => c[0]?.customType === "heartbeat-file-warning",
+    );
+    expect(warningCalls).toHaveLength(0);
+  });
 });
 
 describe("agent_end deferred wakeup", () => {
@@ -1002,5 +1103,166 @@ describe("/heartbeat-toggle command", () => {
 
     // Timer should not fire while disabled
     expect(mock.api.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Idle / soul doc behavior
+// ---------------------------------------------------------------------------
+
+describe("HEARTBEAT_SOUL constant", () => {
+  it("is exported and non-empty", () => {
+    expect(HEARTBEAT_SOUL).toBeDefined();
+    expect(HEARTBEAT_SOUL.length).toBeGreaterThan(100);
+  });
+
+  it("contains the 5 priority areas", () => {
+    expect(HEARTBEAT_SOUL).toContain("Root-cause analysis");
+    expect(HEARTBEAT_SOUL).toContain("Test coverage");
+    expect(HEARTBEAT_SOUL).toContain("Performance & quality");
+    expect(HEARTBEAT_SOUL).toContain("Knowledge capture");
+    expect(HEARTBEAT_SOUL).toContain("Groom the backlog");
+  });
+});
+
+describe("idle prompt behavior (timer-based)", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  // Real timers are needed because doCheck reads files (async I/O)
+  // and fake timers don't advance the event loop for I/O callbacks.
+  async function waitFor(
+    fn: () => boolean,
+    timeout = 3000,
+    interval = 50,
+  ): Promise<void> {
+    const start = Date.now();
+    while (!fn()) {
+      if (Date.now() - start > timeout) throw new Error("waitFor timed out");
+      await new Promise((resolve) => setTimeout(resolve, interval));
+    }
+  }
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "hb-idle-"));
+  });
+
+  afterEach(async () => {
+    // Stop the real timer
+    await mock.emit("session_shutdown", {}, {});
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("sends idle prompt when no tasks and agent is idle", async () => {
+    await writeFile(
+      join(tmpDir, "heartbeat.md"),
+      "interval: 1s\n- [x] Done task (completed 2025-01-01 00:00)\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    ctx.isIdle.mockReturnValue(true);
+    await mock.emit("session_start", {}, ctx);
+    mock.api.sendUserMessage.mockClear();
+
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 1);
+
+    const prompt = mock.api.sendUserMessage.mock.calls[0][0];
+    expect(prompt).toContain("No Pending Tasks");
+    expect(prompt).toContain("Heartbeat Soul");
+    expect(prompt).toContain("Root-cause analysis");
+  });
+
+  it("does not send idle prompt when agent is busy", async () => {
+    await writeFile(
+      join(tmpDir, "heartbeat.md"),
+      "interval: 1s\n- [x] Done (completed 2025-01-01 00:00)\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    ctx.isIdle.mockReturnValue(false);
+    await mock.emit("session_start", {}, ctx);
+    mock.api.sendUserMessage.mockClear();
+
+    // Wait for at least 2 timer ticks, then verify nothing was sent
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(mock.api.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("only sends idle prompt once per idle stretch", async () => {
+    await writeFile(
+      join(tmpDir, "heartbeat.md"),
+      "interval: 1s\n- [x] Done (completed 2025-01-01 00:00)\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    ctx.isIdle.mockReturnValue(true);
+    await mock.emit("session_start", {}, ctx);
+    mock.api.sendUserMessage.mockClear();
+
+    // Wait for first idle prompt
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 1);
+
+    // Wait for another tick — should not send again
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(mock.api.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets idle flag when tasks appear again", async () => {
+    const hbPath = join(tmpDir, "heartbeat.md");
+    await writeFile(
+      hbPath,
+      "interval: 1s\n- [x] Done (completed 2025-01-01 00:00)\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    ctx.isIdle.mockReturnValue(true);
+    await mock.emit("session_start", {}, ctx);
+    mock.api.sendUserMessage.mockClear();
+
+    // Wait for idle prompt
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 1);
+
+    // Add a pending task
+    await writeFile(
+      hbPath,
+      "interval: 1s\n- [ ] New task\n- [x] Done (completed 2025-01-01 00:00)\n",
+    );
+
+    // Wait for task message
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 2);
+    const taskMsg = mock.api.sendUserMessage.mock.calls[1][0];
+    expect(taskMsg).toContain("Pending Tasks");
+    expect(taskMsg).toContain("New task");
+
+    // Remove task again
+    await writeFile(
+      hbPath,
+      "interval: 1s\n- [x] New task (completed 2025-01-01 01:00)\n- [x] Done (completed 2025-01-01 00:00)\n",
+    );
+
+    // Wait for second idle prompt (flag was reset by task appearing)
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 3);
+    const idleMsg = mock.api.sendUserMessage.mock.calls[2][0];
+    expect(idleMsg).toContain("No Pending Tasks");
+  });
+
+  it("includes recently completed tasks in idle prompt", async () => {
+    await writeFile(
+      join(tmpDir, "heartbeat.md"),
+      "interval: 1s\n- [x] Built API (completed 2025-01-01 00:00)\n- [x] Wrote tests (completed 2025-01-01 01:00)\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    ctx.isIdle.mockReturnValue(true);
+    await mock.emit("session_start", {}, ctx);
+    mock.api.sendUserMessage.mockClear();
+
+    await waitFor(() => mock.api.sendUserMessage.mock.calls.length >= 1);
+
+    const prompt = mock.api.sendUserMessage.mock.calls[0][0];
+    expect(prompt).toContain("Built API");
+    expect(prompt).toContain("Wrote tests");
   });
 });

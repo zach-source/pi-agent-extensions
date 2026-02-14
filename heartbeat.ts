@@ -32,6 +32,7 @@ export interface HeartbeatConfig {
 export interface HeartbeatTask {
   raw: string;
   description: string;
+  details: string;
   completed: boolean;
   completedInfo?: string;
 }
@@ -48,6 +49,66 @@ export const DEFAULT_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 export const DEFAULT_LOG_DAYS = 7;
 export const CONTEXT_WARN_PERCENT = 75;
 export const CONTEXT_CRITICAL_PERCENT = 90;
+export const MAX_HEARTBEAT_LINES = 200;
+
+// --- Soul: defines what the heartbeat agent does when idle ---
+
+export const HEARTBEAT_SOUL = `## Heartbeat Soul — Autonomous Work Principles
+
+You are a persistent work loop. Your purpose is to make continuous,
+meaningful progress on the project — whether tasks are queued or not.
+
+### When tasks exist
+Work through them in priority order. Mark done. Store learnings.
+
+### When no tasks remain
+Do NOT go idle. Examine the project and find the most valuable work:
+
+**1. Root-cause analysis**
+Review recently completed tasks and any known issues. Is there a symptom
+that was fixed but whose root cause was never identified? Investigate the
+underlying system, trace the failure path, and document the root cause.
+If fixing it is safe and scoped, do it. Otherwise, add a new heartbeat
+task describing the fix needed.
+
+**2. Test coverage & release readiness**
+Read the project plan, recent commits, and CI status. Ask:
+- Are there new code paths without test coverage?
+- Are there integration or end-to-end scenarios that were verified
+  manually but have no automated test?
+- Is there a release checklist with unchecked items?
+- Are there flaky or skipped tests that should be fixed?
+Add missing tests or unblock the release path. Add heartbeat tasks
+for anything too large to finish in one pass.
+
+**3. Performance & quality**
+Scan for opportunities the current sprint didn't prioritize:
+- N+1 queries, missing indexes, unoptimized hot paths
+- Error handling gaps (silent failures, swallowed errors, missing retries)
+- Security hygiene (hardcoded values, overly broad permissions, missing validation)
+- Dead code, unused dependencies, stale configuration
+Implement small safe improvements directly. Add heartbeat tasks for larger ones.
+
+**4. Knowledge capture**
+Use \`graphiti_add\` to persist anything the next session would benefit from:
+- Architecture decisions and their rationale
+- Debugging paths that worked (or didn't)
+- Environment/infra quirks discovered during work
+- Patterns and conventions unique to this project
+
+**5. Groom the backlog**
+Read heartbeat.md with fresh eyes:
+- Remove completed tasks that are fully landed
+- Break vague tasks into concrete, actionable items
+- Reprioritize based on what you've learned
+- Add tasks discovered during the above analysis
+
+### Operating principles
+- Bias toward action over analysis — ship small improvements continuously
+- Never change behavior without tests proving correctness
+- Commit working code incrementally (don't batch large changes)
+- When stuck after 3 attempts, add a heartbeat task describing the blocker and move on
+- Use \`heartbeat_new_session\` for work that needs a clean context window`;
 
 export function parseInterval(value: string): number {
   const match = value.trim().match(/^(\d+)\s*(s|m|h)$/i);
@@ -83,25 +144,59 @@ export function parseHeartbeat(content: string): ParsedHeartbeat {
     config.logDays = Math.max(1, parseInt(logDaysMatch[1], 10));
   }
 
-  // Parse tasks - lines matching `- [ ] ...` or `- [x] ...`
-  const taskRegex = /^- \[([ xX])\] (.+)$/gm;
-  let match;
-  while ((match = taskRegex.exec(content)) !== null) {
-    const completed = match[1].toLowerCase() === "x";
-    const raw = match[0];
-    const description = match[2].trim();
+  // Parse tasks line-by-line to capture multi-line details
+  const taskLineRegex = /^- \[([ xX])\] (.+)$/;
+  const lines = content.split("\n");
+  let currentTask: HeartbeatTask | null = null;
+  let detailLines: string[] = [];
 
-    // Extract completion info from parenthetical at end
-    const infoMatch = description.match(/\(completed .+\)$/);
-    tasks.push({
-      raw,
-      description: infoMatch
-        ? description.slice(0, -infoMatch[0].length).trim()
-        : description,
-      completed,
-      completedInfo: infoMatch ? infoMatch[0] : undefined,
-    });
+  function finishTask() {
+    if (!currentTask) return;
+    // Trim trailing blank lines from details
+    while (
+      detailLines.length > 0 &&
+      detailLines[detailLines.length - 1].trim() === ""
+    ) {
+      detailLines.pop();
+    }
+    currentTask.details = detailLines.join("\n");
+    tasks.push(currentTask);
+    currentTask = null;
+    detailLines = [];
   }
+
+  for (const line of lines) {
+    const taskMatch = line.match(taskLineRegex);
+    if (taskMatch) {
+      finishTask();
+
+      const completed = taskMatch[1].toLowerCase() === "x";
+      const raw = line;
+      const desc = taskMatch[2].trim();
+      const infoMatch = desc.match(/\(completed .+\)$/);
+
+      currentTask = {
+        raw,
+        description: infoMatch
+          ? desc.slice(0, -infoMatch[0].length).trim()
+          : desc,
+        details: "",
+        completed,
+        completedInfo: infoMatch ? infoMatch[0] : undefined,
+      };
+    } else if (
+      currentTask &&
+      (line.startsWith("  ") || line.startsWith("\t") || line.trim() === "")
+    ) {
+      // Indented or blank continuation line belongs to current task
+      detailLines.push(line);
+    } else {
+      // Non-continuation line (section header, config, etc.)
+      finishTask();
+    }
+  }
+
+  finishTask();
 
   return { config, tasks, rawContent: content };
 }
@@ -279,6 +374,7 @@ export default function (pi: ExtensionAPI) {
   let cwd = "";
   let sessionCompletedCount = 0;
   let lastWarningPercent = 0;
+  let idlePromptSent = false;
 
   // --- Helpers ---
 
@@ -304,12 +400,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   function buildTaskMessage(tasks: HeartbeatTask[]): string {
+    const taskLines: string[] = [];
+    for (const t of tasks) {
+      taskLines.push(`- ${t.description}`);
+      if (t.details) {
+        taskLines.push(t.details);
+      }
+    }
+
     const lines = [
       "## Heartbeat: Pending Tasks",
       "",
       "The following tasks from `heartbeat.md` need attention:",
       "",
-      ...tasks.map((t) => `- ${t.description}`),
+      ...taskLines,
       "",
       "### Instructions",
       "",
@@ -334,6 +438,33 @@ export default function (pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
+  function buildIdlePrompt(completed: HeartbeatTask[]): string {
+    const lines = [
+      "## Heartbeat: No Pending Tasks",
+      "",
+      `Completed tasks this session: ${sessionCompletedCount}`,
+      "",
+    ];
+
+    if (completed.length > 0) {
+      lines.push("Recently completed in heartbeat.md:");
+      for (const t of completed.slice(-5)) {
+        lines.push(`- ${t.description}`);
+      }
+      lines.push("");
+    }
+
+    lines.push(HEARTBEAT_SOUL);
+    lines.push("");
+    lines.push(
+      "Begin by reading the project plan and recent git history,",
+      "then choose the highest-value proactive work from the priorities above.",
+      "Add any new tasks you identify to `heartbeat.md`.",
+    );
+
+    return lines.join("\n");
+  }
+
   async function doCheck(ctx: { isIdle: () => boolean }): Promise<string> {
     lastCheck = new Date();
     lastError = null;
@@ -350,9 +481,25 @@ export default function (pi: ExtensionAPI) {
     }
 
     const pending = pendingTasks(parsed);
+
     if (pending.length === 0) {
-      return "skip:no-tasks";
+      // No tasks — send idle/proactive prompt once per idle stretch
+      if (idlePromptSent) {
+        return "skip:idle-already-prompted";
+      }
+
+      if (!ctx.isIdle()) {
+        return "skip:no-tasks";
+      }
+
+      idlePromptSent = true;
+      const completed = completedTasks(parsed);
+      pi.sendUserMessage(buildIdlePrompt(completed));
+      return "woke:idle-proactive";
     }
+
+    // Tasks exist — reset idle flag so we re-prompt if tasks drain again
+    idlePromptSent = false;
 
     if (!ctx.isIdle()) {
       pendingWakeup = true;
@@ -410,6 +557,7 @@ export default function (pi: ExtensionAPI) {
     lastError = null;
     sessionCompletedCount = 0;
     lastWarningPercent = 0;
+    idlePromptSent = false;
 
     // Read config from heartbeat.md if it exists
     const parsed = await readHeartbeatFile();
@@ -417,6 +565,22 @@ export default function (pi: ExtensionAPI) {
       intervalMs = parsed.config.intervalMs;
       // Prune old logs (fire-and-forget)
       pruneOldLogs(cwd, parsed.config.logDays).catch(() => {});
+
+      // Warn if heartbeat.md is bloated
+      const lineCount = parsed.rawContent.split("\n").length;
+      if (lineCount > MAX_HEARTBEAT_LINES) {
+        pi.sendMessage(
+          {
+            customType: "heartbeat-file-warning",
+            content:
+              `**heartbeat.md is ${lineCount} lines** — this wastes context on every heartbeat cycle.\n` +
+              `Consider pruning completed \`[x]\` tasks and any inline \`## Log\` section ` +
+              `(daily logs are already saved to \`.heartbeat/logs/\`).`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      }
     }
 
     startTimer(ctx);

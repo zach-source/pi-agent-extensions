@@ -33,14 +33,18 @@ interface CompactionState {
 const STATE_DIR = ".pi";
 const STATE_FILE = "compaction-context.json";
 
-let state: CompactionState = {
-  keyDecisions: [],
-  currentGoals: [],
-  blockers: [],
-  completedTasks: [],
-  lastCompactedAt: null,
-  compactionCount: 0,
-};
+function defaultState(): CompactionState {
+  return {
+    keyDecisions: [],
+    currentGoals: [],
+    blockers: [],
+    completedTasks: [],
+    lastCompactedAt: null,
+    compactionCount: 0,
+  };
+}
+
+let state: CompactionState = defaultState();
 
 let currentCwd = "";
 let graphitiAvailable = false;
@@ -52,9 +56,10 @@ async function loadState(cwd: string): Promise<void> {
   try {
     const content = await readFile(join(cwd, STATE_DIR, STATE_FILE), "utf-8");
     const parsed = JSON.parse(content) as CompactionState;
-    state = { ...state, ...parsed };
+    state = { ...defaultState(), ...parsed };
   } catch {
-    // No saved state, use defaults
+    // No saved state, reset to defaults
+    state = defaultState();
   }
 }
 
@@ -180,10 +185,24 @@ export default function (pi: ExtensionAPI) {
     if (state.compactionCount > 0) {
       ctx.ui.setStatus("compaction", `compactions: ${state.compactionCount}`);
     }
+
+    // Warn if compaction context has no persistence backend
+    if (!graphitiAvailable && state.compactionCount === 0) {
+      const hasLocalState =
+        state.keyDecisions.length > 0 ||
+        state.currentGoals.length > 0 ||
+        state.blockers.length > 0;
+      if (!hasLocalState) {
+        ctx.ui.notify(
+          "Compaction context: no Graphiti connection and no local state — decisions/goals won't survive compaction until one is available.",
+          "warning",
+        );
+      }
+    }
   });
 
-  // Hook into compaction
-  pi.on("session.compacting", async (event, ctx) => {
+  // Hook into compaction (must match Pi runtime event name)
+  pi.on("session_before_compact", async (event, ctx) => {
     state.compactionCount++;
     state.lastCompactedAt = new Date().toISOString();
     await saveState();
