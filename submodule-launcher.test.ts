@@ -1238,17 +1238,37 @@ describe("/harness:init command", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("runs git submodule status and creates scaffold", async () => {
-    mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
-      if (cmd === "git" && args[0] === "submodule") {
-        return {
-          stdout: " abc123 services/api (v1.0)\n def456 apps/web (v2.0)\n",
-          stderr: "",
-          exitCode: 0,
-        };
-      }
-      return { stdout: "", stderr: "", exitCode: 0 };
-    });
+  it("scaffolds .pi-agent/ with mailbox directories", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:init")!;
+    await cmd.handler("", ctx);
+
+    // Verify directories were created
+    const parentDir = mailboxPath(tmpDir, "parent");
+    const managerDir = mailboxPath(tmpDir, "manager");
+    const parentFiles = await readdir(parentDir);
+    expect(Array.isArray(parentFiles)).toBe(true);
+    const managerFiles = await readdir(managerDir);
+    expect(Array.isArray(managerFiles)).toBe(true);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-init",
+        content: expect.stringContaining("Scaffolded"),
+      }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("reports existing tasks when present", async () => {
+    // Pre-create a task
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    await writeFile(
+      join(tmpDir, PI_AGENT_DIR, "my-task.md"),
+      "# my-task\npath: .\n\n## Goals\n- [ ] Do work\n",
+    );
 
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -1256,25 +1276,26 @@ describe("/harness:init command", () => {
     const cmd = mock.getCommand("harness:init")!;
     await cmd.handler("", ctx);
 
-    // Check that goal files were created
-    const apiGoal = await readFile(
-      join(tmpDir, PI_AGENT_DIR, "api.md"),
-      "utf-8",
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-init",
+        content: expect.stringContaining("1 existing task(s)"),
+      }),
+      { triggerTurn: false },
     );
-    expect(apiGoal).toContain("# api");
-    expect(apiGoal).toContain("path: services/api");
+  });
 
-    const webGoal = await readFile(
-      join(tmpDir, PI_AGENT_DIR, "web.md"),
-      "utf-8",
-    );
-    expect(webGoal).toContain("# web");
-    expect(webGoal).toContain("path: apps/web");
+  it("suggests /harness:add when no tasks exist", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:init")!;
+    await cmd.handler("", ctx);
 
     expect(mock.api.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         customType: "harness-init",
-        content: expect.stringContaining("2 submodule(s)"),
+        content: expect.stringContaining("/harness:add"),
       }),
       { triggerTurn: false },
     );

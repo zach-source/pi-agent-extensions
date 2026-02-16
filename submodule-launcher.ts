@@ -2261,61 +2261,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("harness:init", {
-    description: "Discover git submodules and scaffold .pi-agent/ goal files",
+    description:
+      "Scaffold .pi-agent/ directory with mailbox structure",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
 
-      let stdout: string;
-      try {
-        const result = await pi.exec("git", ["submodule", "status"], { cwd });
-        stdout = result.stdout ?? "";
-      } catch {
-        ctx.ui.notify("Failed to run git submodule status", "error");
-        return;
-      }
-
-      const submodules: Array<{ name: string; path: string }> = [];
-      for (const line of stdout.trim().split("\n")) {
-        if (!line.trim()) continue;
-        // Format: " <hash> <path> (<describe>)" or "-<hash> <path>"
-        const match = line.trim().match(/^[-+ ]?[0-9a-f]+\s+(\S+)/);
-        if (match) {
-          const subPath = match[1];
-          const name = subPath.split("/").pop() || subPath;
-          submodules.push({ name, path: subPath });
-        }
-      }
-
-      if (submodules.length === 0) {
-        ctx.ui.notify("No submodules found in this repository", "info");
-        return;
-      }
-
+      // Create directory structure
       await mkdir(piAgentDir(), { recursive: true });
+      await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+      await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
 
-      const created: string[] = [];
-      for (const sub of submodules) {
-        const goalFile = join(piAgentDir(), `${sub.name}.md`);
-        try {
-          await readFile(goalFile, "utf-8");
-          // File exists, skip
-        } catch {
-          const content = serializeGoalFile({
-            name: sub.name,
-            path: sub.path,
-            role: "developer",
-            goals: [
-              { text: "Define goals for this submodule", completed: false },
-            ],
-            questions: [],
-            context: "Add context for the agent working on this submodule.",
-            rawContent: "",
-          });
-          await writeFile(goalFile, content, "utf-8");
-          created.push(sub.name);
-        }
-      }
+      // Check for existing goal files
+      const configs = await readGoalFiles();
 
       pi.sendMessage(
         {
@@ -2323,12 +2281,13 @@ export default function (pi: ExtensionAPI) {
           content: [
             `## Harness Init`,
             "",
-            `Found ${submodules.length} submodule(s).`,
-            created.length > 0
-              ? `Created goal files for: ${created.join(", ")}`
-              : "All goal files already exist.",
+            "Scaffolded `.pi-agent/` directory with mailbox structure.",
             "",
-            "Edit the `.pi-agent/<name>.md` files to set goals, then run `/harness:launch`.",
+            configs.length > 0
+              ? `Found ${configs.length} existing task(s): ${configs.map((c) => c.name).join(", ")}`
+              : "No tasks yet. Use `/harness:add <name> [goals...]` to create tasks.",
+            "",
+            "Then run `/harness:launch` to start workers.",
           ].join("\n"),
           display: true,
         },

@@ -205,7 +205,7 @@ describe("submodule-launcher integration", () => {
     expect(status).toContain("apps/web");
   });
 
-  it("/harness:init discovers submodules and scaffolds .pi-agent/", async () => {
+  it("/harness:init scaffolds .pi-agent/ with mailbox directories", async () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
 
@@ -215,23 +215,27 @@ describe("submodule-launcher integration", () => {
     const cmd = mock.getCommand("harness:init")!;
     await cmd.handler("", ctx);
 
-    // Verify .pi-agent/ was created with goal files
+    // Verify .pi-agent/ and mailbox dirs were created
     const piDir = join(parentRepo, PI_AGENT_DIR);
     const files = await readdir(piDir);
-    const mdFiles = files.filter((f) => f.endsWith(".md"));
-    expect(mdFiles.length).toBe(2);
+    expect(files).toContain(".mailboxes");
 
-    // Verify content of one goal file
-    const apiGoal = await readFile(join(piDir, "api.md"), "utf-8");
-    const parsed = parseGoalFile(apiGoal, "api.md");
-    expect(parsed.name).toBe("api");
-    expect(parsed.path).toBe("services/api");
-    expect(parsed.goals.length).toBeGreaterThan(0);
+    const mailboxes = await readdir(join(piDir, ".mailboxes"));
+    expect(mailboxes).toContain("parent");
+    expect(mailboxes).toContain("manager");
   });
 
   it("goal files can be updated via tool and re-read", async () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
+
+    // Create goal file first
+    const piDir = join(parentRepo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: services/api\n\n## Goals\n- [ ] Initial goal\n",
+    );
 
     const ctx = createMockContext(parentRepo);
     await mock.emit("session_start", {}, ctx);
@@ -246,7 +250,6 @@ describe("submodule-launcher integration", () => {
     expect(result.content[0].text).toContain("add");
 
     // Read back
-    const piDir = join(parentRepo, PI_AGENT_DIR);
     const content = await readFile(join(piDir, "api.md"), "utf-8");
     expect(content).toContain("Implement REST endpoints");
   });
@@ -254,6 +257,18 @@ describe("submodule-launcher integration", () => {
   it("harness_status shows combined progress", async () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
+
+    // Create goal files first
+    const piDir = join(parentRepo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: services/api\n\n## Goals\n- [ ] Build API\n",
+    );
+    await writeFile(
+      join(piDir, "web.md"),
+      "# web\npath: apps/web\n\n## Goals\n- [ ] Build UI\n",
+    );
 
     const ctx = createMockContext(parentRepo);
     await mock.emit("session_start", {}, ctx);
@@ -444,6 +459,18 @@ describe("submodule-launcher integration", () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
 
+    // Create goal files first
+    const piDir = join(parentRepo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api.md"),
+      "# api\npath: services/api\n\n## Goals\n- [ ] Build endpoints\n- [ ] Add auth\n",
+    );
+    await writeFile(
+      join(piDir, "web.md"),
+      "# web\npath: apps/web\n\n## Goals\n- [ ] Build UI\n",
+    );
+
     const ctx = createMockContext(parentRepo);
     await mock.emit("session_start", {}, ctx);
 
@@ -452,7 +479,7 @@ describe("submodule-launcher integration", () => {
     await tool.execute("call-1", {
       submodule: "api",
       action: "complete",
-      goal: "Define goals for this submodule",
+      goal: "Build endpoints",
     });
 
     // Get status
@@ -1182,19 +1209,30 @@ describe("standalone harness (no submodules)", () => {
     expect(goalContent).toContain("[x] Write tests for endpoint");
   });
 
-  // --- /harness:init shows no submodules in standalone repo ---
+  // --- /harness:init scaffolds directory in standalone repo ---
 
-  it("/harness:init correctly reports no submodules", async () => {
+  it("/harness:init scaffolds .pi-agent/ and suggests /harness:add", async () => {
     const { mock, ctx } = freshHarness();
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:init")!;
     await cmd.handler("", ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "No submodules found in this repository",
-      "info",
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-init",
+        content: expect.stringContaining("/harness:add"),
+      }),
+      { triggerTurn: false },
     );
+
+    // Verify mailbox directories exist
+    const parentDir = mailboxPath(repo, "parent");
+    const managerDir = mailboxPath(repo, "manager");
+    const parentFiles = await readdir(parentDir);
+    expect(Array.isArray(parentFiles)).toBe(true);
+    const managerFiles = await readdir(managerDir);
+    expect(Array.isArray(managerFiles)).toBe(true);
   });
 
   // --- Session persistence and recovery ---
