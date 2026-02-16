@@ -24,6 +24,13 @@ import {
   buildProgressSummary,
   goalFileName,
   fuzzyMatchOne,
+  sendMailboxMessage,
+  readMailbox,
+  deleteMessage,
+  readQueue,
+  writeQueue,
+  readRegistry,
+  mailboxPath,
   HARNESS_ROLES,
   PI_AGENT_DIR,
   WORKTREE_DIR,
@@ -31,10 +38,15 @@ import {
   STOP_SIGNAL_FILE,
   MANAGER_DIR,
   MANAGER_STATUS_FILE,
+  MAILBOX_DIR,
+  QUEUE_FILE,
+  REGISTRY_FILE,
   type SubmoduleConfig,
   type SubmoduleQuestion,
   type LaunchState,
   type ManagerStatusFile,
+  type MailboxMessage,
+  type WorkQueue,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -1955,5 +1967,483 @@ describe("standalone harness (no submodules)", () => {
     expect(finalParsed.questions[1].answer).toBe(
       "Use OWASP format with severity ratings",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mailbox + Queue + Registry integration tests
+// ---------------------------------------------------------------------------
+
+describe("mailbox system integration", () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-mailbox-integ-"));
+    repo = join(baseDir, "project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      `echo "# Project" > README.md && git add . && git commit -m "init"`,
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  beforeEach(async () => {
+    // Clean up .pi-agent/ between tests
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      try {
+        const entries = await readdir(wtDir);
+        for (const entry of entries) {
+          try {
+            git(`worktree remove ${join(wtDir, entry)} --force`, repo);
+          } catch {
+            // ignore
+          }
+        }
+      } catch {
+        // worktree dir may not exist
+      }
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+      // Clean up branches
+      try {
+        const branches = git("branch", repo)
+          .split("\n")
+          .map((b) => b.trim().replace("* ", ""))
+          .filter((b) => b.startsWith("pi-agent/"));
+        for (const branch of branches) {
+          try {
+            git(`branch -D ${branch}`, repo);
+          } catch {
+            // ignore
+          }
+        }
+      } catch {
+        // ignore
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  afterAll(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  it("mailbox flow: launch → worker sends question → parent reads inbox", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    // Create a task
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "api-worker.md"),
+      "# api-worker\npath: .\n\n## Goals\n- [ ] Build API\n",
+    );
+
+    // Override pi.exec to skip pi spawns
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") return { stdout: "", stderr: "", exitCode: 0 };
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    // Launch the harness
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Verify mailbox directories were created
+    const parentMailbox = mailboxPath(repo, "parent");
+    const managerMailbox = mailboxPath(repo, "manager");
+    const workerMailbox = mailboxPath(repo, "api-worker");
+
+    await readdir(parentMailbox); // Should not throw
+    await readdir(managerMailbox);
+    await readdir(workerMailbox);
+
+    // Simulate worker sending a question to parent mailbox
+    await sendMailboxMessage(repo, "parent", "api-worker", "question", {
+      question: "Which database should I use?",
+    });
+
+    // Parent reads inbox via tool
+    const inboxTool = mock.getTool("harness_inbox")!;
+    const inboxResult = await inboxTool.execute("call-1", {});
+
+    expect(inboxResult.content[0].text).toContain("api-worker");
+    expect(inboxResult.content[0].text).toContain("question");
+    expect(inboxResult.details.count).toBe(1);
+
+    // Messages should be deleted after reading
+    const remaining = await readMailbox(repo, "parent");
+    expect(remaining).toHaveLength(0);
+
+    // Parent sends answer back to worker
+    const sendTool = mock.getTool("harness_send")!;
+    await sendTool.execute("call-2", {
+      to: "api-worker",
+      type: "answer",
+      payload: {
+        question: "Which database should I use?",
+        answer: "PostgreSQL",
+      },
+    });
+
+    // Verify answer arrived in worker's mailbox
+    const workerMessages = await readMailbox(repo, "api-worker");
+    expect(workerMessages).toHaveLength(1);
+    expect(workerMessages[0].message.type).toBe("answer");
+    expect(workerMessages[0].message.payload.answer).toBe("PostgreSQL");
+
+    // Cleanup worktree
+    try {
+      git(
+        `worktree remove ${join(repo, WORKTREE_DIR, "api-worker")} --force`,
+        repo,
+      );
+      git("branch -D pi-agent/api-worker", repo);
+    } catch {
+      // ignore
+    }
+  });
+
+  it("queue dispatch: /harness:queue → manager gets directive → queue updated", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    // Queue work via command
+    const queueCmd = mock.getCommand("harness:queue")!;
+    await queueCmd.handler(
+      "--role tester --priority 3 add-auth-tests Write login test, Write signup test",
+      ctx,
+    );
+
+    // Verify queue file
+    const queue = await readQueue(repo);
+    expect(queue.items).toHaveLength(1);
+    expect(queue.items[0].topic).toBe("add-auth-tests");
+    expect(queue.items[0].role).toBe("tester");
+    expect(queue.items[0].priority).toBe(3);
+    expect(queue.items[0].goals).toEqual([
+      "Write login test",
+      "Write signup test",
+    ]);
+    expect(queue.items[0].status).toBe("pending");
+
+    // Verify queue file exists on disk
+    const queueContent = await readFile(join(repo, QUEUE_FILE), "utf-8");
+    const parsed = JSON.parse(queueContent);
+    expect(parsed.items).toHaveLength(1);
+
+    // Since harness was not active, no manager notification was sent
+    // (the command only notifies if loopActive)
+    // But let's verify the message was sent since harness was not launched
+    // Actually, /harness:queue only sends to manager if loopActive
+    const managerMessages = await readMailbox(repo, "manager");
+    // Manager wasn't active, so no directive sent (loopActive was false)
+    expect(managerMessages).toHaveLength(0);
+  });
+
+  it("queue dispatch with active harness sends directive to manager", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    // Set up a task and launch harness
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "worker-1.md"),
+      "# worker-1\npath: .\n\n## Goals\n- [ ] Task A\n",
+    );
+
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") return { stdout: "", stderr: "", exitCode: 0 };
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    // Launch to make harness active
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Drain any existing manager messages from launch
+    const priorMessages = await readMailbox(repo, "manager");
+    for (const m of priorMessages) {
+      await deleteMessage(repo, "manager", m.filename);
+    }
+
+    // Queue work while harness is active
+    const queueCmd = mock.getCommand("harness:queue")!;
+    await queueCmd.handler("fix-bug Fix the login bug", ctx);
+
+    // Manager should have received a directive
+    const managerMessages = await readMailbox(repo, "manager");
+    expect(managerMessages).toHaveLength(1);
+    expect(managerMessages[0].message.type).toBe("directive");
+    expect(managerMessages[0].message.payload.text).toContain("fix-bug");
+
+    // Cleanup
+    try {
+      git(
+        `worktree remove ${join(repo, WORKTREE_DIR, "worker-1")} --force`,
+        repo,
+      );
+      git("branch -D pi-agent/worker-1", repo);
+    } catch {
+      // ignore
+    }
+  });
+
+  it("registry initialized on launch with worker entries", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "frontend.md"),
+      "# frontend\npath: .\nrole: designer\n\n## Goals\n- [ ] Build UI\n- [ ] Add styles\n",
+    );
+    await writeFile(
+      join(piDir, "backend.md"),
+      "# backend\npath: .\nrole: developer\n\n## Goals\n- [ ] Build API\n",
+    );
+
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") return { stdout: "", stderr: "", exitCode: 0 };
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Verify registry was created
+    const registry = await readRegistry(repo);
+    expect(registry).not.toBeNull();
+    expect(Object.keys(registry!.workers)).toHaveLength(2);
+    expect(registry!.workers["frontend"].role).toBe("designer");
+    expect(registry!.workers["frontend"].goalsTotal).toBe(2);
+    expect(registry!.workers["frontend"].goalsCompleted).toBe(0);
+    expect(registry!.workers["frontend"].status).toBe("active");
+    expect(registry!.workers["backend"].role).toBe("developer");
+    expect(registry!.workers["backend"].goalsTotal).toBe(1);
+
+    // Cleanup
+    for (const name of ["frontend", "backend"]) {
+      try {
+        git(
+          `worktree remove ${join(repo, WORKTREE_DIR, name)} --force`,
+          repo,
+        );
+        git(`branch -D pi-agent/${name}`, repo);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  it("/harness:add creates worker mailbox when harness is active", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    // Set up and launch harness
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "existing.md"),
+      "# existing\npath: .\n\n## Goals\n- [ ] Work\n",
+    );
+
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") return { stdout: "", stderr: "", exitCode: 0 };
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Drain manager messages
+    const priorMessages = await readMailbox(repo, "manager");
+    for (const m of priorMessages) {
+      await deleteMessage(repo, "manager", m.filename);
+    }
+
+    // Add a new worker while harness is active
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("--role tester new-worker Write tests", ctx);
+
+    // Verify worker mailbox was created
+    const workerMailbox = mailboxPath(repo, "new-worker");
+    const files = await readdir(workerMailbox);
+    expect(Array.isArray(files)).toBe(true);
+
+    // Verify manager was notified about new worker
+    const managerMessages = await readMailbox(repo, "manager");
+    expect(managerMessages).toHaveLength(1);
+    expect(managerMessages[0].message.type).toBe("directive");
+    expect(managerMessages[0].message.payload.text).toContain("new-worker");
+    expect(managerMessages[0].message.payload.worker).toBe("new-worker");
+
+    // Cleanup
+    try {
+      git(
+        `worktree remove ${join(repo, WORKTREE_DIR, "existing")} --force`,
+        repo,
+      );
+      git("branch -D pi-agent/existing", repo);
+    } catch {
+      // ignore
+    }
+  });
+
+  it("full mailbox roundtrip: question → answer → verify file lifecycle", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    // 1. Worker sends question to parent
+    const questionId = await sendMailboxMessage(
+      repo,
+      "parent",
+      "my-worker",
+      "question",
+      { question: "Redis or Memcached?" },
+    );
+
+    // 2. Verify message file exists
+    const parentDir = mailboxPath(repo, "parent");
+    const files = await readdir(parentDir);
+    expect(files.length).toBe(1);
+    expect(files[0]).toMatch(/\.json$/);
+
+    // 3. Read via tool
+    const inboxTool = mock.getTool("harness_inbox")!;
+    const inboxResult = await inboxTool.execute("call-1", {});
+    expect(inboxResult.details.count).toBe(1);
+
+    // 4. Files should be deleted after tool read
+    const afterRead = await readdir(parentDir);
+    expect(afterRead.length).toBe(0);
+
+    // 5. Parent sends answer to worker
+    const sendTool = mock.getTool("harness_send")!;
+    await sendTool.execute("call-2", {
+      to: "my-worker",
+      type: "answer",
+      payload: { question: "Redis or Memcached?", answer: "Redis" },
+    });
+
+    // 6. Verify answer in worker mailbox
+    const workerMessages = await readMailbox(repo, "my-worker");
+    expect(workerMessages).toHaveLength(1);
+
+    // 7. Read the raw file to verify JSON structure
+    const workerDir = mailboxPath(repo, "my-worker");
+    const workerFiles = await readdir(workerDir);
+    const rawContent = await readFile(
+      join(workerDir, workerFiles[0]),
+      "utf-8",
+    );
+    const parsed: MailboxMessage = JSON.parse(rawContent);
+    expect(parsed.from).toBe("parent");
+    expect(parsed.to).toBe("my-worker");
+    expect(parsed.type).toBe("answer");
+    expect(parsed.payload.answer).toBe("Redis");
+
+    // 8. Worker deletes after processing
+    await deleteMessage(repo, "my-worker", workerFiles[0]);
+    const finalMessages = await readMailbox(repo, "my-worker");
+    expect(finalMessages).toHaveLength(0);
+  });
+
+  it("pending queue items trigger manager notification on launch", async () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    // Pre-populate queue before launching
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+
+    await writeQueue(repo, {
+      items: [
+        {
+          id: "pre-1",
+          topic: "pre-queued-work",
+          description: "Work queued before launch",
+          priority: 5,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    // Create a task to launch
+    await writeFile(
+      join(piDir, "main-worker.md"),
+      "# main-worker\npath: .\n\n## Goals\n- [ ] Do stuff\n",
+    );
+
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi") return { stdout: "", stderr: "", exitCode: 0 };
+        return originalExec!(cmd, args, opts);
+      },
+    );
+
+    const ctx = createMockContext(repo);
+    await mock.emit("session_start", {}, ctx);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("", ctx);
+
+    // Manager should have received a directive about pending queue items
+    const managerMessages = await readMailbox(repo, "manager");
+    const pendingNotification = managerMessages.find(
+      (m) =>
+        m.message.type === "directive" &&
+        typeof m.message.payload.text === "string" &&
+        m.message.payload.text.includes("pending queue item"),
+    );
+    expect(pendingNotification).toBeDefined();
+
+    // Cleanup
+    try {
+      git(
+        `worktree remove ${join(repo, WORKTREE_DIR, "main-worker")} --force`,
+        repo,
+      );
+      git("branch -D pi-agent/main-worker", repo);
+    } catch {
+      // ignore
+    }
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, readFile, mkdir, rm } from "fs/promises";
+import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -9,6 +9,15 @@ import {
   buildManagerPrompt,
   readManagerStatus,
   getRole,
+  generateMessageId,
+  mailboxPath,
+  sendMailboxMessage,
+  readMailbox,
+  deleteMessage,
+  readQueue,
+  writeQueue,
+  readRegistry,
+  writeRegistry,
   HARNESS_ROLES,
   MAX_STALLS,
   CONTEXT_CRITICAL_PERCENT,
@@ -19,12 +28,20 @@ import {
   MANAGER_STATUS_FILE,
   STOP_SIGNAL_FILE,
   MANAGER_STALE_THRESHOLD_MS,
+  MAILBOX_DIR,
+  QUEUE_FILE,
+  REGISTRY_FILE,
   type SubmoduleConfig,
   type SubmoduleGoal,
   type SubmoduleQuestion,
   type HarnessRole,
   type LaunchState,
   type ManagerStatusFile,
+  type MailboxMessage,
+  type QueueItem,
+  type WorkQueue,
+  type WorkerRegistry,
+  type WorkerRegistryEntry,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -2658,5 +2675,735 @@ describe("constants", () => {
     expect(MANAGER_STATUS_FILE).toBe(".pi-agent/.manager-status.json");
     expect(STOP_SIGNAL_FILE).toBe(".pi-agent/.stop-signal");
     expect(MANAGER_STALE_THRESHOLD_MS).toBe(5 * 60 * 1000);
+    expect(MAILBOX_DIR).toBe(".pi-agent/.mailboxes");
+    expect(QUEUE_FILE).toBe(".pi-agent/.queue.json");
+    expect(REGISTRY_FILE).toBe(".pi-agent/.registry.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mailbox helper tests
+// ---------------------------------------------------------------------------
+
+describe("generateMessageId", () => {
+  it("generates unique IDs with timestamp prefix", () => {
+    const id1 = generateMessageId();
+    const id2 = generateMessageId();
+    expect(id1).toMatch(/^\d+-[a-z0-9]{4}$/);
+    expect(id2).toMatch(/^\d+-[a-z0-9]{4}$/);
+    expect(id1).not.toBe(id2);
+  });
+});
+
+describe("mailboxPath", () => {
+  it("resolves actor mailbox directory", () => {
+    expect(mailboxPath("/tmp/test", "parent")).toBe(
+      join("/tmp/test", MAILBOX_DIR, "parent"),
+    );
+    expect(mailboxPath("/tmp/test", "manager")).toBe(
+      join("/tmp/test", MAILBOX_DIR, "manager"),
+    );
+    expect(mailboxPath("/tmp/test", "my-worker")).toBe(
+      join("/tmp/test", MAILBOX_DIR, "my-worker"),
+    );
+  });
+});
+
+describe("sendMailboxMessage + readMailbox + deleteMessage", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "mailbox-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("sends, reads, and deletes a message", async () => {
+    const id = await sendMailboxMessage(
+      tmpDir,
+      "parent",
+      "manager",
+      "status_report",
+      { summary: "all good" },
+    );
+
+    expect(id).toMatch(/^\d+-[a-z0-9]{4}$/);
+
+    const messages = await readMailbox(tmpDir, "parent");
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message.from).toBe("manager");
+    expect(messages[0].message.to).toBe("parent");
+    expect(messages[0].message.type).toBe("status_report");
+    expect(messages[0].message.payload).toEqual({ summary: "all good" });
+
+    await deleteMessage(tmpDir, "parent", messages[0].filename);
+    const afterDelete = await readMailbox(tmpDir, "parent");
+    expect(afterDelete).toHaveLength(0);
+  });
+
+  it("reads multiple messages in chronological order", async () => {
+    await sendMailboxMessage(tmpDir, "worker1", "manager", "directive", {
+      text: "first",
+    });
+    // Ensure different timestamp
+    await new Promise((r) => setTimeout(r, 5));
+    await sendMailboxMessage(tmpDir, "worker1", "parent", "answer", {
+      text: "second",
+    });
+
+    const messages = await readMailbox(tmpDir, "worker1");
+    expect(messages).toHaveLength(2);
+    expect(messages[0].message.payload.text).toBe("first");
+    expect(messages[1].message.payload.text).toBe("second");
+  });
+
+  it("returns empty array for nonexistent mailbox", async () => {
+    const messages = await readMailbox(tmpDir, "nonexistent");
+    expect(messages).toHaveLength(0);
+  });
+
+  it("skips malformed message files", async () => {
+    const dir = mailboxPath(tmpDir, "test");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "bad.json"), "not json", "utf-8");
+    await sendMailboxMessage(tmpDir, "test", "parent", "ack", {
+      messageId: "123",
+    });
+
+    const messages = await readMailbox(tmpDir, "test");
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message.type).toBe("ack");
+  });
+
+  it("deleteMessage is idempotent for missing files", async () => {
+    // Should not throw
+    await deleteMessage(tmpDir, "parent", "nonexistent.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue helper tests
+// ---------------------------------------------------------------------------
+
+describe("readQueue + writeQueue", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "queue-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns empty queue when file doesn't exist", async () => {
+    const queue = await readQueue(tmpDir);
+    expect(queue.items).toHaveLength(0);
+  });
+
+  it("writes and reads queue items", async () => {
+    const queue: WorkQueue = {
+      items: [
+        {
+          id: "test-1",
+          topic: "add-tests",
+          description: "Add unit tests",
+          goals: ["Write test A", "Write test B"],
+          priority: 5,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "test-2",
+          topic: "fix-bug",
+          description: "Fix critical bug",
+          priority: 1,
+          status: "dispatched",
+          assignedTo: "worker-1",
+          createdAt: new Date().toISOString(),
+          dispatchedAt: new Date().toISOString(),
+        },
+      ],
+    };
+
+    await writeQueue(tmpDir, queue);
+    const read = await readQueue(tmpDir);
+    expect(read.items).toHaveLength(2);
+    expect(read.items[0].topic).toBe("add-tests");
+    expect(read.items[1].status).toBe("dispatched");
+    expect(read.items[1].assignedTo).toBe("worker-1");
+  });
+
+  it("handles malformed queue file gracefully", async () => {
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    await writeFile(join(tmpDir, QUEUE_FILE), "not json", "utf-8");
+    const queue = await readQueue(tmpDir);
+    expect(queue.items).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Registry helper tests
+// ---------------------------------------------------------------------------
+
+describe("readRegistry + writeRegistry", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "registry-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns null when file doesn't exist", async () => {
+    const registry = await readRegistry(tmpDir);
+    expect(registry).toBeNull();
+  });
+
+  it("writes and reads registry", async () => {
+    const registry: WorkerRegistry = {
+      workers: {
+        "api-worker": {
+          name: "api-worker",
+          role: "developer",
+          branch: "pi-agent/api-worker",
+          worktreePath: "/tmp/wt/api-worker",
+          status: "active",
+          goalsTotal: 3,
+          goalsCompleted: 1,
+          assignedQueueItems: ["q-1"],
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    };
+
+    await writeRegistry(tmpDir, registry);
+    const read = await readRegistry(tmpDir);
+    expect(read).not.toBeNull();
+    expect(read!.workers["api-worker"].name).toBe("api-worker");
+    expect(read!.workers["api-worker"].goalsCompleted).toBe(1);
+    expect(read!.workers["api-worker"].assignedQueueItems).toEqual(["q-1"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// harness_queue tool tests
+// ---------------------------------------------------------------------------
+
+describe("harness_queue tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-queue-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("adds item to queue and notifies manager", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_queue")!;
+    const result = await tool.execute("call-1", {
+      topic: "add-tests",
+      description: "Write unit tests for auth module",
+      goals: ["Write login test", "Write signup test"],
+      priority: 5,
+    });
+
+    expect(result.content[0].text).toContain("add-tests");
+    expect(result.details.queueLength).toBe(1);
+
+    // Verify queue file
+    const queue = await readQueue(tmpDir);
+    expect(queue.items).toHaveLength(1);
+    expect(queue.items[0].topic).toBe("add-tests");
+    expect(queue.items[0].priority).toBe(5);
+    expect(queue.items[0].status).toBe("pending");
+
+    // Verify manager was notified
+    const managerMessages = await readMailbox(tmpDir, "manager");
+    expect(managerMessages).toHaveLength(1);
+    expect(managerMessages[0].message.type).toBe("directive");
+    expect(managerMessages[0].message.payload.text).toContain("add-tests");
+  });
+
+  it("uses default priority of 10", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_queue")!;
+    await tool.execute("call-1", { topic: "my-task" });
+
+    const queue = await readQueue(tmpDir);
+    expect(queue.items[0].priority).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// harness_send tool tests
+// ---------------------------------------------------------------------------
+
+describe("harness_send tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-send-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("sends a message to the specified actor", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_send")!;
+    const result = await tool.execute("call-1", {
+      to: "manager",
+      type: "directive",
+      payload: { text: "Please prioritize auth tasks" },
+    });
+
+    expect(result.content[0].text).toContain("manager");
+    expect(result.details.to).toBe("manager");
+
+    const messages = await readMailbox(tmpDir, "manager");
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message.from).toBe("parent");
+    expect(messages[0].message.payload.text).toBe(
+      "Please prioritize auth tasks",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// harness_inbox tool tests
+// ---------------------------------------------------------------------------
+
+describe("harness_inbox tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-inbox-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reads and deletes messages from parent inbox", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Send messages to parent inbox
+    await sendMailboxMessage(tmpDir, "parent", "worker-1", "question", {
+      question: "Which auth provider?",
+    });
+    await sendMailboxMessage(tmpDir, "parent", "manager", "status_report", {
+      summary: "2/3 goals done",
+    });
+
+    const tool = mock.getTool("harness_inbox")!;
+    const result = await tool.execute("call-1", {});
+
+    expect(result.content[0].text).toContain("2 message(s)");
+    expect(result.content[0].text).toContain("worker-1");
+    expect(result.content[0].text).toContain("question");
+    expect(result.details.count).toBe(2);
+
+    // Verify messages were deleted
+    const remaining = await readMailbox(tmpDir, "parent");
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("returns empty message for no messages", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const tool = mock.getTool("harness_inbox")!;
+    const result = await tool.execute("call-1", {});
+
+    expect(result.content[0].text).toContain("No messages");
+    expect(result.details.count).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:queue command tests
+// ---------------------------------------------------------------------------
+
+describe("/harness:queue command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-cmd-queue-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("queues work with topic and goals", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:queue")!;
+    await cmd.handler("add-e2e-tests Write checkout tests, Test payment flow", ctx);
+
+    const queue = await readQueue(tmpDir);
+    expect(queue.items).toHaveLength(1);
+    expect(queue.items[0].topic).toBe("add-e2e-tests");
+    expect(queue.items[0].goals).toEqual([
+      "Write checkout tests",
+      "Test payment flow",
+    ]);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "harness-queue" }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("parses --role and --priority flags", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:queue")!;
+    await cmd.handler("--role tester --priority 3 security-tests Write XSS test", ctx);
+
+    const queue = await readQueue(tmpDir);
+    expect(queue.items[0].topic).toBe("security-tests");
+    expect(queue.items[0].role).toBe("tester");
+    expect(queue.items[0].priority).toBe(3);
+  });
+
+  it("shows usage when no args", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:queue")!;
+    await cmd.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Usage"),
+      "warning",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:inbox command tests
+// ---------------------------------------------------------------------------
+
+describe("/harness:inbox command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-cmd-inbox-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("displays and deletes messages", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    await sendMailboxMessage(tmpDir, "parent", "worker-1", "status_report", {
+      summary: "Done with task A",
+    });
+
+    const cmd = mock.getCommand("harness:inbox")!;
+    await cmd.handler("", ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "harness-inbox" }),
+      { triggerTurn: false },
+    );
+
+    // Messages should be deleted
+    const remaining = await readMailbox(tmpDir, "parent");
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("shows info when no messages", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:inbox")!;
+    await cmd.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "No messages in parent inbox.",
+      "info",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildManagerPrompt mailbox sections
+// ---------------------------------------------------------------------------
+
+describe("buildManagerPrompt with mailbox", () => {
+  it("includes work queue, mailbox, and registry sections", () => {
+    const configs: SubmoduleConfig[] = [
+      {
+        name: "api",
+        path: "services/api",
+        role: "developer",
+        goals: [{ text: "Fix auth", completed: false }],
+        questions: [],
+        context: "",
+        rawContent: "",
+      },
+    ];
+
+    const prompt = buildManagerPrompt(
+      configs,
+      [{ name: "api", branch: "pi-agent/api", worktreePath: "/tmp/wt/api" }],
+      "/tmp/project",
+    );
+
+    expect(prompt).toContain("## Work Queue");
+    expect(prompt).toContain(".queue.json");
+    expect(prompt).toContain("## Mailbox");
+    expect(prompt).toContain(".mailboxes/manager");
+    expect(prompt).toContain("## Worker Registry");
+    expect(prompt).toContain(".registry.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spawnSession mailbox instructions
+// ---------------------------------------------------------------------------
+
+describe("spawnSession with mailbox instructions", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-spawn-mailbox-"));
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes mailbox instructions in worker prompt", async () => {
+    await writeFile(
+      join(tmpDir, PI_AGENT_DIR, "my-worker.md"),
+      "# my-worker\npath: .\n\n## Goals\n- [ ] Do something\n",
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Launch to trigger spawnSession
+    const cmd = mock.getCommand("harness:launch")!;
+    await cmd.handler("", ctx);
+
+    // Check that pi was called with a prompt containing mailbox instructions
+    const piCalls = mock.api.exec.mock.calls.filter(
+      (call: any[]) => call[0] === "pi",
+    );
+    expect(piCalls.length).toBeGreaterThan(0);
+
+    // Find the worker spawn call (not the manager)
+    const workerCall = piCalls.find((call: any[]) =>
+      call[1][1].includes("## Mailbox"),
+    );
+    expect(workerCall).toBeDefined();
+    const prompt = workerCall![1][1];
+    expect(prompt).toContain(".mailboxes/my-worker");
+    expect(prompt).toContain("work_dispatch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// session_start creates mailbox directories
+// ---------------------------------------------------------------------------
+
+describe("session_start mailbox setup", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-start-mailbox-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("creates parent and manager mailbox directories", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const parentDir = mailboxPath(tmpDir, "parent");
+    const managerDir = mailboxPath(tmpDir, "manager");
+
+    // Verify directories exist by attempting to readdir
+    const parentFiles = await readdir(parentDir);
+    expect(Array.isArray(parentFiles)).toBe(true);
+
+    const managerFiles = await readdir(managerDir);
+    expect(Array.isArray(managerFiles)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// turn_end parent inbox check
+// ---------------------------------------------------------------------------
+
+describe("turn_end parent inbox check", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-turnend-inbox-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("surfaces question messages from parent inbox", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+
+    // Set up active state
+    await writeFile(
+      join(tmpDir, LAUNCH_STATE_FILE),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
+    );
+
+    // Write valid manager status
+    await writeFile(
+      join(tmpDir, MANAGER_STATUS_FILE),
+      JSON.stringify(makeManagerStatus()),
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Send a question to parent inbox
+    await sendMailboxMessage(tmpDir, "parent", "worker-1", "question", {
+      question: "Should I use Redis or Memcached?",
+    });
+
+    mock.api.sendMessage.mockClear();
+    await mock.emit("turn_end", {}, ctx);
+
+    // Verify the question was surfaced
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-question",
+        content: expect.stringContaining("Redis or Memcached"),
+      }),
+      { triggerTurn: false },
+    );
+
+    // Verify the question was deleted from inbox
+    const remaining = await readMailbox(tmpDir, "parent");
+    const questionMsgs = remaining.filter(
+      (m) => m.message.type === "question",
+    );
+    expect(questionMsgs).toHaveLength(0);
+  });
+
+  it("shows message count in status bar", async () => {
+    const piDir = join(tmpDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+
+    await writeFile(
+      join(tmpDir, LAUNCH_STATE_FILE),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
+    );
+
+    await writeFile(
+      join(tmpDir, MANAGER_STATUS_FILE),
+      JSON.stringify(makeManagerStatus()),
+    );
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Send a non-question message to parent inbox (should show in count)
+    await sendMailboxMessage(tmpDir, "parent", "manager", "status_report", {
+      summary: "all good",
+    });
+
+    ctx.ui.setStatus.mockClear();
+    await mock.emit("turn_end", {}, ctx);
+
+    // Status bar should contain message count
+    const statusCalls = ctx.ui.setStatus.mock.calls;
+    const lastStatusCall = statusCalls[statusCalls.length - 1];
+    expect(lastStatusCall[1]).toContain("1 msg");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool registration: new tools
+// ---------------------------------------------------------------------------
+
+describe("tool registration: mailbox tools", () => {
+  it("registers harness_queue, harness_send, harness_inbox", () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    expect(mock.getTool("harness_queue")).toBeDefined();
+    expect(mock.getTool("harness_send")).toBeDefined();
+    expect(mock.getTool("harness_inbox")).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Command registration: new commands
+// ---------------------------------------------------------------------------
+
+describe("command registration: mailbox commands", () => {
+  it("registers harness:queue and harness:inbox", () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+
+    expect(mock.getCommand("harness:queue")).toBeDefined();
+    expect(mock.getCommand("harness:inbox")).toBeDefined();
   });
 });

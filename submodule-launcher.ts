@@ -216,6 +216,9 @@ export const MANAGER_DIR = ".pi-agent/.manager";
 export const MANAGER_STATUS_FILE = ".pi-agent/.manager-status.json";
 export const STOP_SIGNAL_FILE = ".pi-agent/.stop-signal";
 export const MANAGER_STALE_THRESHOLD_MS = 5 * 60 * 1000;
+export const MAILBOX_DIR = ".pi-agent/.mailboxes";
+export const QUEUE_FILE = ".pi-agent/.queue.json";
+export const REGISTRY_FILE = ".pi-agent/.registry.json";
 
 // --- Validation Schemas (Typebox) ---
 
@@ -256,6 +259,116 @@ const ManagerStatusSchema = Type.Object({
   stallCount: Type.Number(),
   mergeResults: Type.Optional(Type.Array(Type.String())),
   message: Type.Optional(Type.String()),
+});
+
+// --- Mailbox / Queue / Registry Types ---
+
+export interface MailboxMessage {
+  id: string;
+  from: string;
+  to: string;
+  type:
+    | "directive"
+    | "status_report"
+    | "question"
+    | "answer"
+    | "work_dispatch"
+    | "ack";
+  timestamp: string;
+  payload: Record<string, unknown>;
+}
+
+export interface QueueItem {
+  id: string;
+  topic: string;
+  description: string;
+  goals?: string[];
+  role?: string;
+  priority: number;
+  status: "pending" | "dispatched" | "completed";
+  assignedTo?: string;
+  createdAt: string;
+  dispatchedAt?: string;
+}
+
+export interface WorkQueue {
+  items: QueueItem[];
+}
+
+export interface WorkerRegistryEntry {
+  name: string;
+  role: string;
+  branch: string;
+  worktreePath: string;
+  status: "active" | "idle" | "stalled" | "completed";
+  goalsTotal: number;
+  goalsCompleted: number;
+  lastHeartbeat?: string;
+  assignedQueueItems: string[];
+}
+
+export interface WorkerRegistry {
+  workers: Record<string, WorkerRegistryEntry>;
+  updatedAt: string;
+}
+
+const MailboxMessageSchema = Type.Object({
+  id: Type.String(),
+  from: Type.String(),
+  to: Type.String(),
+  type: Type.Union([
+    Type.Literal("directive"),
+    Type.Literal("status_report"),
+    Type.Literal("question"),
+    Type.Literal("answer"),
+    Type.Literal("work_dispatch"),
+    Type.Literal("ack"),
+  ]),
+  timestamp: Type.String(),
+  payload: Type.Record(Type.String(), Type.Unknown()),
+});
+
+const QueueItemSchema = Type.Object({
+  id: Type.String(),
+  topic: Type.String(),
+  description: Type.String(),
+  goals: Type.Optional(Type.Array(Type.String())),
+  role: Type.Optional(Type.String()),
+  priority: Type.Number(),
+  status: Type.Union([
+    Type.Literal("pending"),
+    Type.Literal("dispatched"),
+    Type.Literal("completed"),
+  ]),
+  assignedTo: Type.Optional(Type.String()),
+  createdAt: Type.String(),
+  dispatchedAt: Type.Optional(Type.String()),
+});
+
+const WorkQueueSchema = Type.Object({
+  items: Type.Array(QueueItemSchema),
+});
+
+const WorkerRegistryEntrySchema = Type.Object({
+  name: Type.String(),
+  role: Type.String(),
+  branch: Type.String(),
+  worktreePath: Type.String(),
+  status: Type.Union([
+    Type.Literal("active"),
+    Type.Literal("idle"),
+    Type.Literal("stalled"),
+    Type.Literal("completed"),
+  ]),
+  goalsTotal: Type.Number(),
+  goalsCompleted: Type.Number(),
+  lastHeartbeat: Type.Optional(Type.String()),
+  assignedQueueItems: Type.Array(Type.String()),
+});
+
+const WorkerRegistrySchema = Type.Object({
+  workers: Type.Record(Type.String(), WorkerRegistryEntrySchema),
+  updatedAt: Type.String(),
 });
 
 // --- Shared Helpers ---
@@ -307,6 +420,142 @@ export function fuzzyMatchOne<T>(
   if (substring.length > 1) return { ambiguous: substring };
 
   return null;
+}
+
+// --- Mailbox / Queue / Registry Helpers ---
+
+/** Generate a unique message ID: "{timestamp}-{4 random chars}" */
+export function generateMessageId(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let suffix = "";
+  for (let i = 0; i < 4; i++) {
+    suffix += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `${Date.now()}-${suffix}`;
+}
+
+/** Resolve the mailbox directory for an actor. */
+export function mailboxPath(baseCwd: string, actor: string): string {
+  return join(baseCwd, MAILBOX_DIR, actor);
+}
+
+/** Write a message file to a recipient's mailbox directory. */
+export async function sendMailboxMessage(
+  baseCwd: string,
+  to: string,
+  from: string,
+  type: MailboxMessage["type"],
+  payload: Record<string, unknown>,
+): Promise<string> {
+  const id = generateMessageId();
+  const msg: MailboxMessage = {
+    id,
+    from,
+    to,
+    type,
+    timestamp: new Date().toISOString(),
+    payload,
+  };
+  const dir = mailboxPath(baseCwd, to);
+  await mkdir(dir, { recursive: true });
+  const filename = `${id}.json`;
+  await atomicWriteFile(join(dir, filename), JSON.stringify(msg, null, 2) + "\n");
+  return id;
+}
+
+/** Read all messages from an actor's mailbox, sorted chronologically. */
+export async function readMailbox(
+  baseCwd: string,
+  actor: string,
+): Promise<Array<{ message: MailboxMessage; filename: string }>> {
+  const dir = mailboxPath(baseCwd, actor);
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const results: Array<{ message: MailboxMessage; filename: string }> = [];
+  for (const file of files.sort()) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const content = await readFile(join(dir, file), "utf-8");
+      const parsed = JSON.parse(content);
+      if (Value.Check(MailboxMessageSchema, parsed)) {
+        results.push({ message: parsed as MailboxMessage, filename: file });
+      }
+    } catch {
+      // Skip malformed messages
+    }
+  }
+  return results;
+}
+
+/** Delete a processed message from an actor's mailbox. */
+export async function deleteMessage(
+  baseCwd: string,
+  actor: string,
+  filename: string,
+): Promise<void> {
+  try {
+    await rm(join(mailboxPath(baseCwd, actor), filename));
+  } catch {
+    // Already deleted or doesn't exist
+  }
+}
+
+/** Read the work queue. Returns empty queue if file doesn't exist. */
+export async function readQueue(baseCwd: string): Promise<WorkQueue> {
+  try {
+    const content = await readFile(join(baseCwd, QUEUE_FILE), "utf-8");
+    const parsed = JSON.parse(content);
+    if (Value.Check(WorkQueueSchema, parsed)) {
+      return parsed as WorkQueue;
+    }
+  } catch {
+    // File doesn't exist or is malformed
+  }
+  return { items: [] };
+}
+
+/** Atomically write the work queue. */
+export async function writeQueue(
+  baseCwd: string,
+  queue: WorkQueue,
+): Promise<void> {
+  await mkdir(join(baseCwd, PI_AGENT_DIR), { recursive: true });
+  await atomicWriteFile(
+    join(baseCwd, QUEUE_FILE),
+    JSON.stringify(queue, null, 2) + "\n",
+  );
+}
+
+/** Read the worker registry. Returns null if absent. */
+export async function readRegistry(
+  baseCwd: string,
+): Promise<WorkerRegistry | null> {
+  try {
+    const content = await readFile(join(baseCwd, REGISTRY_FILE), "utf-8");
+    const parsed = JSON.parse(content);
+    if (Value.Check(WorkerRegistrySchema, parsed)) {
+      return parsed as WorkerRegistry;
+    }
+  } catch {
+    // File doesn't exist or is malformed
+  }
+  return null;
+}
+
+/** Atomically write the worker registry. */
+export async function writeRegistry(
+  baseCwd: string,
+  registry: WorkerRegistry,
+): Promise<void> {
+  await mkdir(join(baseCwd, PI_AGENT_DIR), { recursive: true });
+  await atomicWriteFile(
+    join(baseCwd, REGISTRY_FILE),
+    JSON.stringify(registry, null, 2) + "\n",
+  );
 }
 
 // --- Pure Functions ---
@@ -619,6 +868,35 @@ export function buildManagerPrompt(
     "- Always write the status file after each check, even if nothing changed",
     "- Use the updatedAt timestamp so the parent can detect liveness",
     "- Exit gracefully when stop signal is found, all goals are complete, or stall limit is reached",
+    "",
+    "## Work Queue",
+    `On each heartbeat cycle, read \`${resolve(baseCwd, QUEUE_FILE)}\` for pending work items.`,
+    "For each item with status \"pending\":",
+    "- Match the item's role (if any) against available workers, or pick a worker with capacity",
+    "- Update the item's status to \"dispatched\" and set assignedTo to the worker name",
+    "- Add the item's goals to the worker's goal file",
+    "- Send a work_dispatch message to the worker's mailbox at `.pi-agent/.mailboxes/{worker}/`",
+    "- Write the updated queue back to the file",
+    "",
+    "## Mailbox",
+    `Your inbox is at \`${resolve(baseCwd, MAILBOX_DIR, "manager")}/\`.`,
+    "On each heartbeat cycle, read all *.json files in your inbox directory, sorted by filename.",
+    "Process each message by type:",
+    "- **directive**: Execute the instruction or dispatch work accordingly",
+    "- **status_report**: Note worker progress, update registry",
+    "- **question**: Forward to parent mailbox at `.pi-agent/.mailboxes/parent/` if you cannot answer",
+    "- **ack**: Note acknowledgment",
+    "After processing each message, delete the file (deletion = acknowledgment).",
+    "To send a message, write a JSON file to `.pi-agent/.mailboxes/{recipient}/` with this schema:",
+    '```json',
+    '{ "id": "<timestamp>-<4chars>", "from": "manager", "to": "<recipient>",',
+    '  "type": "<message_type>", "timestamp": "<ISO 8601>", "payload": { ... } }',
+    '```',
+    "",
+    "## Worker Registry",
+    `Maintain \`${resolve(baseCwd, REGISTRY_FILE)}\` with worker status on each heartbeat.`,
+    "Update each worker's entry with: status, goalsTotal, goalsCompleted, lastHeartbeat, assignedQueueItems.",
+    "The parent reads this file for display purposes.",
   ].join("\n");
 }
 
@@ -696,6 +974,48 @@ const AnswerParams = Type.Object({
 });
 
 type AnswerInput = Static<typeof AnswerParams>;
+
+const QueueToolParams = Type.Object({
+  topic: Type.String({ description: "Topic/name for the queue item" }),
+  description: Type.Optional(
+    Type.String({ description: "Description of the work" }),
+  ),
+  goals: Type.Optional(
+    Type.Array(Type.String(), { description: "Goals for the queued work" }),
+  ),
+  role: Type.Optional(
+    Type.String({ description: "Preferred worker role for dispatch" }),
+  ),
+  priority: Type.Optional(
+    Type.Number({
+      description: "Priority (lower = higher priority, default 10)",
+    }),
+  ),
+});
+
+type QueueToolInput = Static<typeof QueueToolParams>;
+
+const SendToolParams = Type.Object({
+  to: Type.String({
+    description: 'Recipient actor name (e.g., "manager", "parent", or worker name)',
+  }),
+  type: Type.Union(
+    [
+      Type.Literal("directive"),
+      Type.Literal("status_report"),
+      Type.Literal("question"),
+      Type.Literal("answer"),
+      Type.Literal("work_dispatch"),
+      Type.Literal("ack"),
+    ],
+    { description: "Message type" },
+  ),
+  payload: Type.Record(Type.String(), Type.Unknown(), {
+    description: "Message payload",
+  }),
+});
+
+type SendToolInput = Static<typeof SendToolParams>;
 
 // --- Extension ---
 
@@ -973,6 +1293,20 @@ export default function (pi: ExtensionAPI) {
       `If you need a decision or clarification from the user, write your question to the goal file at \`${goalFilePath}\`.`,
       "Append to the `## Questions` section using the format: `- ? Your question here`",
       "Then periodically re-read the goal file to check for answers (lines starting with `- !`).",
+      "",
+      "## Mailbox",
+      `Your inbox is at \`${resolve(cwd, MAILBOX_DIR, config.name)}/\`.`,
+      "On each heartbeat cycle, read all *.json files in your inbox directory, sorted by filename.",
+      "Each file is a JSON message with: id, from, to, type, timestamp, payload.",
+      "Process each message by type:",
+      "- **directive**: Follow the instruction (e.g., new goals, changes in direction)",
+      "- **work_dispatch**: Accept the dispatched queue item, add its goals to your work",
+      "- **answer**: Use the answer to unblock your work",
+      "- **ack**: Note acknowledgment",
+      "After processing each message, delete the file.",
+      "To send a message to another actor, write a JSON file to `.pi-agent/.mailboxes/{recipient}/` with:",
+      '`{ "id": "<timestamp>-<4chars>", "from": "' + config.name + '", "to": "<recipient>",',
+      '  "type": "<type>", "timestamp": "<ISO 8601>", "payload": { ... } }`',
     ].join("\n");
 
     pi.exec("pi", ["-p", prompt], {
@@ -1059,6 +1393,14 @@ export default function (pi: ExtensionAPI) {
     cwd = ctx.cwd;
     lastCtx = ctx;
     await restoreState();
+
+    // Ensure mailbox directories exist
+    try {
+      await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+      await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
+    } catch {
+      // Best effort
+    }
 
     if (loopActive) {
       const status = await readManagerStatus(cwd);
@@ -1166,9 +1508,34 @@ export default function (pi: ExtensionAPI) {
       // ignore
     }
 
+    // Check parent inbox for messages
+    let inboxSuffix = "";
+    try {
+      const inboxMessages = await readMailbox(cwd, "parent");
+      if (inboxMessages.length > 0) {
+        inboxSuffix = `, ${inboxMessages.length} msg`;
+        // Surface question messages
+        for (const { message, filename } of inboxMessages) {
+          if (message.type === "question") {
+            pi.sendMessage(
+              {
+                customType: "harness-question",
+                content: `**Question from ${message.from}:** ${message.payload.question ?? JSON.stringify(message.payload)}`,
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+            await deleteMessage(cwd, "parent", filename);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     ctx.ui.setStatus(
       "harness",
-      `harness: ${doneGoals}/${totalGoals} goals, ${status.status}${questionSuffix}`,
+      `harness: ${doneGoals}/${totalGoals} goals, ${status.status}${questionSuffix}${inboxSuffix}`,
     );
 
     // Check terminal states
@@ -1592,6 +1959,115 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "harness_queue",
+    label: "Queue Harness Work",
+    description:
+      "Add work to the harness queue. The manager dispatches queued items " +
+      "to workers based on role and capacity.",
+    parameters: QueueToolParams,
+
+    async execute(_toolCallId, params: QueueToolInput) {
+      const queue = await readQueue(cwd);
+      const id = generateMessageId();
+      const item: QueueItem = {
+        id,
+        topic: params.topic,
+        description: params.description ?? params.topic,
+        goals: params.goals,
+        role: params.role,
+        priority: params.priority ?? 10,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      };
+      queue.items.push(item);
+      await writeQueue(cwd, queue);
+      invalidateCache();
+
+      // Notify manager of new work
+      await sendMailboxMessage(cwd, "manager", "parent", "directive", {
+        text: `New queue item: ${params.topic}`,
+        queueItemId: id,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Queued "${params.topic}" (id: ${id}, ${queue.items.length} item(s) in queue)`,
+          },
+        ],
+        details: { id, queueLength: queue.items.length },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_send",
+    label: "Send Harness Message",
+    description:
+      "Send a message to an actor's mailbox (parent, manager, or worker name).",
+    parameters: SendToolParams,
+
+    async execute(_toolCallId, params: SendToolInput) {
+      const id = await sendMailboxMessage(
+        cwd,
+        params.to,
+        "parent",
+        params.type,
+        params.payload as Record<string, unknown>,
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Message sent to ${params.to} (id: ${id}, type: ${params.type})`,
+          },
+        ],
+        details: { id, to: params.to, type: params.type },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_inbox",
+    label: "Read Harness Inbox",
+    description:
+      "Read all messages in the parent's mailbox. Messages are deleted after reading.",
+    parameters: Type.Object({}),
+
+    async execute() {
+      const messages = await readMailbox(cwd, "parent");
+
+      if (messages.length === 0) {
+        return {
+          content: [{ type: "text", text: "No messages in parent inbox." }],
+          details: { count: 0 },
+        };
+      }
+
+      const lines: string[] = [`## Parent Inbox (${messages.length} message(s))`, ""];
+      for (const { message, filename } of messages) {
+        lines.push(
+          `**[${message.type}]** from ${message.from} at ${message.timestamp}`,
+        );
+        lines.push(`Payload: ${JSON.stringify(message.payload)}`);
+        lines.push("");
+        // Delete after reading
+        await deleteMessage(cwd, "parent", filename);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {
+          count: messages.length,
+          messages: messages.map((m) => m.message),
+        },
+      };
+    },
+  });
+
   // --- Commands ---
 
   pi.registerCommand("harness:launch", {
@@ -1647,11 +2123,48 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Create mailbox directories for each worker
+      for (const config of configs) {
+        await mkdir(mailboxPath(cwd, config.name), { recursive: true });
+      }
+      await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+      await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
+
+      // Initialize worker registry
+      const registryWorkers: Record<string, WorkerRegistryEntry> = {};
+      for (const config of configs) {
+        const session = sessions.get(config.name);
+        if (!session) continue;
+        registryWorkers[config.name] = {
+          name: config.name,
+          role: config.role,
+          branch: session.branch,
+          worktreePath: session.worktreePath,
+          status: "active",
+          goalsTotal: config.goals.length,
+          goalsCompleted: config.goals.filter((g) => g.completed).length,
+          assignedQueueItems: [],
+        };
+      }
+      await writeRegistry(cwd, {
+        workers: registryWorkers,
+        updatedAt: new Date().toISOString(),
+      });
+
       // Spawn the manager session
       await spawnManager(configs);
 
       loopActive = true;
       await persistState();
+
+      // If queue has pending items, notify manager
+      const queue = await readQueue(cwd);
+      const pendingItems = queue.items.filter((i) => i.status === "pending");
+      if (pendingItems.length > 0) {
+        await sendMailboxMessage(cwd, "manager", "parent", "directive", {
+          text: `${pendingItems.length} pending queue item(s) awaiting dispatch`,
+        });
+      }
 
       ctx.ui.setStatus("harness", "harness: active");
       pi.sendMessage(
@@ -2007,6 +2520,142 @@ export default function (pi: ExtensionAPI) {
             "",
             "Run `/harness:launch` to start workers.",
           ].join("\n"),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+
+      // If harness is active, create worker mailbox and notify manager
+      if (loopActive) {
+        await mkdir(mailboxPath(cwd, name), { recursive: true });
+        await sendMailboxMessage(cwd, "manager", "parent", "directive", {
+          text: `New worker added: ${name}`,
+          worker: name,
+          role: roleArg,
+        });
+      }
+    },
+  });
+
+  pi.registerCommand("harness:queue", {
+    description:
+      "Add work to the queue: /harness:queue [--role <name>] [--priority <n>] <topic> [goals...]",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+      let remaining = (args ?? "").trim();
+
+      if (!remaining) {
+        ctx.ui.notify(
+          "Usage: /harness:queue [--role <name>] [--priority <n>] <topic> [goals...]",
+          "warning",
+        );
+        return;
+      }
+
+      // Parse --role flag
+      let roleArg: string | undefined;
+      const roleFlag = remaining.match(/--role\s+(\S+)/);
+      if (roleFlag) {
+        roleArg = roleFlag[1].toLowerCase();
+        remaining = remaining.replace(roleFlag[0], "").trim();
+      }
+
+      // Parse --priority flag
+      let priority = 10;
+      const priorityFlag = remaining.match(/--priority\s+(\d+)/);
+      if (priorityFlag) {
+        priority = parseInt(priorityFlag[1], 10);
+        remaining = remaining.replace(priorityFlag[0], "").trim();
+      }
+
+      // First token is topic, rest are goals (comma-separated)
+      const spaceIdx = remaining.indexOf(" ");
+      const topic = spaceIdx === -1 ? remaining : remaining.slice(0, spaceIdx);
+      const goalsRaw =
+        spaceIdx === -1 ? "" : remaining.slice(spaceIdx + 1).trim();
+
+      const goals = goalsRaw
+        ? goalsRaw
+            .split(",")
+            .map((g) => g.trim())
+            .filter((g) => g.length > 0)
+        : undefined;
+
+      const queue = await readQueue(cwd);
+      const id = generateMessageId();
+      const item: QueueItem = {
+        id,
+        topic,
+        description: goalsRaw || topic,
+        goals,
+        role: roleArg,
+        priority,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      };
+      queue.items.push(item);
+      await writeQueue(cwd, queue);
+      invalidateCache();
+
+      // Notify manager
+      if (loopActive) {
+        await sendMailboxMessage(cwd, "manager", "parent", "directive", {
+          text: `New queue item: ${topic}`,
+          queueItemId: id,
+        });
+      }
+
+      pi.sendMessage(
+        {
+          customType: "harness-queue",
+          content: [
+            `## Work Queued: ${topic}`,
+            "",
+            `ID: ${id}`,
+            `Priority: ${priority}`,
+            ...(roleArg ? [`Role: ${roleArg}`] : []),
+            ...(goals ? [`Goals: ${goals.join(", ")}`] : []),
+            "",
+            `Queue now has ${queue.items.length} item(s).`,
+          ].join("\n"),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    },
+  });
+
+  pi.registerCommand("harness:inbox", {
+    description: "Read all messages in the parent's mailbox",
+    handler: async (_args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+
+      const messages = await readMailbox(cwd, "parent");
+
+      if (messages.length === 0) {
+        ctx.ui.notify("No messages in parent inbox.", "info");
+        return;
+      }
+
+      const lines: string[] = [
+        `## Parent Inbox (${messages.length} message(s))`,
+        "",
+      ];
+      for (const { message, filename } of messages) {
+        lines.push(
+          `**[${message.type}]** from ${message.from} at ${message.timestamp}`,
+        );
+        lines.push(`Payload: ${JSON.stringify(message.payload)}`);
+        lines.push("");
+        await deleteMessage(cwd, "parent", filename);
+      }
+
+      pi.sendMessage(
+        {
+          customType: "harness-inbox",
+          content: lines.join("\n"),
           display: true,
         },
         { triggerTurn: false },
