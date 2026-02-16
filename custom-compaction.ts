@@ -99,7 +99,10 @@ async function saveToGraphiti(summary: string): Promise<boolean> {
 
     const resp = await fetch("http://127.0.0.1:51847/mcp/", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -113,7 +116,10 @@ async function checkGraphiti(): Promise<boolean> {
   try {
     const resp = await fetch("http://127.0.0.1:51847/mcp/", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 0,
