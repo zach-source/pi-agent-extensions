@@ -229,7 +229,7 @@ export interface BmadGoalSpec {
 }
 
 /** Hardcoded dependency edges for BMAD workflows. */
-const BMAD_DEPENDENCY_MAP: Record<string, string[]> = {
+export const BMAD_DEPENDENCY_MAP: Record<string, string[]> = {
   "product-brief": [],
   brainstorm: [],
   research: [],
@@ -322,6 +322,40 @@ export function buildBmadWorkflowDag(
       dependsOn: deps,
       goals: [`Complete the ${name} workflow: ${def.description}`],
     });
+  }
+
+  // Cycle detection via topological sort (Kahn's algorithm)
+  const inDegree = new Map<string, number>();
+  const adjList = new Map<string, string[]>();
+  for (const s of specs) {
+    inDegree.set(s.workflowName, s.dependsOn.length);
+    for (const dep of s.dependsOn) {
+      const edges = adjList.get(dep) ?? [];
+      edges.push(s.workflowName);
+      adjList.set(dep, edges);
+    }
+  }
+  const queue: string[] = [];
+  for (const [name, deg] of inDegree) {
+    if (deg === 0) queue.push(name);
+  }
+  let visited = 0;
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    visited++;
+    for (const neighbor of adjList.get(node) ?? []) {
+      const newDeg = (inDegree.get(neighbor) ?? 1) - 1;
+      inDegree.set(neighbor, newDeg);
+      if (newDeg === 0) queue.push(neighbor);
+    }
+  }
+  if (visited < specs.length) {
+    const cycleNodes = [...inDegree.entries()]
+      .filter(([, deg]) => deg > 0)
+      .map(([name]) => name);
+    throw new Error(
+      `Dependency cycle detected in BMAD workflow DAG: ${cycleNodes.join(" → ")}`,
+    );
   }
 
   return specs;
@@ -3039,13 +3073,20 @@ export default function (pi: ExtensionAPI) {
     rawPrompt = rawPrompt
       .replace(/[Ii]nterview the user/g, "Based on existing project documents, fill in")
       .replace(/[Aa]sk the user (?:about |for |to )?/g, "Infer from available documentation ")
+      .replace(/[Aa]sk which /g, "Determine which ")
       .replace(/[Cc]onfirm with the user/g, "Verify against existing documents")
       .replace(/[Dd]iscuss with the user/g, "Analyze based on available context")
-      .replace(/[Pp]resent (?:.*?) to the user/g, "Document in the output file")
+      .replace(/[Pp]resent for (?:user )?review\b.*$/gm, "Save the document for harness review")
+      .replace(/and present for review$/gm, "and save the document")
+      .replace(/[Gg]ather .*?from the user/g, "Infer from existing project documents")
       .replace(
         /[Ss]uggest the next recommended workflow to the user/g,
         "Mark your goal as complete — the harness manager handles workflow sequencing",
       );
+
+    // M3: Strip the raw BMAD prompt's "### When Complete" block to avoid
+    // conflicting with our autonomous "## When Complete" section below.
+    rawPrompt = rawPrompt.replace(/### When Complete\n[\s\S]*$/, "").trimEnd();
 
     const goalFilePath = resolve(cwd, PI_AGENT_DIR, `${BMAD_PREFIX}${spec.workflowName}.md`);
     const workerName = `${BMAD_PREFIX}${spec.workflowName}`;
@@ -4309,13 +4350,13 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Write .bmad-mode.json metadata
+      // Build .bmad-mode.json data (written once after workers are spawned)
       const bmadModeData = {
         enabled: true,
         projectLevel: bmadConfig.projectLevel,
         projectName: bmadConfig.projectName,
         statusFile: bmadConfig.workflowStatusFile,
-        maxWorkers: maxWorkers === Infinity ? null : maxWorkers,
+        maxWorkers,
         workflows: dag.map((spec) => ({
           name: `${BMAD_PREFIX}${spec.workflowName}`,
           workflowName: spec.workflowName,
@@ -4324,10 +4365,6 @@ export default function (pi: ExtensionAPI) {
           status: "pending" as const,
         })),
       };
-      await atomicWriteFile(
-        join(piAgentDir(), ".bmad-mode.json"),
-        JSON.stringify(bmadModeData, null, 2),
-      );
 
       // Separate into ready (no unmet deps) vs waiting — a dep is only
       // "unmet" if it refers to another config in this launch (i.e. it's
@@ -4417,7 +4454,7 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      // Re-write .bmad-mode.json with updated statuses
+      // Write .bmad-mode.json (single write, after all worker statuses are finalized)
       await atomicWriteFile(
         join(piAgentDir(), ".bmad-mode.json"),
         JSON.stringify(bmadModeData, null, 2),
@@ -4456,7 +4493,7 @@ export default function (pi: ExtensionAPI) {
         projectLevel: bmadConfig.projectLevel,
         projectName: bmadConfig.projectName,
         statusFile: bmadConfig.workflowStatusFile,
-        maxWorkers: maxWorkers === Infinity ? undefined : maxWorkers,
+        maxWorkers,
         workflows: dag.map((spec) => ({
           name: `${BMAD_PREFIX}${spec.workflowName}`,
           workflowName: spec.workflowName,

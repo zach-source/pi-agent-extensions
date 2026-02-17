@@ -330,13 +330,20 @@ export function updateStatusInYaml(
   const lines = content.split("\n");
   let inBlock = false;
 
+  const escapedWorkflow = workflow.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].match(new RegExp(`^\\s*-\\s*name:\\s*${workflow}\\s*$`))) {
+    if (lines[i].match(new RegExp(`^\\s*-\\s*name:\\s*${escapedWorkflow}\\s*$`))) {
       inBlock = true;
       continue;
     }
     if (inBlock && lines[i].match(/^\s+status:/)) {
-      lines[i] = lines[i].replace(/status:\s*"[^"]*"/, `status: "${filePath}"`);
+      // Handle both quoted (status: "value") and unquoted (status: value) YAML
+      const safeFilePath = filePath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      lines[i] = lines[i].replace(
+        /status:\s*(?:"[^"]*"|'[^']*'|\S+)/,
+        `status: "${safeFilePath}"`,
+      );
       inBlock = false;
     }
     if (inBlock && lines[i].match(/^\s*-\s*name:/)) {
@@ -451,15 +458,25 @@ export async function loadStatus(
 // Recommendation Logic
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Known statuses that indicate a workflow has NOT been completed. */
+const INCOMPLETE_STATUSES = new Set([
+  "",
+  "required",
+  "optional",
+  "recommended",
+  "conditional",
+  // In-progress statuses (set by manager or harness during execution)
+  "active",
+  "pending",
+  "in-progress",
+  "in_progress",
+  "running",
+  "queued",
+  "blocked",
+]);
+
 export function isCompleted(status: string): boolean {
-  return (
-    status !== "required" &&
-    status !== "optional" &&
-    status !== "recommended" &&
-    status !== "conditional" &&
-    status !== "skipped" &&
-    status !== ""
-  );
+  return !INCOMPLETE_STATUSES.has(status.toLowerCase());
 }
 
 export function getNextRecommendation(
@@ -495,8 +512,8 @@ export function formatStatusSymbol(
   entry: WorkflowEntry,
   recommendation: string,
 ): string {
+  if (entry.status.toLowerCase() === "skipped") return "~";
   if (isCompleted(entry.status)) return "\u2713"; // checkmark
-  if (entry.status === "skipped") return "~";
   if (entry.name === recommendation) return "\u2192"; // arrow
   if (entry.status === "required") return "!";
   return "-";

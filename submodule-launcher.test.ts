@@ -55,11 +55,13 @@ import {
   goalFileName,
   withQueueLock,
   BMAD_ROLE_MAP,
+  BMAD_DEPENDENCY_MAP,
   buildBmadWorkflowDag,
   type BmadGoalSpec,
   type BmadModeConfig,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
+import { WORKFLOW_DEFS } from "./bmad.js";
 
 // ---------------------------------------------------------------------------
 // Mock factories
@@ -6733,8 +6735,19 @@ describe("buildBmadWorkflowDag", () => {
     expect(byName("prd")!.dependsOn).toEqual(["product-brief"]);
     expect(byName("architecture")!.dependsOn).toContain("prd");
     expect(byName("sprint-planning")!.dependsOn).toContain("architecture");
+    // M4: At L2, tech-spec is NOT in the plan, so sprint-planning should
+    // NOT depend on tech-spec (the dep edge is filtered out by the DAG builder)
+    expect(byName("sprint-planning")!.dependsOn).not.toContain("tech-spec");
     expect(byName("create-story")!.dependsOn).toEqual(["sprint-planning"]);
     expect(byName("dev-story")!.dependsOn).toEqual(["create-story"]);
+  });
+
+  it("L1 sprint-planning depends on tech-spec (not architecture)", () => {
+    const dag = buildBmadWorkflowDag(1, [], MOCK_WORKFLOW_DEFS);
+    const sp = dag.find((s) => s.workflowName === "sprint-planning")!;
+    // L1 includes tech-spec but NOT architecture or prd
+    expect(sp.dependsOn).toContain("tech-spec");
+    expect(sp.dependsOn).not.toContain("architecture");
   });
 
   it("empty status returns full DAG for level", () => {
@@ -6742,6 +6755,14 @@ describe("buildBmadWorkflowDag", () => {
     // L2 should have: product-brief, prd, architecture, sprint-planning,
     // create-story, dev-story, brainstorm, research, create-ux-design, solutioning-gate-check
     expect(dag.length).toBe(10);
+  });
+
+  it("DAG is acyclic for all levels", () => {
+    // Cycle detection via Kahn's algorithm is built into buildBmadWorkflowDag.
+    // If the hardcoded BMAD_DEPENDENCY_MAP had a cycle, this would throw.
+    for (const level of [0, 1, 2, 3]) {
+      expect(() => buildBmadWorkflowDag(level, [], MOCK_WORKFLOW_DEFS)).not.toThrow();
+    }
   });
 });
 
@@ -6762,6 +6783,34 @@ describe("BMAD_ROLE_MAP", () => {
     const roleNames = HARNESS_ROLES.map((r) => r.name);
     expect(roleNames).toContain("analyst");
     expect(roleNames).toContain("planner");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BMAD_DEPENDENCY_MAP / WORKFLOW_DEFS consistency (D3)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("BMAD_DEPENDENCY_MAP", () => {
+  const realDefNames = new Set(WORKFLOW_DEFS.map((d) => d.name));
+
+  it("every key in BMAD_DEPENDENCY_MAP exists in WORKFLOW_DEFS", () => {
+    for (const key of Object.keys(BMAD_DEPENDENCY_MAP)) {
+      expect(realDefNames.has(key)).toBe(true);
+    }
+  });
+
+  it("every dependency value in BMAD_DEPENDENCY_MAP exists in WORKFLOW_DEFS", () => {
+    for (const [, deps] of Object.entries(BMAD_DEPENDENCY_MAP)) {
+      for (const dep of deps) {
+        expect(realDefNames.has(dep)).toBe(true);
+      }
+    }
+  });
+
+  it("no workflow depends on itself", () => {
+    for (const [key, deps] of Object.entries(BMAD_DEPENDENCY_MAP)) {
+      expect(deps).not.toContain(key);
+    }
   });
 });
 

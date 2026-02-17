@@ -51,6 +51,7 @@ import {
   type WorkerState,
   buildBmadWorkflowDag,
   BMAD_ROLE_MAP,
+  BMAD_PREFIX,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -4633,5 +4634,871 @@ describe("/harness:bmad command integration", { timeout: 30000 }, () => {
         try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BMAD Harness Stress Tests & Edge Cases
+// ---------------------------------------------------------------------------
+
+describe("BMAD harness: stress tests and edge cases", { timeout: 60000 }, () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-bmad-stress-"));
+    repo = join(baseDir, "stress-project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      'echo "# Stress" > README.md && git add . && git commit -m "init"',
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      try {
+        const entries = await readdir(wtDir);
+        for (const entry of entries) {
+          try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+        }
+      } catch { /* wtdir may not exist */ }
+      try { git("worktree prune", repo); } catch { /* ignore */ }
+      try {
+        const branches = git("branch --list pi-agent/*", repo);
+        for (const branch of branches.split("\n")) {
+          const b = branch.trim();
+          if (b) { try { git(`branch -D ${b}`, repo); } catch { /* ignore */ } }
+        }
+      } catch { /* ignore */ }
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+      await rm(join(repo, "bmad"), { recursive: true, force: true });
+      await rm(join(repo, "docs"), { recursive: true, force: true });
+    } catch { /* first test */ }
+  });
+
+  function freshBmadHarness() {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi" || cmd === "tmux") {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+    return originalExec;
+  }
+
+  async function writeBmadConfig(level: number, name: string) {
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), [
+      `project_name: "${name}"`,
+      "project_type: web-app",
+      `project_level: ${level}`,
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      '  sprint_status_file: "docs/sprint-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+      "  stories: docs/stories",
+      "  tests: tests",
+    ].join("\n"));
+  }
+
+  async function writeStatusFile(entries: Array<{ name: string; status: string; phase: number }>) {
+    await mkdir(join(repo, "docs"), { recursive: true });
+    const lines = ["workflow_status:"];
+    for (const e of entries) {
+      lines.push(
+        `  - name: ${e.name}`,
+        `    phase: ${e.phase}`,
+        `    status: "${e.status}"`,
+        `    description: "${e.name} workflow"`,
+      );
+    }
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), lines.join("\n"));
+  }
+
+  // =========================================================================
+  // 1. Prompt Autonomy Sanitization — verify NO interactive phrases survive
+  // =========================================================================
+  it("prompt autonomy: all interactive phrases are replaced across every workflow at every level", async () => {
+    // For each level, build prompts for all workflows and verify no interactive
+    // phrases leaked through the M5 transformation.
+    const interactivePatterns = [
+      /[Ii]nterview the user/,
+      /[Aa]sk the user/,
+      /[Aa]sk which /,
+      /[Cc]onfirm with the user/,
+      /[Dd]iscuss with the user/,
+      /[Pp]resent for (?:user )?review/,
+      /and present for review/,
+      /[Gg]ather .*?from the user/,
+      /[Ss]uggest the next recommended workflow to the user/,
+    ];
+
+    for (const level of [0, 1, 2, 3]) {
+      await writeBmadConfig(level, `PromptTest-L${level}`);
+      await writeStatusFile([]); // Nothing completed
+
+      const { mock, ctx } = freshBmadHarness();
+      await mock.emit("session_start", {}, ctx);
+      interceptPiSpawns(mock);
+
+      const bmadCmd = mock.getCommand("harness:bmad")!;
+      await bmadCmd.handler("--max-workers 1", ctx);
+
+      // Read all generated prompt files
+      const promptsDir = join(repo, PI_AGENT_DIR, ".prompts");
+      let promptFiles: string[];
+      try {
+        promptFiles = (await readdir(promptsDir)).filter((f) => f.endsWith(".md"));
+      } catch {
+        promptFiles = [];
+      }
+
+      const violations: string[] = [];
+      for (const pf of promptFiles) {
+        const content = await readFile(join(promptsDir, pf), "utf-8");
+        for (const pattern of interactivePatterns) {
+          if (pattern.test(content)) {
+            violations.push(`${pf} contains "${pattern.source}"`);
+          }
+        }
+        // Verify autonomous preamble IS present
+        expect(content).toContain("running autonomously");
+        // Verify the "When Complete" section tells worker the manager handles sequencing
+        expect(content).toContain("harness manager handles workflow sequencing");
+        // Verify the "Asking Questions" section exists
+        expect(content).toContain("## Asking Questions");
+        // M3: Verify no duplicate "When Complete" sections — the raw BMAD
+        // "### When Complete" should be stripped, leaving only our "## When Complete"
+        const whenCompleteMatches = content.match(/#+\s+When Complete/g) || [];
+        if (whenCompleteMatches.length > 1) {
+          violations.push(`${pf} has ${whenCompleteMatches.length} "When Complete" sections`);
+        }
+      }
+
+      expect(violations).toEqual([]);
+
+      // Cleanup for next level iteration
+      try {
+        const wtDir = join(repo, WORKTREE_DIR);
+        const entries = await readdir(wtDir);
+        for (const entry of entries) {
+          try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+        }
+      } catch { /* ignore */ }
+      try { git("worktree prune", repo); } catch { /* ignore */ }
+      try {
+        const branches = git("branch --list pi-agent/*", repo);
+        for (const b of branches.split("\n").map((s) => s.trim()).filter(Boolean)) {
+          try { git(`branch -D ${b}`, repo); } catch { /* ignore */ }
+        }
+      } catch { /* ignore */ }
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+    }
+  });
+
+  // =========================================================================
+  // 2. Max-workers throttling — verify only N workers spawn even with many ready
+  // =========================================================================
+  it("max-workers=1 throttles to exactly 1 active worker, rest queued", async () => {
+    // L2 project with nothing completed → many ready Phase 1 workflows
+    await writeBmadConfig(2, "ThrottleTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    // Read .bmad-mode.json — only 1 workflow should be "active"
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+    const active = modeJson.workflows.filter((w: any) => w.status === "active");
+    const pending = modeJson.workflows.filter((w: any) => w.status === "pending");
+
+    expect(active.length).toBe(1);
+    expect(pending.length).toBeGreaterThan(0);
+    expect(active.length + pending.length).toBe(modeJson.workflows.length);
+
+    // Only 1 worktree should exist
+    const wtDir = join(repo, WORKTREE_DIR);
+    const worktrees = await readdir(wtDir);
+    expect(worktrees.length).toBe(1);
+
+    // Queue should contain the rest
+    const queue = await readQueue(repo);
+    expect(queue.items.length).toBeGreaterThan(0);
+
+    // Verify maxWorkers is written to the mode file
+    expect(modeJson.maxWorkers).toBe(1);
+  });
+
+  // =========================================================================
+  // 3. Stop→Restart cycle: verify BMAD prompts cleaned up and fresh launch works
+  // =========================================================================
+  it("stop cleans up BMAD prompts, second launch starts fresh", async () => {
+    await writeBmadConfig(0, "RestartTest");
+    await writeStatusFile([
+      { name: "tech-spec", phase: 2, status: "required" },
+      { name: "sprint-planning", phase: 4, status: "required" },
+      { name: "create-story", phase: 4, status: "required" },
+      { name: "dev-story", phase: 4, status: "required" },
+    ]);
+
+    // First launch
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("", ctx);
+
+    // Prompts should exist
+    const promptsDir = join(repo, PI_AGENT_DIR, ".prompts");
+    const promptsBefore = await readdir(promptsDir);
+    expect(promptsBefore.length).toBeGreaterThan(0);
+
+    // Stop the harness
+    const stopCmd = mock.getCommand("harness:stop")!;
+    await stopCmd.handler("", ctx);
+
+    // Prompts directory should be cleaned up
+    let promptsAfterStop: string[] = [];
+    try {
+      promptsAfterStop = await readdir(promptsDir);
+    } catch {
+      // Directory removed entirely — also acceptable
+    }
+    expect(promptsAfterStop.length).toBe(0);
+
+    // Cleanup worktrees for a fresh start
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      const entries = await readdir(wtDir);
+      for (const entry of entries) {
+        try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+    try { git("worktree prune", repo); } catch { /* ignore */ }
+    try {
+      const branches = git("branch --list pi-agent/*", repo);
+      for (const b of branches.split("\n").map((s) => s.trim()).filter(Boolean)) {
+        try { git(`branch -D ${b}`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+
+    // Second launch with fresh harness instance
+    const h2 = freshBmadHarness();
+    await h2.mock.emit("session_start", {}, h2.ctx);
+    interceptPiSpawns(h2.mock);
+
+    const bmadCmd2 = h2.mock.getCommand("harness:bmad")!;
+    await bmadCmd2.handler("", h2.ctx);
+
+    // Fresh prompts created
+    const promptsAfterRelaunch = await readdir(promptsDir);
+    expect(promptsAfterRelaunch.length).toBeGreaterThan(0);
+
+    // .bmad-mode.json refreshed
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+    expect(modeJson.enabled).toBe(true);
+    expect(modeJson.workflows.some((w: any) => w.status === "active")).toBe(true);
+  });
+
+  // =========================================================================
+  // 4. Cleanup removes ALL BMAD artifacts (prompts, mode file, worktrees)
+  // =========================================================================
+  it("harness:cleanup removes BMAD prompts, .bmad-mode.json, and all worktrees", async () => {
+    await writeBmadConfig(1, "CleanupTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 2", ctx);
+
+    // Verify artifacts exist
+    const promptsDir = join(repo, PI_AGENT_DIR, ".prompts");
+    expect((await readdir(promptsDir)).length).toBeGreaterThan(0);
+    const modeFile = join(repo, PI_AGENT_DIR, ".bmad-mode.json");
+    const modeBefore = JSON.parse(await readFile(modeFile, "utf-8"));
+    expect(modeBefore.enabled).toBe(true);
+
+    // Stop first (cleanup requires stopped harness)
+    const stopCmd = mock.getCommand("harness:stop")!;
+    await stopCmd.handler("", ctx);
+
+    // Run cleanup
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+
+    // Verify prompts directory gone
+    let promptsGone = false;
+    try { await readdir(promptsDir); } catch { promptsGone = true; }
+    expect(promptsGone).toBe(true);
+
+    // Verify .bmad-mode.json gone
+    let modeGone = false;
+    try { await readFile(modeFile, "utf-8"); } catch { modeGone = true; }
+    expect(modeGone).toBe(true);
+
+    // Verify worktrees cleaned
+    let wtGone = false;
+    try {
+      const entries = await readdir(join(repo, WORKTREE_DIR));
+      wtGone = entries.length === 0;
+    } catch { wtGone = true; }
+    expect(wtGone).toBe(true);
+  });
+
+  // =========================================================================
+  // 5. Malformed status file — warning emitted but launch still proceeds
+  // =========================================================================
+  it("malformed status file emits warning but launches all workflows as incomplete", async () => {
+    await writeBmadConfig(0, "MalformedTest");
+    // Write a status file with invalid YAML structure (not array format)
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(
+      join(repo, "docs", "bmm-workflow-status.yaml"),
+      "this is not valid workflow YAML\njust some garbage text\n",
+    );
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("", ctx);
+
+    // Should have emitted a warning about malformed status file
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("yielded 0 workflow entries"),
+      "warning",
+    );
+
+    // But should still have launched — all 4 L0 workflows treated as incomplete
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+    expect(modeJson.workflows.length).toBe(4);
+  });
+
+  // =========================================================================
+  // 6. Role persona appears in BMAD worker prompts
+  // =========================================================================
+  it("each BMAD worker prompt includes its role persona", async () => {
+    await writeBmadConfig(2, "RolePersonaTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    const promptsDir = join(repo, PI_AGENT_DIR, ".prompts");
+    const promptFiles = (await readdir(promptsDir)).filter((f) => f.endsWith(".md"));
+
+    // Map expected roles: workflow → expected persona snippet
+    const expectedPersonas: Record<string, string> = {
+      "bmad-product-brief.md": "business analyst",
+      "bmad-brainstorm.md": "exploration",  // researcher role
+      "bmad-research.md": "exploration",    // researcher role
+      "bmad-prd.md": "exploration",         // researcher → Product Manager
+      "bmad-tech-spec.md": "exploration",   // researcher → Product Manager
+      "bmad-create-ux-design.md": "frontend developer focused on UI/UX",
+      "bmad-architecture.md": "software architect",
+      "bmad-solutioning-gate-check.md": "software architect",
+      "bmad-sprint-planning.md": "project planner",
+      "bmad-create-story.md": "project planner",
+      "bmad-dev-story.md": "methodical software developer",
+    };
+
+    for (const pf of promptFiles) {
+      const content = await readFile(join(promptsDir, pf), "utf-8");
+      const expected = expectedPersonas[pf];
+      if (expected) {
+        expect(content.toLowerCase()).toContain(expected.toLowerCase());
+      }
+      // All prompts must say "You are ..." — not just "You are running autonomously"
+      expect(content).toMatch(/You are [a-z]/);
+    }
+  });
+
+  // =========================================================================
+  // 7. Dependency resolution correctness under partial completion
+  // =========================================================================
+  it("complex partial completion: deps correctly resolved across phases", async () => {
+    // L2 project where Phase 1 done, prd done but create-ux-design not
+    // NOTE: At L2, tech-spec is NOT in the plan (L2 uses prd+architecture).
+    // Architecture depends on [prd, tech-spec] → at L2, tech-spec is out-of-plan so only prd matters.
+    // With prd completed, architecture should be ready.
+    await writeBmadConfig(2, "PartialDeps");
+    await writeStatusFile([
+      { name: "product-brief", phase: 1, status: "docs/product-brief.md" },
+      { name: "brainstorm", phase: 1, status: "docs/brainstorm.md" },
+      { name: "research", phase: 1, status: "docs/research.md" },
+      { name: "prd", phase: 2, status: "docs/prd.md" },
+      // create-ux-design depends on prd (completed) → should be ready
+      { name: "create-ux-design", phase: 2, status: "optional" },
+    ]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 10", ctx);
+
+    // Read goal files to verify dependency chains
+    const piDir = join(repo, PI_AGENT_DIR);
+
+    // create-ux-design: no unmet deps (prd completed → filtered out)
+    const uxGoal = await readFile(join(piDir, "bmad-create-ux-design.md"), "utf-8");
+    expect(uxGoal).not.toContain("depends_on:");
+
+    // architecture: at L2, depends on [prd, tech-spec]. prd completed, tech-spec NOT in L2 plan.
+    // Both deps are satisfied → architecture should have no unmet deps
+    const archGoal = await readFile(join(piDir, "bmad-architecture.md"), "utf-8");
+    expect(archGoal).not.toContain("depends_on:");
+
+    // solutioning-gate-check: depends on architecture (unmet — just unblocked, not completed)
+    const gateGoal = await readFile(join(piDir, "bmad-solutioning-gate-check.md"), "utf-8");
+    expect(gateGoal).toContain("bmad-architecture");
+
+    // sprint-planning: at L2, depends on [architecture, tech-spec]. tech-spec out-of-plan → only architecture
+    const sprintGoal = await readFile(join(piDir, "bmad-sprint-planning.md"), "utf-8");
+    expect(sprintGoal).toContain("bmad-architecture");
+    expect(sprintGoal).not.toContain("bmad-tech-spec"); // tech-spec is out-of-plan at L2
+
+    // Read .bmad-mode.json — architecture + create-ux-design should be active (ready, no unmet deps)
+    const modeJson = JSON.parse(await readFile(join(piDir, ".bmad-mode.json"), "utf-8"));
+    const activeNames = modeJson.workflows
+      .filter((w: any) => w.status === "active")
+      .map((w: any) => w.name);
+    expect(activeNames).toContain("bmad-architecture");
+    expect(activeNames).toContain("bmad-create-ux-design");
+    // solutioning-gate-check should be pending (waiting for architecture)
+    const gateWorkflow = modeJson.workflows.find((w: any) => w.name === "bmad-solutioning-gate-check");
+    expect(gateWorkflow.status).toBe("pending");
+  });
+
+  // =========================================================================
+  // 8. Manager instructions contain BMAD-specific sections with correct metadata
+  // =========================================================================
+  it("manager instructions include BMAD phase management with correct project metadata", async () => {
+    await writeBmadConfig(3, "ManagerMetaTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 2", ctx);
+
+    // Read manager instructions from file (written to .pi-agent/.manager-instructions.md, NOT inside MANAGER_DIR)
+    const instructionsFile = join(repo, PI_AGENT_DIR, ".manager-instructions.md");
+    const instructions = await readFile(instructionsFile, "utf-8");
+
+    // Verify BMAD phase management section
+    expect(instructions).toContain("## BMAD Phase Management");
+    expect(instructions).toContain("ManagerMetaTest");
+    expect(instructions).toContain("Level 3");
+    expect(instructions).toContain("Max concurrent workers: 2");
+
+    // Verify dependency unblocking instructions
+    expect(instructions).toContain(".bmad-mode.json");
+    expect(instructions).toContain('"completed"');
+    expect(instructions).toContain("NOT listed in `.bmad-mode.json` at all is considered satisfied");
+
+    // Verify registry update instruction for new workers
+    expect(instructions).toContain("Add the new worker to the registry");
+
+    // Verify dev-story fan-out
+    expect(instructions).toContain("Dev-story fan-out");
+    expect(instructions).toContain("bmad-create-story");
+    expect(instructions).toContain("docs/stories/STORY-*.md");
+
+    // Verify staleness detection
+    expect(instructions).toContain("Staleness detection");
+    expect(instructions).toContain("heartbeat staleness");
+  });
+
+  // =========================================================================
+  // 9. "skipped" means "intentionally not doing this" → isCompleted("skipped") → true
+  //    Skipped workflows are EXCLUDED from the DAG (treated as done).
+  //    Dependencies on skipped workflows are satisfied.
+  // =========================================================================
+  it("'skipped' status workflows are excluded from DAG and satisfy dependencies", async () => {
+    await writeBmadConfig(2, "SkippedTest");
+    await writeStatusFile([
+      { name: "product-brief", phase: 1, status: "skipped" },
+      { name: "brainstorm", phase: 1, status: "skipped" },
+      { name: "research", phase: 1, status: "skipped" },
+      // prd "required" → not completed
+      { name: "prd", phase: 2, status: "required" },
+    ]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+
+    // "skipped" is treated as completed → these workflows are NOT in the DAG
+    const names = modeJson.workflows.map((w: any) => w.workflowName);
+    expect(names).not.toContain("product-brief");
+    expect(names).not.toContain("brainstorm");
+    expect(names).not.toContain("research");
+    // prd is "required" → still in the DAG
+    expect(names).toContain("prd");
+
+    // prd depends on product-brief, which is "skipped" (completed) → dep is SATISFIED
+    const prdWorkflow = modeJson.workflows.find((w: any) => w.workflowName === "prd");
+    expect(prdWorkflow).toBeDefined();
+    expect(prdWorkflow.dependsOn).toEqual([]); // product-brief skipped → dep satisfied
+  });
+
+  // =========================================================================
+  // 10. Goal file → parse round-trip preserves BMAD dependencies
+  // =========================================================================
+  it("BMAD goal files round-trip through serialize/parse preserving dependencies", async () => {
+    await writeBmadConfig(2, "RoundtripTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    const piDir = join(repo, PI_AGENT_DIR);
+    const goalFiles = (await readdir(piDir)).filter(
+      (f) => f.startsWith("bmad-") && f.endsWith(".md"),
+    );
+
+    for (const gf of goalFiles) {
+      const raw = await readFile(join(piDir, gf), "utf-8");
+      const parsed = parseGoalFile(raw, gf);
+
+      // Re-serialize and re-parse
+      const reserialized = serializeGoalFile(parsed);
+      const reparsed = parseGoalFile(reserialized, gf);
+
+      // Core fields preserved
+      expect(reparsed.name).toBe(parsed.name);
+      expect(reparsed.role).toBe(parsed.role);
+      expect(reparsed.goals.length).toBe(parsed.goals.length);
+      for (let i = 0; i < parsed.goals.length; i++) {
+        expect(reparsed.goals[i].text).toBe(parsed.goals[i].text);
+        expect(reparsed.goals[i].completed).toBe(parsed.goals[i].completed);
+      }
+
+      // Dependencies preserved
+      if (parsed.dependsOn && parsed.dependsOn.length > 0) {
+        expect(reparsed.dependsOn).toEqual(parsed.dependsOn);
+        // All BMAD deps should use the bmad- prefix
+        for (const dep of reparsed.dependsOn!) {
+          expect(dep).toMatch(/^bmad-/);
+        }
+      }
+
+      // Context preserved
+      expect(reparsed.context).toBe(parsed.context);
+    }
+  });
+
+  // =========================================================================
+  // 11. Mailbox directories created for ALL workflows, not just active ones
+  // =========================================================================
+  it("mailbox directories created for all DAG workflows including queued ones", async () => {
+    await writeBmadConfig(2, "MailboxTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    // Read .bmad-mode.json to get all workflow names
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+
+    // Every workflow (active + pending) should have a mailbox directory
+    const mailboxDir = join(repo, MAILBOX_DIR);
+    for (const w of modeJson.workflows) {
+      let mailboxExists = false;
+      try {
+        const entries = await readdir(join(mailboxDir, w.name));
+        mailboxExists = true;
+      } catch {
+        // Directory doesn't exist
+      }
+      expect(mailboxExists).toBe(true);
+    }
+
+    // Manager mailbox should also exist
+    let managerMailbox = false;
+    try {
+      await readdir(join(mailboxDir, "manager"));
+      managerMailbox = true;
+    } catch { /* */ }
+    expect(managerMailbox).toBe(true);
+  });
+
+  // =========================================================================
+  // 12. Workflow with no WORKFLOW_PROMPTS entry gets fallback prompt
+  // =========================================================================
+  it("workflow without WORKFLOW_PROMPTS entry gets sensible fallback prompt", async () => {
+    // This tests the fallback path in buildBmadWorkerPrompt where
+    // WORKFLOW_PROMPTS[name] is undefined. We can test this indirectly:
+    // the "solutioning-gate-check" workflow IS in WORKFLOW_PROMPTS, so let's
+    // verify all generated prompts contain meaningful content (not just the
+    // fallback stub). This is more of a sanity check.
+    await writeBmadConfig(2, "FallbackTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    const promptsDir = join(repo, PI_AGENT_DIR, ".prompts");
+    const promptFiles = (await readdir(promptsDir)).filter((f) => f.endsWith(".md"));
+
+    for (const pf of promptFiles) {
+      const content = await readFile(join(promptsDir, pf), "utf-8");
+      // Every prompt should have substantial content (not just the 3-line fallback)
+      expect(content.length).toBeGreaterThan(500);
+      // Every prompt should have the BMAD header
+      expect(content).toMatch(/## (Autonomous BMAD Worker|BMAD:)/);
+      // Every prompt should have harness worker instructions
+      expect(content).toContain("## Harness Worker Instructions");
+      // Every prompt should have mailbox section
+      expect(content).toContain("## Mailbox");
+      // Every prompt should have "When Complete" section
+      expect(content).toContain("## When Complete");
+      expect(content).toContain("bmad_save_document");
+      expect(content).toContain("bmad_update_status");
+    }
+  });
+
+  // =========================================================================
+  // 13. Registry only contains spawned workers, not queued ones
+  // =========================================================================
+  it("registry contains only spawned (active) workers, not queued workers", async () => {
+    await writeBmadConfig(2, "RegistryTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 2", ctx);
+
+    const registry = await readRegistry(repo);
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+
+    const activeWorkflows = modeJson.workflows.filter((w: any) => w.status === "active");
+    const pendingWorkflows = modeJson.workflows.filter((w: any) => w.status === "pending");
+
+    // Registry should only have active workers (+ possibly manager)
+    const registryNames = Object.keys(registry.workers);
+    for (const aw of activeWorkflows) {
+      expect(registryNames).toContain(aw.name);
+    }
+    for (const pw of pendingWorkflows) {
+      expect(registryNames).not.toContain(pw.name);
+    }
+  });
+
+  // =========================================================================
+  // 14. Queue items have correct metadata for BMAD workflows
+  // =========================================================================
+  it("queued BMAD workflows have correct role, goals, and description in queue", async () => {
+    await writeBmadConfig(0, "QueueMetaTest");
+    await writeStatusFile([
+      { name: "tech-spec", phase: 2, status: "required" },
+      { name: "sprint-planning", phase: 4, status: "required" },
+      { name: "create-story", phase: 4, status: "required" },
+      { name: "dev-story", phase: 4, status: "required" },
+    ]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    // Only tech-spec should be active, rest queued
+    const queue = await readQueue(repo);
+
+    // Should have 3 queued items (sprint-planning, create-story, dev-story)
+    expect(queue.items.length).toBe(3);
+
+    for (const item of queue.items) {
+      // Topic should be the worker name (bmad-prefixed)
+      expect(item.topic).toMatch(/^bmad-/);
+      // Should have a role
+      expect(item.role).toBeDefined();
+      expect(typeof item.role).toBe("string");
+      // Should have goals
+      expect(item.goals.length).toBeGreaterThan(0);
+      // Description should mention BMAD workflow
+      expect(item.description).toContain("BMAD workflow");
+      // Status should be pending
+      expect(item.status).toBe("pending");
+    }
+
+    // Verify specific role mappings in queue
+    const sprintItem = queue.items.find((i) => i.topic === "bmad-sprint-planning");
+    expect(sprintItem).toBeDefined();
+    expect(sprintItem!.role).toBe("planner"); // Scrum Master → planner
+
+    const devItem = queue.items.find((i) => i.topic === "bmad-dev-story");
+    expect(devItem).toBeDefined();
+    expect(devItem!.role).toBe("developer"); // Developer → developer
+  });
+
+  // =========================================================================
+  // 15. Full L2 waterfall: simulate worker completions, verify unblocking cascade
+  // =========================================================================
+  it("simulated completion cascade: completing Phase 1 unblocks Phase 2 deps correctly", async () => {
+    // L2 project: product-brief → prd → architecture → sprint → story → dev
+    // NOTE: At L2, tech-spec is NOT in the plan. Architecture depends on [prd, tech-spec]
+    // but since tech-spec is out-of-plan, only prd matters.
+    await writeBmadConfig(2, "CascadeTest");
+    await writeStatusFile([]);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+    interceptPiSpawns(mock);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 10", ctx);
+
+    // Snapshot: Phase 1 workflows (product-brief, brainstorm, research) are ready
+    const modeJson = JSON.parse(
+      await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"),
+    );
+    const phase1Active = modeJson.workflows
+      .filter((w: any) => w.status === "active")
+      .map((w: any) => w.workflowName);
+
+    // Phase 1 workflows should be active (no deps)
+    expect(phase1Active).toContain("product-brief");
+    expect(phase1Active).toContain("brainstorm");
+    expect(phase1Active).toContain("research");
+
+    // Phase 2 workflows (prd, create-ux-design) should be pending — they depend on product-brief
+    const prdW = modeJson.workflows.find((w: any) => w.workflowName === "prd");
+    expect(prdW.status).toBe("pending");
+
+    // Verify tech-spec is NOT in the L2 plan at all
+    const techW = modeJson.workflows.find((w: any) => w.workflowName === "tech-spec");
+    expect(techW).toBeUndefined();
+
+    // Now simulate: Phase 1 completes.
+    const { WORKFLOW_DEFS } = await import("./bmad.js");
+    const dagAfterPhase1 = buildBmadWorkflowDag(
+      2,
+      [
+        { name: "product-brief", status: "docs/product-brief.md" },
+        { name: "brainstorm", status: "docs/brainstorm.md" },
+        { name: "research", status: "docs/research.md" },
+      ],
+      WORKFLOW_DEFS,
+    );
+
+    // prd should now have NO deps (product-brief completed)
+    const prdSpec = dagAfterPhase1.find((s) => s.workflowName === "prd");
+    expect(prdSpec).toBeDefined();
+    expect(prdSpec!.dependsOn).toEqual([]);
+
+    // create-ux-design depends on prd which is NOT completed yet → dep is unmet
+    const uxSpec = dagAfterPhase1.find((s) => s.workflowName === "create-ux-design");
+    expect(uxSpec).toBeDefined();
+    expect(uxSpec!.dependsOn).toEqual(["prd"]);
+
+    // architecture depends on [prd, tech-spec]. tech-spec out-of-plan → only prd matters.
+    // prd is not completed → dep unmet
+    const archSpec = dagAfterPhase1.find((s) => s.workflowName === "architecture");
+    expect(archSpec).toBeDefined();
+    expect(archSpec!.dependsOn).toEqual(["prd"]);
+
+    // Now simulate: prd completes
+    const dagAfterPrd = buildBmadWorkflowDag(
+      2,
+      [
+        { name: "product-brief", status: "docs/product-brief.md" },
+        { name: "brainstorm", status: "docs/brainstorm.md" },
+        { name: "research", status: "docs/research.md" },
+        { name: "prd", status: "docs/prd.md" },
+      ],
+      WORKFLOW_DEFS,
+    );
+
+    // architecture: prd completed, tech-spec out-of-plan → NO deps
+    const finalArch = dagAfterPrd.find((s) => s.workflowName === "architecture");
+    expect(finalArch).toBeDefined();
+    expect(finalArch!.dependsOn).toEqual([]);
+
+    // create-ux-design: prd completed → NO deps
+    const finalUx = dagAfterPrd.find((s) => s.workflowName === "create-ux-design");
+    expect(finalUx).toBeDefined();
+    expect(finalUx!.dependsOn).toEqual([]);
+
+    // sprint-planning depends on [architecture, tech-spec]. tech-spec out-of-plan → only architecture
+    // architecture not completed → dep unmet
+    const finalSprint = dagAfterPrd.find((s) => s.workflowName === "sprint-planning");
+    expect(finalSprint).toBeDefined();
+    expect(finalSprint!.dependsOn).toEqual(["architecture"]);
+
+    // solutioning-gate-check depends on architecture (not completed) → dep unmet
+    const finalGate = dagAfterPrd.find((s) => s.workflowName === "solutioning-gate-check");
+    expect(finalGate).toBeDefined();
+    expect(finalGate!.dependsOn).toEqual(["architecture"]);
   });
 });

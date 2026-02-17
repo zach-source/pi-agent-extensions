@@ -16,6 +16,7 @@ import {
   loadStatus,
   getNextRecommendation,
   formatStatusSymbol,
+  isCompleted,
   getTemplate,
   BMAD_VERSION,
   LEVEL_DEFS,
@@ -373,6 +374,131 @@ describe("updateStatusInYaml", () => {
     expect(updated).toContain('status: "required"');
     // But timestamp still updated
     expect(updated).toContain('last_updated: "2026-02-11T10:00:00.000Z"');
+  });
+
+  it("handles unquoted YAML status values", () => {
+    const unquotedYaml = [
+      'last_updated: "2026-01-01T00:00:00.000Z"',
+      "",
+      "workflow_status:",
+      "  - name: product-brief",
+      "    phase: 1",
+      "    status: optional",
+      '    description: "Product brief"',
+    ].join("\n");
+
+    const updated = updateStatusInYaml(
+      unquotedYaml,
+      "product-brief",
+      "docs/product-brief.md",
+      "2026-02-11T10:00:00.000Z",
+    );
+    expect(updated).toContain('status: "docs/product-brief.md"');
+  });
+
+  it("handles single-quoted YAML status values", () => {
+    const singleQuotedYaml = [
+      'last_updated: "2026-01-01T00:00:00.000Z"',
+      "",
+      "workflow_status:",
+      "  - name: prd",
+      "    phase: 2",
+      "    status: 'required'",
+      '    description: "PRD"',
+    ].join("\n");
+
+    const updated = updateStatusInYaml(
+      singleQuotedYaml,
+      "prd",
+      "docs/prd.md",
+      "2026-02-11T10:00:00.000Z",
+    );
+    expect(updated).toContain('status: "docs/prd.md"');
+  });
+
+  it("handles workflow names with regex metacharacters", () => {
+    const yamlWithSpecialName = [
+      'last_updated: "2026-01-01T00:00:00.000Z"',
+      "",
+      "workflow_status:",
+      "  - name: create-ux-design",
+      "    phase: 2",
+      '    status: "optional"',
+      '    description: "UX Design"',
+    ].join("\n");
+
+    const updated = updateStatusInYaml(
+      yamlWithSpecialName,
+      "create-ux-design",
+      "docs/ux.md",
+      "2026-02-11T10:00:00.000Z",
+    );
+    expect(updated).toContain('status: "docs/ux.md"');
+  });
+
+  it("escapes quotes in filePath to prevent YAML injection", () => {
+    const yaml = [
+      'last_updated: "2026-01-01T00:00:00.000Z"',
+      "",
+      "workflow_status:",
+      "  - name: product-brief",
+      "    phase: 1",
+      '    status: "optional"',
+      '    description: "Product brief"',
+    ].join("\n");
+
+    const updated = updateStatusInYaml(
+      yaml,
+      "product-brief",
+      'docs/brief "v1".md',
+      "2026-02-11T10:00:00.000Z",
+    );
+    // Double quotes in the filePath should be escaped
+    expect(updated).toContain('status: "docs/brief \\"v1\\".md"');
+  });
+});
+
+describe("isCompleted", () => {
+  it("returns false for pending label statuses", () => {
+    expect(isCompleted("required")).toBe(false);
+    expect(isCompleted("optional")).toBe(false);
+    expect(isCompleted("recommended")).toBe(false);
+    expect(isCompleted("conditional")).toBe(false);
+    expect(isCompleted("")).toBe(false);
+  });
+
+  it("returns false for in-progress statuses", () => {
+    expect(isCompleted("active")).toBe(false);
+    expect(isCompleted("pending")).toBe(false);
+    expect(isCompleted("in-progress")).toBe(false);
+    expect(isCompleted("in_progress")).toBe(false);
+    expect(isCompleted("running")).toBe(false);
+    expect(isCompleted("queued")).toBe(false);
+    expect(isCompleted("blocked")).toBe(false);
+  });
+
+  it("returns false for case-insensitive in-progress statuses", () => {
+    expect(isCompleted("Active")).toBe(false);
+    expect(isCompleted("PENDING")).toBe(false);
+    expect(isCompleted("In-Progress")).toBe(false);
+    expect(isCompleted("Running")).toBe(false);
+  });
+
+  it("returns true for file path statuses (completed)", () => {
+    expect(isCompleted("docs/product-brief-myapp.md")).toBe(true);
+    expect(isCompleted("docs/prd-v1.md")).toBe(true);
+    expect(isCompleted("docs/architecture.md")).toBe(true);
+  });
+
+  it("returns true for explicit completion statuses", () => {
+    expect(isCompleted("completed")).toBe(true);
+    expect(isCompleted("done")).toBe(true);
+    expect(isCompleted("merged")).toBe(true);
+  });
+
+  it("returns true for 'skipped' (intentionally not doing this workflow)", () => {
+    expect(isCompleted("skipped")).toBe(true);
+    expect(isCompleted("Skipped")).toBe(true);
   });
 });
 
