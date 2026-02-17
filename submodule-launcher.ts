@@ -27,6 +27,7 @@
  *
  * Commands:
  *   /harness:launch    - Read goals, create worktrees, spawn workers + manager
+ *   /harness:auto      - Autonomous: scout → plan → execute → re-scout loop
  *   /harness:status    - Show progress of all submodules
  *   /harness:stop      - Write stop signal, deactivate loop
  *   /harness:init      - Discover submodules, scaffold .pi-agent/
@@ -449,6 +450,61 @@ export const TMUX_SERVER = "pi-harness";
 export const MAX_CONSECUTIVE_FAILURES = 5;
 export const WORKER_STALL_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 export const RECOVERY_BACKOFF = [2, 4, 8]; // stale cycles required for each recovery attempt
+
+// --- Auto Mode Types & Constants ---
+
+export const AUTO_MODE_FILE = ".pi-agent/.auto-mode.json";
+export const SCOUT_ANALYSIS_FILE = ".pi-agent/.scout-analysis.json";
+export const SCOUT_REPORT_FILE = ".pi-agent/.scout-report.md";
+
+export type ScoutCategory = "tests" | "quality" | "features" | "docs" | "security" | "performance" | "cleanup" | "bugs";
+
+export interface ScoutFinding {
+  id: string;
+  category: ScoutCategory;
+  severity: "high" | "medium" | "low";
+  title: string;
+  description: string;
+  evidence: string[];
+  suggestedRole: string;
+  estimatedGoals: string[];
+  dependsOn?: string[];
+}
+
+export interface ScoutAnalysis {
+  timestamp: string;
+  objective?: string;
+  focus?: ScoutCategory[];
+  repoSummary: {
+    name: string;
+    languages: string[];
+    hasTests: boolean;
+    testFramework?: string;
+    hasCI: boolean;
+    recentCommits: number;
+    openTodoCount: number;
+  };
+  findings: ScoutFinding[];
+}
+
+export interface AutoModeConfig {
+  objective?: string;
+  focus?: ScoutCategory[];
+  maxWorkers: number;
+  maxIterations: number;
+  autoApprove: boolean;
+  staggerMs: number;
+  iteration: number;
+}
+
+export interface AutoModeState {
+  enabled: boolean;
+  config: AutoModeConfig;
+  phase: "scouting" | "planning" | "check-in" | "executing" | "re-scouting" | "idle";
+  iteration: number;
+  scoutAnalysis?: ScoutAnalysis;
+  planApproved: boolean;
+}
 
 export interface WorkerState {
   name: string;
@@ -1046,6 +1102,197 @@ export function buildProgressSummary(configs: SubmoduleConfig[]): string {
   }
 
   return lines.join("\n");
+}
+
+// --- Auto Mode Pure Functions ---
+
+/**
+ * Build the prompt for the scout worker that evaluates the codebase.
+ * Pure function — no side effects.
+ */
+export function buildScoutPrompt(
+  baseCwd: string,
+  objective?: string,
+  focus?: ScoutCategory[],
+): string {
+  const analysisPath = resolve(baseCwd, SCOUT_ANALYSIS_FILE);
+  const reportPath = resolve(baseCwd, SCOUT_REPORT_FILE);
+  const goalFilePath = resolve(baseCwd, PI_AGENT_DIR, "scout.md");
+
+  const lines: string[] = [
+    "You are a technical researcher evaluating this codebase to identify the highest-impact work.",
+    "Your job is read-only investigation — do NOT modify any source code, tests, or configuration.",
+    "",
+  ];
+
+  if (objective) {
+    lines.push("## Objective", "", objective, "");
+  }
+
+  if (focus && focus.length > 0) {
+    lines.push(
+      "## Focus Areas",
+      "",
+      `Limit your investigation to these categories: ${focus.join(", ")}`,
+      "",
+    );
+  }
+
+  lines.push(
+    "## Investigation Checklist",
+    "",
+    "Investigate each area systematically. Skip areas outside the focus filter (if any).",
+    "",
+    "### 1. Project Structure",
+    "- Read README, directory layout, package.json/Cargo.toml/go.mod/etc.",
+    "- Identify languages, frameworks, and build system",
+    "- Note the overall architecture pattern (monorepo, microservices, monolith)",
+    "",
+    "### 2. Test Health",
+    "- Detect test framework (vitest, jest, pytest, go test, etc.)",
+    "- Run the test suite and capture pass/fail/skip counts",
+    "- Identify coverage gaps: modules or features with no tests",
+    "- Check for flaky or disabled tests",
+    "",
+    "### 3. Code Quality",
+    "- Search for TODO, FIXME, HACK, XXX comments",
+    "- Run linter if available (eslint, ruff, golangci-lint, etc.)",
+    "- Check for type errors (tsc --noEmit, mypy, etc.)",
+    "- Look for dead code, unused exports, unreachable branches",
+    "",
+    "### 4. Git History",
+    "- Review last 20 commits for patterns and recent focus areas",
+    "- Check for open branches that may indicate in-progress work",
+    "- Look for recent reverts or hotfixes indicating instability",
+    "",
+    "### 5. Dependencies & Security",
+    "- Check for outdated dependencies (npm outdated, pip list --outdated, etc.)",
+    "- Run security audit if available (npm audit, pip-audit, etc.)",
+    "- Verify dependency versions are pinned appropriately",
+    "",
+    "### 6. Documentation",
+    "- Evaluate README completeness and accuracy",
+    "- Check for inline documentation (JSDoc, docstrings, etc.)",
+    "- Look for missing or outdated changelog",
+    "",
+    "### 7. CI/CD & Infrastructure",
+    "- Check for GitHub Actions, GitLab CI, or other CI configuration",
+    "- Evaluate build scripts and deployment configuration",
+    "- Look for Dockerfile, docker-compose, Kubernetes manifests",
+    "",
+  );
+
+  lines.push(
+    "## Output Requirements",
+    "",
+    "Write TWO files when your investigation is complete:",
+    "",
+    `### 1. \`${analysisPath}\` — Structured JSON`,
+    "",
+    "```json",
+    "{",
+    '  "timestamp": "<ISO 8601>",',
+    objective ? `  "objective": "${objective.replace(/"/g, '\\"')}",` : "",
+    focus ? `  "focus": ${JSON.stringify(focus)},` : "",
+    '  "repoSummary": {',
+    '    "name": "<repo name>",',
+    '    "languages": ["<lang1>", "<lang2>"],',
+    '    "hasTests": true|false,',
+    '    "testFramework": "<framework or null>",',
+    '    "hasCI": true|false,',
+    '    "recentCommits": <number>,',
+    '    "openTodoCount": <number>',
+    "  },",
+    '  "findings": [',
+    "    {",
+    '      "id": "<kebab-case-id>",',
+    '      "category": "tests|quality|features|docs|security|performance|cleanup|bugs",',
+    '      "severity": "high|medium|low",',
+    '      "title": "<short title>",',
+    '      "description": "<detailed description>",',
+    '      "evidence": ["<file path or test output>"],',
+    '      "suggestedRole": "<harness role name>",',
+    '      "estimatedGoals": ["<concrete goal 1>", "<concrete goal 2>"],',
+    '      "dependsOn": ["<other-finding-id>"]',
+    "    }",
+    "  ]",
+    "}",
+    "```",
+    "",
+    `### 2. \`${reportPath}\` — Human-Readable Markdown`,
+    "",
+    "Write a concise markdown summary with:",
+    "- Repository overview (1-2 sentences)",
+    "- Key findings grouped by severity",
+    "- Recommended priority order",
+    "",
+    "## Constraints",
+    "",
+    "- **Read-only**: Do NOT modify any source code, tests, or configuration",
+    "- **Max 15 findings**: Focus on the highest-impact issues",
+    "- **Prefer parallelizable goals**: Findings that can be worked on independently are better",
+    "- **Be specific**: Each goal should be concrete and actionable (not vague like 'improve quality')",
+    "- **Use evidence**: Back findings with specific file paths, test output, or metrics",
+    "",
+    "## Goal File",
+    "",
+    `When done, edit your goal file at \`${goalFilePath}\` to mark your goal complete: change \`- [ ]\` to \`- [x]\`.`,
+    "",
+    "## Worker Instructions",
+    "",
+    "- You are working in a git worktree — do NOT switch branches",
+    "- NEVER modify heartbeat.md or .pi-agent-prompt.md",
+    "- Do not commit any files — your output is the two analysis files only",
+    "",
+  );
+
+  return lines.filter((l) => l !== undefined).join("\n");
+}
+
+/**
+ * Build a launch plan from scout analysis. Pure function — no side effects.
+ * Returns configs split into ready (no unmet deps) and queued (blocked/overflow).
+ */
+export function buildPlanFromAnalysis(
+  analysis: ScoutAnalysis,
+  maxWorkers: number,
+): { configs: SubmoduleConfig[]; ready: SubmoduleConfig[]; queued: SubmoduleConfig[] } {
+  // Sort findings by severity: high → medium → low
+  const severityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const sorted = [...analysis.findings].sort(
+    (a, b) => (severityOrder[a.severity] ?? 2) - (severityOrder[b.severity] ?? 2),
+  );
+
+  const configs: SubmoduleConfig[] = sorted.map((finding) => ({
+    name: finding.id,
+    path: ".",
+    role: HARNESS_ROLES.some((r) => r.name === finding.suggestedRole)
+      ? finding.suggestedRole
+      : "developer",
+    goals: finding.estimatedGoals.map((text) => ({ text, completed: false })),
+    questions: [],
+    context: `${finding.description}\n\nEvidence: ${finding.evidence.join(", ")}`,
+    rawContent: "",
+    dependsOn: finding.dependsOn,
+  }));
+
+  // All finding IDs in this plan
+  const allIds = new Set(configs.map((c) => c.name));
+
+  const ready: SubmoduleConfig[] = [];
+  const queued: SubmoduleConfig[] = [];
+
+  for (const config of configs) {
+    // Only count deps that reference other findings in this plan
+    const unmetDeps = (config.dependsOn ?? []).filter((d) => allIds.has(d));
+    if (unmetDeps.length === 0 && ready.length < maxWorkers) {
+      ready.push(config);
+    } else {
+      queued.push(config);
+    }
+  }
+
+  return { configs, ready, queued };
 }
 
 /** Build static manager instructions (written once at launch). */
@@ -1975,6 +2222,182 @@ export default function (pi: ExtensionAPI) {
     }));
   }
 
+  // --- Auto Mode Helpers ---
+
+  async function readAutoModeState(): Promise<AutoModeState | null> {
+    try {
+      const content = await readFile(join(cwd, AUTO_MODE_FILE), "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === "object" && parsed.enabled !== undefined) {
+        return parsed as AutoModeState;
+      }
+    } catch {
+      // File doesn't exist or is malformed
+    }
+    return null;
+  }
+
+  async function writeAutoModeState(state: AutoModeState): Promise<void> {
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(
+      join(cwd, AUTO_MODE_FILE),
+      JSON.stringify(state, null, 2) + "\n",
+    );
+  }
+
+  async function spawnScout(autoConfig: AutoModeConfig): Promise<void> {
+    const scoutConfig: SubmoduleConfig = {
+      name: "scout",
+      path: ".",
+      role: "researcher",
+      goals: [{ text: "Evaluate the codebase and produce a scout analysis", completed: false }],
+      questions: [],
+      context: autoConfig.objective ?? "Identify the highest-impact improvements for this codebase",
+      rawContent: "",
+    };
+
+    // Write goal file
+    const goalContent = serializeGoalFile(scoutConfig);
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(join(piAgentDir(), goalFileName("scout")), goalContent);
+
+    // Create worktree and write prompt
+    const session = await createWorktree(scoutConfig);
+    const prompt = buildScoutPrompt(cwd, autoConfig.objective, autoConfig.focus);
+    await atomicWriteFile(join(session.worktreePath, ".pi-agent-prompt.md"), prompt);
+    await addToWorktreeExclude(session.worktreePath, ".pi-agent-prompt.md");
+
+    // Spawn tmux session
+    const tmuxName = `worker-scout`;
+    const cmd = `pi -p "$(cat .pi-agent-prompt.md)"`;
+    await tmuxNewSession(tmuxName, cmd, session.worktreePath);
+
+    session.tmuxSession = tmuxName;
+    session.spawned = true;
+    session.spawnedAt = new Date();
+
+    await mkdir(mailboxPath(cwd, "scout"), { recursive: true });
+  }
+
+  async function executeAutoModePlan(
+    analysis: ScoutAnalysis,
+    autoConfig: AutoModeConfig,
+  ): Promise<void> {
+    const { configs: allConfigs, ready, queued } = buildPlanFromAnalysis(
+      analysis,
+      autoConfig.maxWorkers,
+    );
+
+    // Write goal files for all configs
+    for (const config of allConfigs) {
+      const goalContent = serializeGoalFile(config);
+      await atomicWriteFile(join(piAgentDir(), goalFileName(config.name)), goalContent);
+    }
+
+    // Spawn ready workers with stagger
+    const launched: string[] = [];
+    for (let i = 0; i < ready.length; i++) {
+      const config = ready[i];
+      const session = await createWorktree(config);
+      await spawnSession(session, config);
+      launched.push(`${config.name} (${config.goals.length} goals)`);
+
+      if (i < ready.length - 1 && autoConfig.staggerMs > 0) {
+        await new Promise((r) => setTimeout(r, autoConfig.staggerMs));
+      }
+    }
+
+    // Queue overflow/waiting
+    if (queued.length > 0) {
+      await withQueueLock(cwd, async () => {
+        const queue = await readQueue(cwd);
+        for (const config of queued) {
+          const id = generateMessageId();
+          queue.items.push({
+            id,
+            topic: config.name,
+            description: `Auto mode: ${config.goals.map((g) => g.text).join("; ")}`,
+            goals: config.goals.map((g) => g.text),
+            role: config.role,
+            priority: 10,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+          });
+        }
+        await writeQueue(cwd, queue);
+      });
+    }
+
+    // Create mailbox directories
+    for (const config of allConfigs) {
+      await mkdir(mailboxPath(cwd, config.name), { recursive: true });
+    }
+    await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+    await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
+
+    // Initialize worker registry
+    const registryWorkers: Record<string, WorkerRegistryEntry> = {};
+    for (const config of ready) {
+      const session = sessions.get(config.name);
+      if (!session) continue;
+      registryWorkers[config.name] = {
+        name: config.name,
+        role: config.role,
+        branch: session.branch,
+        worktreePath: session.worktreePath,
+        status: "active",
+        goalsTotal: config.goals.length,
+        goalsCompleted: 0,
+        assignedQueueItems: [],
+      };
+    }
+    await writeRegistry(cwd, {
+      workers: registryWorkers,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Spawn manager
+    await spawnManager(allConfigs);
+
+    loopActive = true;
+    launchStartedAt = new Date();
+    managerRecoveryAttempts = 0;
+    managerStaleCount = 0;
+    await persistState();
+
+    // Notify manager about queued items
+    const queue = await readQueue(cwd);
+    const pendingItems = queue.items.filter((i) => i.status === "pending");
+    if (pendingItems.length > 0) {
+      await sendMailboxMessage(cwd, "manager", "parent", "directive", {
+        text: `${pendingItems.length} pending queue item(s) awaiting dispatch`,
+      });
+    }
+
+    // Report launch
+    const reportLines = [
+      `## Auto Mode: Workers Launched`,
+      "",
+      `**Iteration:** ${autoConfig.iteration + 1}/${autoConfig.maxIterations}`,
+      `**Workers:** ${launched.join(", ")} (${launched.length})`,
+    ];
+    if (queued.length > 0) {
+      reportLines.push(
+        `**Queued (dependencies/overflow):** ${queued.map((c) => c.name).join(", ")} (${queued.length})`,
+      );
+    }
+    reportLines.push("", "Manager session spawned to monitor progress.");
+
+    pi.sendMessage(
+      {
+        customType: "harness-auto-launched",
+        content: reportLines.join("\n"),
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  }
+
   async function spawnManager(configs: SubmoduleConfig[], bmadMode?: BmadModeConfig): Promise<void> {
     const mgrDir = managerDirPath();
     await mkdir(mgrDir, { recursive: true });
@@ -2243,6 +2666,85 @@ export default function (pi: ExtensionAPI) {
       // getContextUsage may not be available
     }
 
+    // --- Auto mode: scout completion detection ---
+    const autoState = await readAutoModeState();
+    if (autoState?.enabled && (autoState.phase === "scouting" || autoState.phase === "re-scouting")) {
+      // Check if scout goal file has goal completed
+      try {
+        const scoutGoalPath = join(piAgentDir(), goalFileName("scout"));
+        const scoutGoalContent = await readFile(scoutGoalPath, "utf-8");
+        const scoutConfig = parseGoalFile(scoutGoalContent, "scout.md");
+        const allGoalsDone = scoutConfig.goals.length > 0 && scoutConfig.goals.every((g) => g.completed);
+
+        if (allGoalsDone) {
+          // Read the scout analysis
+          let analysis: ScoutAnalysis | null = null;
+          try {
+            const analysisContent = await readFile(join(cwd, SCOUT_ANALYSIS_FILE), "utf-8");
+            analysis = JSON.parse(analysisContent) as ScoutAnalysis;
+          } catch {
+            // Analysis file not written or malformed
+          }
+
+          if (analysis && analysis.findings && analysis.findings.length > 0) {
+            // Clean up scout worktree
+            const scoutSession = sessions.get("scout");
+            if (scoutSession) {
+              try {
+                await removeWorktree(scoutSession, true);
+              } catch { /* best effort */ }
+              sessions.delete("scout");
+            }
+            try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* best effort */ }
+
+            // Update auto state with analysis
+            autoState.scoutAnalysis = analysis;
+            autoState.phase = "executing";
+            autoState.planApproved = true;
+            await writeAutoModeState(autoState);
+
+            // Execute immediately (full autonomy)
+            await executeAutoModePlan(analysis, autoState.config);
+            ctx.ui.setStatus("harness", "harness: auto executing");
+            return;
+          } else {
+            // Scout finished but no valid analysis — notify user
+            pi.sendMessage(
+              {
+                customType: "harness-auto-scout-failed",
+                content: "Scout completed but produced no valid analysis. Run `/harness:auto cancel` and try again.",
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+          }
+        }
+      } catch {
+        // Scout goal file not found yet — still in progress
+      }
+
+      // During scouting, update status but skip manager checks (no manager yet)
+      const scoutSession = sessions.get("scout");
+      if (scoutSession?.tmuxSession) {
+        const alive = await tmuxHasSession(scoutSession.tmuxSession);
+        ctx.ui.setStatus(
+          "harness",
+          `harness: auto ${autoState.phase} (scout ${alive ? "running" : "dead"})`,
+        );
+        if (!alive) {
+          pi.sendMessage(
+            {
+              customType: "harness-auto-scout-dead",
+              content: "Scout worker died unexpectedly. Run `/harness:auto cancel` and try again.",
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+        }
+      }
+      return;
+    }
+
     // Primary manager liveness: is the tmux session alive?
     if (managerTmuxSession) {
       const alive = await tmuxHasSession(managerTmuxSession);
@@ -2509,6 +3011,70 @@ export default function (pi: ExtensionAPI) {
       status.status === "stopped" ||
       status.status === "stalled"
     ) {
+      // Auto mode re-scout on all_complete
+      if (status.status === "all_complete" && autoState?.enabled && autoState.phase === "executing") {
+        const canRescout = autoState.config.iteration < autoState.config.maxIterations - 1;
+        if (canRescout) {
+          await writeRunSummary("all_complete");
+
+          // Clean up current workers and manager
+          for (const [, session] of sessions) {
+            if (session.tmuxSession) {
+              await tmuxKillSession(session.tmuxSession);
+              session.tmuxSession = null;
+              session.spawned = false;
+            }
+          }
+          if (managerTmuxSession) {
+            await tmuxKillSession(managerTmuxSession);
+            managerTmuxSession = null;
+          }
+          // Clean up manager dir and status
+          try { await rm(managerDirPath(), { recursive: true, force: true }); } catch { /* best effort */ }
+          try { await rm(join(cwd, MANAGER_STATUS_FILE)); } catch { /* best effort */ }
+          try { await rm(join(cwd, STOP_SIGNAL_FILE)); } catch { /* best effort */ }
+
+          sessions.clear();
+          managerSpawned = false;
+          invalidateCache();
+
+          // Increment iteration and re-scout
+          autoState.iteration++;
+          autoState.config.iteration = autoState.iteration;
+          autoState.phase = "re-scouting";
+          autoState.scoutAnalysis = undefined;
+          autoState.planApproved = false;
+          await writeAutoModeState(autoState);
+
+          await spawnScout(autoState.config);
+          await persistState();
+
+          ctx.ui.setStatus("harness", `harness: auto re-scouting (iteration ${autoState.iteration + 1}/${autoState.config.maxIterations})`);
+          pi.sendMessage(
+            {
+              customType: "harness-auto-rescout",
+              content: `## Auto Mode: Re-Scouting (Iteration ${autoState.iteration + 1}/${autoState.config.maxIterations})\n\nAll goals complete. Scout re-evaluating the codebase for next round of work.`,
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+          return;
+        } else {
+          // Final iteration — deactivate auto mode
+          autoState.enabled = false;
+          autoState.phase = "idle";
+          await writeAutoModeState(autoState);
+          pi.sendMessage(
+            {
+              customType: "harness-auto-complete",
+              content: `## Auto Mode Complete\n\nCompleted ${autoState.config.maxIterations} iteration(s). All auto mode work finished.`,
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+        }
+      }
+
       const reason =
         status.status === "all_complete"
           ? "all_complete"
@@ -3477,6 +4043,12 @@ export default function (pi: ExtensionAPI) {
         // May not exist
       }
 
+      // Clean up auto mode files
+      for (const f of [AUTO_MODE_FILE, SCOUT_ANALYSIS_FILE, SCOUT_REPORT_FILE]) {
+        try { await rm(join(cwd, f)); } catch { /* may not exist */ }
+      }
+      try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+
       loopActive = false;
       invalidateCache();
       await persistState();
@@ -3870,6 +4442,12 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // May not exist
       }
+
+      // Remove auto mode files
+      for (const f of [AUTO_MODE_FILE, SCOUT_ANALYSIS_FILE, SCOUT_REPORT_FILE]) {
+        try { await rm(join(cwd, f)); } catch { /* may not exist */ }
+      }
+      try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
 
       // Kill entire tmux server
       await tmuxKillServer();
@@ -4543,6 +5121,211 @@ export default function (pi: ExtensionAPI) {
         {
           customType: "harness-bmad-started",
           content: reportLines.join("\n"),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    },
+  });
+
+  // --- /harness:auto ---
+
+  pi.registerCommand("harness:auto", {
+    description:
+      "Autonomous codebase evaluation and execution. " +
+      "Runs scout → plan → execute → re-scout loop. " +
+      "Supports: --yes, --max-workers N, --max-iterations N, --stagger N, --focus cat1,cat2. " +
+      "Sub-commands: approve, drop <name>, cancel.",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+
+      const remaining = (args ?? "").trim();
+
+      // --- Sub-commands ---
+
+      if (remaining === "cancel") {
+        const autoState = await readAutoModeState();
+        if (!autoState?.enabled) {
+          ctx.ui.notify("Auto mode is not active", "info");
+          return;
+        }
+        // Clean up scout worktree if present
+        const scoutSession = sessions.get("scout");
+        if (scoutSession) {
+          try {
+            await removeWorktree(scoutSession, true);
+          } catch { /* may not exist */ }
+          sessions.delete("scout");
+        }
+        // Clean up auto mode files
+        try { await rm(join(cwd, AUTO_MODE_FILE)); } catch { /* may not exist */ }
+        try { await rm(join(cwd, SCOUT_ANALYSIS_FILE)); } catch { /* may not exist */ }
+        try { await rm(join(cwd, SCOUT_REPORT_FILE)); } catch { /* may not exist */ }
+        try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+
+        // If in executing phase, also stop the harness
+        if (autoState.phase === "executing") {
+          // Write stop signal for manager
+          try {
+            await writeFile(join(cwd, STOP_SIGNAL_FILE), new Date().toISOString() + "\n", "utf-8");
+          } catch { /* best effort */ }
+          for (const [, session] of sessions) {
+            if (session.tmuxSession) {
+              await tmuxKillSession(session.tmuxSession);
+              session.tmuxSession = null;
+              session.spawned = false;
+            }
+          }
+          if (managerTmuxSession) {
+            await tmuxKillSession(managerTmuxSession);
+            managerTmuxSession = null;
+          }
+          loopActive = false;
+          invalidateCache();
+          await persistState();
+        }
+
+        ctx.ui.setStatus("harness", undefined);
+        pi.sendMessage(
+          {
+            customType: "harness-auto-cancelled",
+            content: "Auto mode cancelled. All scout/auto state cleaned up.",
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+        return;
+      }
+
+      if (remaining === "approve") {
+        const autoState = await readAutoModeState();
+        if (!autoState?.enabled || autoState.phase !== "check-in") {
+          ctx.ui.notify("No auto mode plan waiting for approval", "info");
+          return;
+        }
+        if (!autoState.scoutAnalysis) {
+          ctx.ui.notify("No scout analysis found", "warning");
+          return;
+        }
+        autoState.planApproved = true;
+        autoState.phase = "executing";
+        await writeAutoModeState(autoState);
+        await executeAutoModePlan(autoState.scoutAnalysis, autoState.config);
+        ctx.ui.setStatus("harness", "harness: auto executing");
+        return;
+      }
+
+      if (remaining.startsWith("drop ")) {
+        const findingId = remaining.slice(5).trim();
+        const autoState = await readAutoModeState();
+        if (!autoState?.enabled || !autoState.scoutAnalysis) {
+          ctx.ui.notify("No auto mode analysis to modify", "info");
+          return;
+        }
+        const idx = autoState.scoutAnalysis.findings.findIndex((f) => f.id === findingId);
+        if (idx === -1) {
+          ctx.ui.notify(
+            `Finding "${findingId}" not found. Available: ${autoState.scoutAnalysis.findings.map((f) => f.id).join(", ")}`,
+            "warning",
+          );
+          return;
+        }
+        autoState.scoutAnalysis.findings.splice(idx, 1);
+        await writeAutoModeState(autoState);
+        pi.sendMessage(
+          {
+            customType: "harness-auto-dropped",
+            content: `Dropped finding "${findingId}". ${autoState.scoutAnalysis.findings.length} findings remaining.`,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+        return;
+      }
+
+      // --- Main /harness:auto command ---
+
+      if (loopActive) {
+        ctx.ui.notify("Harness is already active. Stop it first with /harness:stop.", "warning");
+        return;
+      }
+
+      // Parse flags
+      let maxWorkers = 3;
+      let maxIterations = 3;
+      let staggerMs = 5000;
+      let autoApprove = true;
+      let focus: ScoutCategory[] | undefined;
+
+      const maxWorkersMatch = remaining.match(/--max-workers\s+(\d+)/);
+      if (maxWorkersMatch) maxWorkers = parseInt(maxWorkersMatch[1], 10);
+
+      const maxIterMatch = remaining.match(/--max-iterations\s+(\d+)/);
+      if (maxIterMatch) maxIterations = parseInt(maxIterMatch[1], 10);
+
+      const staggerMatch = remaining.match(/--stagger\s+(\d+)/);
+      if (staggerMatch) staggerMs = parseInt(staggerMatch[1], 10);
+
+      if (remaining.includes("--yes")) autoApprove = true;
+
+      const focusMatch = remaining.match(/--focus\s+([\w,]+)/);
+      if (focusMatch) {
+        focus = focusMatch[1].split(",").filter(Boolean) as ScoutCategory[];
+      }
+
+      // Extract objective: everything that's not a flag
+      const objective = remaining
+        .replace(/--max-workers\s+\d+/g, "")
+        .replace(/--max-iterations\s+\d+/g, "")
+        .replace(/--stagger\s+\d+/g, "")
+        .replace(/--yes/g, "")
+        .replace(/--focus\s+[\w,]+/g, "")
+        .trim() || undefined;
+
+      const autoConfig: AutoModeConfig = {
+        objective,
+        focus,
+        maxWorkers,
+        maxIterations,
+        autoApprove,
+        staggerMs,
+        iteration: 0,
+      };
+
+      const autoState: AutoModeState = {
+        enabled: true,
+        config: autoConfig,
+        phase: "scouting",
+        iteration: 0,
+        planApproved: false,
+      };
+
+      // Clean up leftover stop signal
+      try { await rm(join(cwd, STOP_SIGNAL_FILE)); } catch { /* no signal */ }
+
+      await mkdir(piAgentDir(), { recursive: true });
+      await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+      await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
+      await writeAutoModeState(autoState);
+
+      await spawnScout(autoConfig);
+      loopActive = true;
+      await persistState();
+
+      ctx.ui.setStatus("harness", "harness: auto scouting");
+      pi.sendMessage(
+        {
+          customType: "harness-auto-started",
+          content: [
+            "## Auto Mode: Scout Deployed",
+            "",
+            objective ? `**Objective:** ${objective}` : "**Objective:** General codebase evaluation",
+            focus ? `**Focus:** ${focus.join(", ")}` : "",
+            `**Max workers:** ${maxWorkers} | **Max iterations:** ${maxIterations}`,
+            "",
+            "Scout worker is evaluating the codebase. Workers will be launched automatically when scouting completes.",
+          ].filter(Boolean).join("\n"),
           display: true,
         },
         { triggerTurn: false },

@@ -50,8 +50,14 @@ import {
   type WorkQueue,
   type WorkerState,
   buildBmadWorkflowDag,
+  buildPlanFromAnalysis,
   BMAD_ROLE_MAP,
   BMAD_PREFIX,
+  AUTO_MODE_FILE,
+  SCOUT_ANALYSIS_FILE,
+  SCOUT_REPORT_FILE,
+  type ScoutAnalysis,
+  type AutoModeState,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -5500,5 +5506,253 @@ describe("BMAD harness: stress tests and edge cases", { timeout: 60000 }, () => 
     const finalGate = dagAfterPrd.find((s) => s.workflowName === "solutioning-gate-check");
     expect(finalGate).toBeDefined();
     expect(finalGate!.dependsOn).toEqual(["architecture"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:auto integration
+// ---------------------------------------------------------------------------
+
+describe("/harness:auto integration", () => {
+  let parentRepo: string;
+  let mockPi: ReturnType<typeof createMockExtensionAPI>;
+
+  beforeAll(async () => {
+    parentRepo = await mkdtemp(join(tmpdir(), "harness-auto-int-"));
+    git("init", parentRepo);
+    git('config user.email "test@test.com"', parentRepo);
+    git('config user.name "Test"', parentRepo);
+    await writeFile(join(parentRepo, "README.md"), "# Test\n");
+    git("add -A", parentRepo);
+    git('commit -m "init"', parentRepo);
+  });
+
+  afterAll(async () => {
+    // Kill any tmux sessions we may have started
+    try {
+      execSync("tmux -L pi-harness kill-server 2>/dev/null", { encoding: "utf-8" });
+    } catch { /* no sessions */ }
+    await rm(parentRepo, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    mockPi = createMockExtensionAPI();
+    // Clean up state from previous tests
+    try {
+      execSync("tmux -L pi-harness kill-server 2>/dev/null", { encoding: "utf-8" });
+    } catch { /* no sessions */ }
+    // Prune worktrees and remove leftover branches/state
+    try { git("worktree prune", parentRepo); } catch { /* ok */ }
+    try { await rm(join(parentRepo, PI_AGENT_DIR), { recursive: true, force: true }); } catch { /* ok */ }
+    try {
+      const branches = git("branch --list 'pi-agent/*'", parentRepo);
+      for (const b of branches.split("\n").map(s => s.trim()).filter(Boolean)) {
+        try { git(`branch -D ${b}`, parentRepo); } catch { /* ok */ }
+      }
+    } catch { /* no branches */ }
+  });
+
+  it("full auto lifecycle: spawn scout → simulate completion → verify goal files created", { timeout: 30_000 }, async () => {
+    initExtension(mockPi.api as any);
+    const ctx = createMockContext(parentRepo);
+
+    // Initialize session
+    await mockPi.emit("session_start", {}, ctx);
+
+    // Run /harness:auto with minimal stagger to speed up the test
+    const autoCmd = mockPi.getCommand("harness:auto");
+    expect(autoCmd).toBeDefined();
+    await autoCmd!.handler("--max-workers 2 --stagger 100 improve test coverage", ctx);
+
+    // Verify auto mode state was written
+    const stateContent = await readFile(join(parentRepo, AUTO_MODE_FILE), "utf-8");
+    const state = JSON.parse(stateContent) as AutoModeState;
+    expect(state.enabled).toBe(true);
+    expect(state.phase).toBe("scouting");
+    expect(state.config.objective).toBe("improve test coverage");
+    expect(state.config.maxWorkers).toBe(2);
+
+    // Verify scout goal file was created
+    const scoutGoal = await readFile(join(parentRepo, PI_AGENT_DIR, "scout.md"), "utf-8");
+    expect(scoutGoal).toContain("# scout");
+    expect(scoutGoal).toContain("Evaluate the codebase");
+
+    // Verify scout worktree was created
+    const worktreePath = join(parentRepo, WORKTREE_DIR, "scout");
+    const promptFile = await readFile(join(worktreePath, ".pi-agent-prompt.md"), "utf-8");
+    expect(promptFile).toContain("Investigation Checklist");
+    expect(promptFile).toContain("improve test coverage");
+
+    // Simulate scout completion: write analysis and mark goal done
+    const analysis: ScoutAnalysis = {
+      timestamp: new Date().toISOString(),
+      objective: "improve test coverage",
+      repoSummary: {
+        name: "test-repo",
+        languages: ["typescript"],
+        hasTests: true,
+        testFramework: "vitest",
+        hasCI: false,
+        recentCommits: 5,
+        openTodoCount: 3,
+      },
+      findings: [
+        {
+          id: "test-gap-auth",
+          category: "tests",
+          severity: "high",
+          title: "Missing auth tests",
+          description: "Auth module has no unit tests",
+          evidence: ["src/auth.ts"],
+          suggestedRole: "tester",
+          estimatedGoals: ["Write unit tests for auth module", "Add integration tests"],
+        },
+        {
+          id: "cleanup-todos",
+          category: "cleanup",
+          severity: "low",
+          title: "Remove TODOs",
+          description: "Several TODO comments in codebase",
+          evidence: ["src/index.ts", "src/utils.ts"],
+          suggestedRole: "developer",
+          estimatedGoals: ["Resolve TODO comments"],
+        },
+      ],
+    };
+
+    await writeFile(join(parentRepo, SCOUT_ANALYSIS_FILE), JSON.stringify(analysis, null, 2));
+
+    // Mark scout goal as complete
+    const completedGoal = "# scout\npath: .\nrole: researcher\n\n## Goals\n- [x] Evaluate the codebase and produce a scout analysis\n\n## Context\nimprove test coverage\n";
+    await writeFile(join(parentRepo, PI_AGENT_DIR, "scout.md"), completedGoal);
+
+    // Trigger turn_end to detect scout completion
+    await mockPi.emit("turn_end", {}, ctx);
+
+    // Verify auto state was updated to executing
+    const updatedState = JSON.parse(await readFile(join(parentRepo, AUTO_MODE_FILE), "utf-8")) as AutoModeState;
+    expect(updatedState.phase).toBe("executing");
+    expect(updatedState.planApproved).toBe(true);
+
+    // Verify goal files were created from analysis findings
+    const testGapGoal = await readFile(join(parentRepo, PI_AGENT_DIR, "test-gap-auth.md"), "utf-8");
+    expect(testGapGoal).toContain("test-gap-auth");
+    expect(testGapGoal).toContain("Write unit tests for auth module");
+
+    const cleanupGoal = await readFile(join(parentRepo, PI_AGENT_DIR, "cleanup-todos.md"), "utf-8");
+    expect(cleanupGoal).toContain("cleanup-todos");
+    expect(cleanupGoal).toContain("Resolve TODO comments");
+
+    // Clean up — cancel to stop everything
+    await autoCmd!.handler("cancel", ctx);
+  });
+
+  it("cancel sub-command cleans up scout and state files", async () => {
+    initExtension(mockPi.api as any);
+    const ctx = createMockContext(parentRepo);
+    await mockPi.emit("session_start", {}, ctx);
+
+    const autoCmd = mockPi.getCommand("harness:auto");
+    await autoCmd!.handler("evaluate codebase", ctx);
+
+    // Verify scout is running
+    let stateContent = await readFile(join(parentRepo, AUTO_MODE_FILE), "utf-8");
+    let state = JSON.parse(stateContent) as AutoModeState;
+    expect(state.enabled).toBe(true);
+
+    // Cancel
+    await autoCmd!.handler("cancel", ctx);
+
+    // Verify auto mode file is cleaned up
+    let autoFileExists = true;
+    try {
+      await readFile(join(parentRepo, AUTO_MODE_FILE));
+    } catch {
+      autoFileExists = false;
+    }
+    expect(autoFileExists).toBe(false);
+
+    // Verify scout goal file is cleaned up
+    let scoutGoalExists = true;
+    try {
+      await readFile(join(parentRepo, PI_AGENT_DIR, "scout.md"));
+    } catch {
+      scoutGoalExists = false;
+    }
+    expect(scoutGoalExists).toBe(false);
+  });
+
+  it("re-scout iteration increments counter and respawns scout", async () => {
+    initExtension(mockPi.api as any);
+    const ctx = createMockContext(parentRepo);
+    await mockPi.emit("session_start", {}, ctx);
+
+    const autoCmd = mockPi.getCommand("harness:auto");
+    await autoCmd!.handler("--max-iterations 2 evaluate", ctx);
+
+    // Simulate scout completing with a single finding
+    const analysis: ScoutAnalysis = {
+      timestamp: new Date().toISOString(),
+      repoSummary: {
+        name: "test-repo",
+        languages: ["typescript"],
+        hasTests: true,
+        hasCI: false,
+        recentCommits: 5,
+        openTodoCount: 0,
+      },
+      findings: [
+        {
+          id: "quick-fix",
+          category: "bugs",
+          severity: "high",
+          title: "Quick fix",
+          description: "Simple bug fix",
+          evidence: ["src/bug.ts"],
+          suggestedRole: "developer",
+          estimatedGoals: ["Fix the bug"],
+        },
+      ],
+    };
+
+    await writeFile(join(parentRepo, SCOUT_ANALYSIS_FILE), JSON.stringify(analysis, null, 2));
+    await writeFile(
+      join(parentRepo, PI_AGENT_DIR, "scout.md"),
+      "# scout\npath: .\nrole: researcher\n\n## Goals\n- [x] Evaluate the codebase and produce a scout analysis\n",
+    );
+
+    // turn_end detects scout completion → executes plan
+    await mockPi.emit("turn_end", {}, ctx);
+
+    let state = JSON.parse(await readFile(join(parentRepo, AUTO_MODE_FILE), "utf-8")) as AutoModeState;
+    expect(state.phase).toBe("executing");
+    expect(state.iteration).toBe(0);
+
+    // Simulate all_complete by writing manager status
+    const managerStatus: ManagerStatusFile = {
+      status: "all_complete",
+      updatedAt: new Date().toISOString(),
+      submodules: {
+        "quick-fix": { completed: 1, total: 1, allDone: true },
+      },
+      stallCount: 0,
+    };
+    await mkdir(join(parentRepo, PI_AGENT_DIR), { recursive: true });
+    await writeFile(join(parentRepo, MANAGER_STATUS_FILE), JSON.stringify(managerStatus));
+
+    // turn_end detects all_complete → triggers re-scout
+    await mockPi.emit("turn_end", {}, ctx);
+
+    state = JSON.parse(await readFile(join(parentRepo, AUTO_MODE_FILE), "utf-8")) as AutoModeState;
+    expect(state.phase).toBe("re-scouting");
+    expect(state.iteration).toBe(1);
+    expect(state.config.iteration).toBe(1);
+
+    // Scout goal file should exist again for re-scout
+    const scoutGoal = await readFile(join(parentRepo, PI_AGENT_DIR, "scout.md"), "utf-8");
+    expect(scoutGoal).toContain("scout");
+
+    // Clean up
+    await autoCmd!.handler("cancel", ctx);
   });
 });

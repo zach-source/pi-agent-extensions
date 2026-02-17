@@ -57,8 +57,18 @@ import {
   BMAD_ROLE_MAP,
   BMAD_DEPENDENCY_MAP,
   buildBmadWorkflowDag,
+  buildScoutPrompt,
+  buildPlanFromAnalysis,
+  AUTO_MODE_FILE,
+  SCOUT_ANALYSIS_FILE,
+  SCOUT_REPORT_FILE,
   type BmadGoalSpec,
   type BmadModeConfig,
+  type ScoutAnalysis,
+  type ScoutFinding,
+  type ScoutCategory,
+  type AutoModeConfig,
+  type AutoModeState,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 import { WORKFLOW_DEFS } from "./bmad.js";
@@ -6861,5 +6871,319 @@ describe("buildManagerInstructions with bmadMode", () => {
     ];
     const result = buildManagerInstructions(configs, "/tmp/test");
     expect(result).not.toContain("BMAD Phase Management");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildScoutPrompt
+// ---------------------------------------------------------------------------
+
+describe("buildScoutPrompt", () => {
+  it("contains investigation checklist areas", () => {
+    const prompt = buildScoutPrompt("/tmp/test");
+    expect(prompt).toContain("Investigation Checklist");
+    expect(prompt).toContain("Project Structure");
+    expect(prompt).toContain("Test Health");
+    expect(prompt).toContain("Code Quality");
+    expect(prompt).toContain("Git History");
+    expect(prompt).toContain("Dependencies & Security");
+    expect(prompt).toContain("Documentation");
+    expect(prompt).toContain("CI/CD & Infrastructure");
+  });
+
+  it("includes objective when provided", () => {
+    const prompt = buildScoutPrompt("/tmp/test", "improve test coverage");
+    expect(prompt).toContain("## Objective");
+    expect(prompt).toContain("improve test coverage");
+  });
+
+  it("includes focus filter when provided", () => {
+    const prompt = buildScoutPrompt("/tmp/test", undefined, ["tests", "security"]);
+    expect(prompt).toContain("## Focus Areas");
+    expect(prompt).toContain("tests, security");
+  });
+
+  it("contains JSON output schema with ScoutAnalysis fields", () => {
+    const prompt = buildScoutPrompt("/tmp/test");
+    expect(prompt).toContain('"findings"');
+    expect(prompt).toContain('"repoSummary"');
+    expect(prompt).toContain('"severity"');
+    expect(prompt).toContain('"suggestedRole"');
+    expect(prompt).toContain('"estimatedGoals"');
+    expect(prompt).toContain(SCOUT_ANALYSIS_FILE);
+    expect(prompt).toContain(SCOUT_REPORT_FILE);
+  });
+
+  it("includes read-only constraint", () => {
+    const prompt = buildScoutPrompt("/tmp/test");
+    expect(prompt).toContain("Read-only");
+    expect(prompt).toContain("Do NOT modify");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPlanFromAnalysis
+// ---------------------------------------------------------------------------
+
+describe("buildPlanFromAnalysis", () => {
+  function makeFinding(overrides: Partial<ScoutFinding> = {}): ScoutFinding {
+    return {
+      id: "test-finding",
+      category: "tests",
+      severity: "medium",
+      title: "Test Finding",
+      description: "A test finding",
+      evidence: ["src/test.ts"],
+      suggestedRole: "tester",
+      estimatedGoals: ["Write missing unit tests"],
+      ...overrides,
+    };
+  }
+
+  function makeAnalysis(findings: ScoutFinding[]): ScoutAnalysis {
+    return {
+      timestamp: new Date().toISOString(),
+      repoSummary: {
+        name: "test-repo",
+        languages: ["typescript"],
+        hasTests: true,
+        testFramework: "vitest",
+        hasCI: true,
+        recentCommits: 10,
+        openTodoCount: 5,
+      },
+      findings,
+    };
+  }
+
+  it("returns empty configs for empty findings", () => {
+    const analysis = makeAnalysis([]);
+    const result = buildPlanFromAnalysis(analysis, 3);
+    expect(result.configs).toHaveLength(0);
+    expect(result.ready).toHaveLength(0);
+    expect(result.queued).toHaveLength(0);
+  });
+
+  it("maps single finding to single config with correct role and goals", () => {
+    const finding = makeFinding({
+      id: "test-gap",
+      suggestedRole: "tester",
+      estimatedGoals: ["Write unit tests for auth", "Write integration tests"],
+    });
+    const analysis = makeAnalysis([finding]);
+    const result = buildPlanFromAnalysis(analysis, 3);
+
+    expect(result.configs).toHaveLength(1);
+    expect(result.configs[0].name).toBe("test-gap");
+    expect(result.configs[0].role).toBe("tester");
+    expect(result.configs[0].goals).toHaveLength(2);
+    expect(result.configs[0].goals[0].text).toBe("Write unit tests for auth");
+    expect(result.configs[0].goals[1].completed).toBe(false);
+    expect(result.ready).toHaveLength(1);
+  });
+
+  it("sorts findings by severity: high → medium → low", () => {
+    const findings = [
+      makeFinding({ id: "low-item", severity: "low" }),
+      makeFinding({ id: "high-item", severity: "high" }),
+      makeFinding({ id: "med-item", severity: "medium" }),
+    ];
+    const analysis = makeAnalysis(findings);
+    const result = buildPlanFromAnalysis(analysis, 10);
+
+    expect(result.configs[0].name).toBe("high-item");
+    expect(result.configs[1].name).toBe("med-item");
+    expect(result.configs[2].name).toBe("low-item");
+  });
+
+  it("splits findings with dependsOn into queued", () => {
+    const findings = [
+      makeFinding({ id: "base-work", severity: "high" }),
+      makeFinding({ id: "dependent-work", severity: "high", dependsOn: ["base-work"] }),
+    ];
+    const analysis = makeAnalysis(findings);
+    const result = buildPlanFromAnalysis(analysis, 10);
+
+    expect(result.ready).toHaveLength(1);
+    expect(result.ready[0].name).toBe("base-work");
+    expect(result.queued).toHaveLength(1);
+    expect(result.queued[0].name).toBe("dependent-work");
+  });
+
+  it("respects maxWorkers — overflow goes to queued", () => {
+    const findings = [
+      makeFinding({ id: "item-1", severity: "high" }),
+      makeFinding({ id: "item-2", severity: "high" }),
+      makeFinding({ id: "item-3", severity: "high" }),
+    ];
+    const analysis = makeAnalysis(findings);
+    const result = buildPlanFromAnalysis(analysis, 2);
+
+    expect(result.ready).toHaveLength(2);
+    expect(result.queued).toHaveLength(1);
+  });
+
+  it("treats dependsOn referencing unknown findings as no-dep", () => {
+    const findings = [
+      makeFinding({ id: "item-1", dependsOn: ["nonexistent-thing"] }),
+    ];
+    const analysis = makeAnalysis(findings);
+    const result = buildPlanFromAnalysis(analysis, 3);
+
+    // "nonexistent-thing" is not in allIds, so it's treated as satisfied
+    expect(result.ready).toHaveLength(1);
+    expect(result.queued).toHaveLength(0);
+  });
+
+  it("falls back to developer role for invalid suggestedRole", () => {
+    const findings = [
+      makeFinding({ id: "item-1", suggestedRole: "nonexistent-role" }),
+    ];
+    const analysis = makeAnalysis(findings);
+    const result = buildPlanFromAnalysis(analysis, 3);
+
+    expect(result.configs[0].role).toBe("developer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:auto flag parsing (pure logic)
+// ---------------------------------------------------------------------------
+
+describe("/harness:auto flag parsing (pure logic)", () => {
+  // Tests the flag parsing logic extracted from the command handler.
+  // The actual command also spawns git worktrees, so end-to-end
+  // flag verification is covered in the integration tests.
+
+  function parseAutoFlags(input: string) {
+    let maxWorkers = 3;
+    let maxIterations = 3;
+    let staggerMs = 5000;
+    let autoApprove = true;
+    let focus: ScoutCategory[] | undefined;
+
+    const maxWorkersMatch = input.match(/--max-workers\s+(\d+)/);
+    if (maxWorkersMatch) maxWorkers = parseInt(maxWorkersMatch[1], 10);
+
+    const maxIterMatch = input.match(/--max-iterations\s+(\d+)/);
+    if (maxIterMatch) maxIterations = parseInt(maxIterMatch[1], 10);
+
+    const staggerMatch = input.match(/--stagger\s+(\d+)/);
+    if (staggerMatch) staggerMs = parseInt(staggerMatch[1], 10);
+
+    if (input.includes("--yes")) autoApprove = true;
+
+    const focusMatch = input.match(/--focus\s+([\w,]+)/);
+    if (focusMatch) {
+      focus = focusMatch[1].split(",").filter(Boolean) as ScoutCategory[];
+    }
+
+    const objective = input
+      .replace(/--max-workers\s+\d+/g, "")
+      .replace(/--max-iterations\s+\d+/g, "")
+      .replace(/--stagger\s+\d+/g, "")
+      .replace(/--yes/g, "")
+      .replace(/--focus\s+[\w,]+/g, "")
+      .trim() || undefined;
+
+    return { maxWorkers, maxIterations, staggerMs, autoApprove, focus, objective };
+  }
+
+  it("parses all flags correctly", () => {
+    const result = parseAutoFlags(
+      "--max-workers 5 --max-iterations 10 --stagger 3000 --focus tests,security --yes improve test coverage",
+    );
+
+    expect(result.maxWorkers).toBe(5);
+    expect(result.maxIterations).toBe(10);
+    expect(result.staggerMs).toBe(3000);
+    expect(result.autoApprove).toBe(true);
+    expect(result.focus).toEqual(["tests", "security"]);
+    expect(result.objective).toBe("improve test coverage");
+  });
+
+  it("applies defaults when no flags provided", () => {
+    const result = parseAutoFlags("");
+
+    expect(result.maxWorkers).toBe(3);
+    expect(result.maxIterations).toBe(3);
+    expect(result.staggerMs).toBe(5000);
+    expect(result.objective).toBeUndefined();
+    expect(result.focus).toBeUndefined();
+  });
+
+  it("extracts objective from remaining text after flags", () => {
+    const result = parseAutoFlags("--max-workers 2 fix all the bugs");
+
+    expect(result.objective).toBe("fix all the bugs");
+    expect(result.maxWorkers).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:auto cancel sub-command
+// ---------------------------------------------------------------------------
+
+describe("/harness:auto cancel", () => {
+  let tempDir: string;
+  let mockPi: ReturnType<typeof createMockExtensionAPI>;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "harness-auto-cancel-"));
+    mockPi = createMockExtensionAPI();
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("cleans up auto mode state files", async () => {
+    initExtension(mockPi.api as any);
+    const cmd = mockPi.getCommand("harness:auto");
+
+    // Write auto mode state
+    const piDir = join(tempDir, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    const state: AutoModeState = {
+      enabled: true,
+      config: {
+        maxWorkers: 3,
+        maxIterations: 3,
+        autoApprove: true,
+        staggerMs: 5000,
+        iteration: 0,
+      },
+      phase: "scouting",
+      iteration: 0,
+      planApproved: false,
+    };
+    await writeFile(join(tempDir, AUTO_MODE_FILE), JSON.stringify(state));
+    await writeFile(join(tempDir, SCOUT_ANALYSIS_FILE), "{}");
+    await writeFile(join(tempDir, SCOUT_REPORT_FILE), "# Report");
+    await writeFile(join(piDir, "scout.md"), "# scout\n## Goals\n- [ ] Scout");
+
+    const ctx = createMockContext({ cwd: tempDir });
+
+    // Emit session_start to set cwd
+    await mockPi.emit("session_start", {}, ctx);
+
+    await cmd!.handler("cancel", ctx);
+
+    // Verify files are cleaned up
+    let autoExists = true;
+    try {
+      await readFile(join(tempDir, AUTO_MODE_FILE));
+    } catch {
+      autoExists = false;
+    }
+    expect(autoExists).toBe(false);
+
+    let scoutGoalExists = true;
+    try {
+      await readFile(join(piDir, "scout.md"));
+    } catch {
+      scoutGoalExists = false;
+    }
+    expect(scoutGoalExists).toBe(false);
   });
 });

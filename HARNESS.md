@@ -57,6 +57,7 @@ Your Pi session (parent)
 |---------|-------------|
 | `/harness:init` | Scaffold `.pi-agent/` directory with mailbox structure |
 | `/harness:launch` | Create worktrees, spawn workers + manager |
+| `/harness:auto [objective]` | Autonomous: scout → plan → execute → re-scout loop |
 | `/harness:stop` | Gracefully stop all workers and the manager |
 | `/harness:cleanup` | Remove all worktrees, branches, and state files |
 
@@ -302,6 +303,91 @@ If the manager dies or stalls:
 ```
 
 The manager can recover up to 5 consecutive failures before requiring `--force`.
+
+## Autonomous Mode
+
+The harness can run fully autonomously: evaluate your codebase, derive high-impact work, execute it in parallel, and re-scout when done — with no user intervention.
+
+### Quick Start
+
+```
+# Evaluate codebase and execute highest-impact work
+/harness:auto
+
+# With an objective
+/harness:auto improve test coverage and fix security issues
+
+# With constraints
+/harness:auto --max-workers 4 --max-iterations 5 --focus tests,security
+```
+
+### How It Works
+
+```
+/harness:auto
+  │
+  ├── 1. Scout Phase
+  │   └── Researcher worker evaluates the codebase
+  │       ├── Project structure, test health, code quality
+  │       ├── Git history, dependencies, documentation
+  │       └── Produces .scout-analysis.json + .scout-report.md
+  │
+  ├── 2. Execute Phase
+  │   └── Workers spawned from scout findings
+  │       ├── Each finding → a worker with goals
+  │       ├── Sorted by severity (high → medium → low)
+  │       └── Manager monitors progress and auto-merges
+  │
+  └── 3. Re-Scout Phase (repeat until maxIterations)
+      └── After all goals complete, scout re-evaluates
+          └── Finds new work based on updated codebase
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-workers N` | 3 | Maximum concurrent workers |
+| `--max-iterations N` | 3 | Scout → execute cycles before stopping |
+| `--stagger N` | 5000 | Milliseconds between worker spawns |
+| `--focus cat1,cat2` | all | Limit scout to specific categories |
+| `--yes` | true | Auto-approve scout findings (default) |
+
+**Focus categories:** `tests`, `quality`, `features`, `docs`, `security`, `performance`, `cleanup`, `bugs`
+
+### Sub-Commands
+
+| Command | Description |
+|---------|-------------|
+| `/harness:auto approve` | Approve a pending plan (when check-in is enabled) |
+| `/harness:auto drop <id>` | Remove a finding from the scout analysis |
+| `/harness:auto cancel` | Stop auto mode and clean up all state |
+
+### Examples
+
+```
+# General codebase improvement (3 iterations)
+/harness:auto
+
+# Targeted: fix tests with 2 workers, 1 pass
+/harness:auto --focus tests --max-workers 2 --max-iterations 1 fix failing tests
+
+# Full sweep: 5 workers, 5 iterations
+/harness:auto --max-workers 5 --max-iterations 5
+
+# Cancel mid-run
+/harness:auto cancel
+```
+
+### State Files
+
+| File | Purpose |
+|------|---------|
+| `.pi-agent/.auto-mode.json` | Auto mode configuration and phase tracking |
+| `.pi-agent/.scout-analysis.json` | Structured scout findings (JSON) |
+| `.pi-agent/.scout-report.md` | Human-readable scout summary |
+
+These files are automatically cleaned up by `/harness:auto cancel`, `/harness:stop`, and `/harness:cleanup`.
 
 ## Tips
 
