@@ -451,7 +451,7 @@ export async function loadStatus(
 // Recommendation Logic
 // ═══════════════════════════════════════════════════════════════════════════
 
-function isCompleted(status: string): boolean {
+export function isCompleted(status: string): boolean {
   return (
     status !== "required" &&
     status !== "optional" &&
@@ -1255,7 +1255,7 @@ export function getTemplate(
 // Workflow Prompt Builders
 // ═══════════════════════════════════════════════════════════════════════════
 
-function buildContextBlock(
+export function buildContextBlock(
   config: BmadConfig,
   status: WorkflowEntry[],
 ): string {
@@ -1274,7 +1274,7 @@ function buildContextBlock(
   ].join("\n");
 }
 
-function buildToolsBlock(): string {
+export function buildToolsBlock(): string {
   return [
     "### Available BMAD Tools",
     "- `bmad_get_template` - Load a pre-populated document template",
@@ -1284,7 +1284,7 @@ function buildToolsBlock(): string {
   ].join("\n");
 }
 
-function buildCompletionBlock(workflow: string): string {
+export function buildCompletionBlock(workflow: string): string {
   return [
     "### When Complete",
     `1. Save the document using \`bmad_save_document\` with workflow \`${workflow}\``,
@@ -1323,7 +1323,7 @@ function buildInitPrompt(cwd: string, existing: boolean): string {
   ].join("\n");
 }
 
-const WORKFLOW_PROMPTS: Record<
+export const WORKFLOW_PROMPTS: Record<
   string,
   (config: BmadConfig, status: WorkflowEntry[]) => string
 > = {

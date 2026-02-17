@@ -41,12 +41,16 @@ import {
   MAILBOX_DIR,
   QUEUE_FILE,
   REGISTRY_FILE,
+  SUMMARY_FILE,
   type SubmoduleConfig,
   type SubmoduleQuestion,
   type LaunchState,
   type ManagerStatusFile,
   type MailboxMessage,
   type WorkQueue,
+  type WorkerState,
+  buildBmadWorkflowDag,
+  BMAD_ROLE_MAP,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -88,7 +92,8 @@ function createMockExtensionAPI() {
       .mockImplementation(async (cmd: string, args: string[], opts?: any) => {
         const cwd = opts?.cwd || ".";
         try {
-          const stdout = execSync(`${cmd} ${args.join(" ")}`, {
+          const quotedArgs = args.map((a: string) => `'${a.replace(/'/g, "'\\''")}'`);
+          const stdout = execSync(`${cmd} ${quotedArgs.join(" ")}`, {
             cwd,
             encoding: "utf-8",
             timeout: 10_000,
@@ -373,7 +378,7 @@ describe("submodule-launcher integration", () => {
     expect(parsed.context).toBe(config.context);
   });
 
-  it("standalone worktree: add task, launch, verify worktree created", async () => {
+  it("standalone worktree: add task, launch, verify worktree created", { timeout: 15000 }, async () => {
     // Create a plain repo WITHOUT submodules
     const standaloneRepo = join(baseDir, "standalone");
     git(`init ${standaloneRepo}`, baseDir);
@@ -418,7 +423,7 @@ describe("submodule-launcher integration", () => {
 
     // Launch the harness
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Verify worktree was created
     const wtPath = join(standaloneRepo, WORKTREE_DIR, "refactor-auth");
@@ -580,12 +585,12 @@ describe("standalone harness (no submodules)", () => {
     return { mock, ctx };
   }
 
-  /** Intercept pi spawns so we don't actually launch agent sessions */
+  /** Intercept pi and tmux spawns so we don't actually launch agent sessions */
   function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
     const originalExec = mock.api.exec.getMockImplementation();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -664,7 +669,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const cmd = mock.getCommand("harness:launch")!;
-    await cmd.handler("", ctx);
+    await cmd.handler("--stagger 0", ctx);
 
     // Verify worktree was created on the correct branch
     const wtPath = join(repo, WORKTREE_DIR, "launch-test");
@@ -712,7 +717,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const cmd = mock.getCommand("harness:launch")!;
-    await cmd.handler("", ctx);
+    await cmd.handler("--stagger 0", ctx);
 
     // Verify both worktrees exist
     const alphaPath = join(repo, WORKTREE_DIR, "task-alpha");
@@ -737,9 +742,11 @@ describe("standalone harness (no submodules)", () => {
       { triggerTurn: false },
     );
 
-    // Verify pi was called 3 times: 2 workers + 1 manager
-    const piCalls = mock.api.exec.mock.calls.filter((c: any) => c[0] === "pi");
-    expect(piCalls).toHaveLength(3);
+    // Verify tmux new-session was called 3 times: 2 workers + 1 manager
+    const tmuxNewCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "tmux" && c[1]?.includes("new-session"),
+    );
+    expect(tmuxNewCalls).toHaveLength(3);
 
     // Clean up
     git(`worktree remove ${alphaPath} --force`, repo);
@@ -865,7 +872,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Simulate work in the worktree: add a file and commit
     const wtPath = join(repo, WORKTREE_DIR, "merge-test");
@@ -916,7 +923,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Verify harness is active
     const stateBefore: LaunchState = JSON.parse(
@@ -938,9 +945,12 @@ describe("standalone harness (no submodules)", () => {
     );
     expect(stateAfter.active).toBe(false);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("stop signal"),
-      "info",
+    // writeRunSummary sends a summary message
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-summary",
+      }),
+      expect.anything(),
     );
 
     // Clean up worktree
@@ -969,7 +979,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Clear exec calls to count only the recover spawn
     mock.api.exec.mockClear();
@@ -979,17 +989,27 @@ describe("standalone harness (no submodules)", () => {
     const recoverCmd = mock.getCommand("harness:recover")!;
     await recoverCmd.handler("", ctx);
 
-    // Verify a new manager pi session was spawned
-    const piCalls = mock.api.exec.mock.calls.filter((c: any) => c[0] === "pi");
-    expect(piCalls).toHaveLength(1);
-    expect(piCalls[0][2].cwd).toContain(".manager");
+    // Verify a new manager tmux session was spawned
+    const tmuxCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "tmux" && c[1]?.includes("new-session"),
+    );
+    expect(tmuxCalls).toHaveLength(1);
+    expect(tmuxCalls[0][1]).toContain("harness-manager");
 
-    // Verify manager heartbeat.md was recreated
-    const heartbeat = await readFile(
-      join(repo, MANAGER_DIR, "heartbeat.md"),
+    // Verify manager prompt file was created
+    const promptFile = await readFile(
+      join(repo, MANAGER_DIR, ".pi-agent-prompt.md"),
       "utf-8",
     );
-    expect(heartbeat).toContain("Launch Manager");
+    expect(promptFile).toContain(".manager-instructions.md");
+    expect(promptFile).toContain("Current Submodules");
+
+    // Verify static instructions file was created
+    const instructionsFile = await readFile(
+      join(repo, PI_AGENT_DIR, ".manager-instructions.md"),
+      "utf-8",
+    );
+    expect(instructionsFile).toContain("Launch Manager");
 
     expect(ctx.ui.notify).toHaveBeenCalledWith("Manager respawned", "info");
 
@@ -1026,13 +1046,11 @@ describe("standalone harness (no submodules)", () => {
     const parsed = parseGoalFile(goalContent, "role-test.md");
     expect(parsed.role).toBe("architect");
 
-    // Override pi.exec to capture the prompt but not actually spawn
-    const piPrompts: string[] = [];
+    // Override exec to intercept tmux/pi spawns
     const originalExec = mock.api.exec.getMockImplementation();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
-          piPrompts.push(args[1]); // -p <prompt>
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -1041,12 +1059,11 @@ describe("standalone harness (no submodules)", () => {
 
     // Launch
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
-    // Find the worker prompt (not the manager prompt)
-    const workerPrompt = piPrompts.find(
-      (p) => p.includes("role-test") && !p.includes("Launch Manager"),
-    );
+    // Read the worker prompt from the .pi-agent-prompt.md file
+    const wtPath2 = join(repo, WORKTREE_DIR, "role-test");
+    const workerPrompt = await readFile(join(wtPath2, ".pi-agent-prompt.md"), "utf-8");
     expect(workerPrompt).toBeDefined();
     expect(workerPrompt).toContain("a software architect focused on structure");
     expect(workerPrompt).toContain('working on "role-test"');
@@ -1154,7 +1171,7 @@ describe("standalone harness (no submodules)", () => {
     // 2. Launch
     interceptPiSpawns(mock);
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     const wtPath = join(repo, WORKTREE_DIR, "lifecycle-test");
 
@@ -1250,7 +1267,7 @@ describe("standalone harness (no submodules)", () => {
 
     interceptPiSpawns(mock);
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Simulate shutdown
     await mock.emit("session_shutdown", {}, ctx);
@@ -1312,7 +1329,7 @@ describe("standalone harness (no submodules)", () => {
 
     interceptPiSpawns(mock);
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Should notify that all goals are already complete
     expect(ctx.ui.notify).toHaveBeenCalledWith(
@@ -1323,7 +1340,7 @@ describe("standalone harness (no submodules)", () => {
 
   // --- Question flow with real git operations ---
 
-  it("full question lifecycle: launch worker, worker writes questions to goal file, user answers, worker sees answers", async () => {
+  it("full question lifecycle: launch worker, worker writes questions to goal file, user answers, worker sees answers", { timeout: 30000 }, async () => {
     const { mock, ctx } = freshHarness();
     await mock.emit("session_start", {}, ctx);
 
@@ -1343,13 +1360,11 @@ describe("standalone harness (no submodules)", () => {
     expect(goalContent).toContain("SSO for enterprise");
     expect(goalContent).not.toContain("## Questions");
 
-    // 2. Launch the harness (creates real worktree, intercepts pi spawn)
-    const piPrompts: string[] = [];
+    // 2. Launch the harness (creates real worktree, intercepts tmux/pi spawn)
     const originalExec = mock.api.exec.getMockImplementation();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
-          piPrompts.push(args[1]);
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -1357,7 +1372,7 @@ describe("standalone harness (no submodules)", () => {
     );
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Verify real worktree was created on disk
     const wtPath = join(repo, WORKTREE_DIR, "auth-spike");
@@ -1365,9 +1380,7 @@ describe("standalone harness (no submodules)", () => {
     expect(workerBranch).toBe("pi-agent/auth-spike");
 
     // Verify worker prompt includes question instructions
-    const workerPrompt = piPrompts.find(
-      (p) => p.includes("auth-spike") && !p.includes("Launch Manager"),
-    );
+    const workerPrompt = await readFile(join(wtPath, ".pi-agent-prompt.md"), "utf-8");
     expect(workerPrompt).toBeDefined();
     expect(workerPrompt).toContain("## Asking Questions");
     expect(workerPrompt).toContain("- ? Your question here");
@@ -1410,12 +1423,10 @@ describe("standalone harness (no submodules)", () => {
 
     // 6. Verify manager prompt includes questions and stall-exemption
     //    (simulate recover to capture the new manager prompt)
-    piPrompts.length = 0;
     mock.api.exec.mockClear();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
-          piPrompts.push(args[1]);
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -1425,11 +1436,15 @@ describe("standalone harness (no submodules)", () => {
     const recoverCmd = mock.getCommand("harness:recover")!;
     await recoverCmd.handler("", ctx);
 
-    const managerPrompt = piPrompts.find((p) => p.includes("Launch Manager"));
+    const managerPrompt = await readFile(join(repo, MANAGER_DIR, ".pi-agent-prompt.md"), "utf-8");
     expect(managerPrompt).toBeDefined();
     expect(managerPrompt).toContain("Unanswered questions (2)");
     expect(managerPrompt).toContain("SAML or just OIDC");
-    expect(managerPrompt).toContain("NOT stalled");
+
+    // "NOT stalled" instruction is now in the static instructions file
+    const instructionsPath = join(repo, PI_AGENT_DIR, ".manager-instructions.md");
+    const instructions = await readFile(instructionsPath, "utf-8");
+    expect(instructions).toContain("NOT stalled");
 
     // 7. User answers first question via harness_answer
     const answerTool = mock.getTool("harness_answer")!;
@@ -1597,7 +1612,7 @@ describe("standalone harness (no submodules)", () => {
     interceptPiSpawns(mock);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Read the heartbeat.md written to the worktree
     const wtPath = join(repo, WORKTREE_DIR, "worker-task");
@@ -1747,13 +1762,11 @@ describe("standalone harness (no submodules)", () => {
     let goalContent = await readFile(goalPath, "utf-8");
     expect(goalContent).toContain("role: researcher");
 
-    // Launch harness — capture worker prompt
-    const piPrompts: string[] = [];
+    // Launch harness — intercept tmux/pi spawns
     const originalExec = mock.api.exec.getMockImplementation();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
-          piPrompts.push(args[1]);
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -1761,7 +1774,7 @@ describe("standalone harness (no submodules)", () => {
     );
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     const wtPath = join(repo, WORKTREE_DIR, "security-audit");
     expect(git("branch --show-current", wtPath)).toBe(
@@ -1769,9 +1782,7 @@ describe("standalone harness (no submodules)", () => {
     );
 
     // Worker prompt includes question instructions
-    const workerPrompt = piPrompts.find(
-      (p) => p.includes("security-audit") && !p.includes("Launch Manager"),
-    );
+    const workerPrompt = await readFile(join(wtPath, ".pi-agent-prompt.md"), "utf-8");
     expect(workerPrompt).toContain("## Asking Questions");
 
     // Worker discovers more work → adds 3 goals via harness_update_goal
@@ -1856,12 +1867,10 @@ describe("standalone harness (no submodules)", () => {
     expect(worktreeLog).toContain("review input validation");
 
     // KEY ASSERTION: Manager prompt says "Unanswered questions" and "NOT stalled"
-    piPrompts.length = 0;
     mock.api.exec.mockClear();
     mock.api.exec.mockImplementation(
       async (cmd: string, args: string[], opts?: any) => {
-        if (cmd === "pi") {
-          piPrompts.push(args[1]);
+        if (cmd === "pi" || cmd === "tmux") {
           return { stdout: "", stderr: "", exitCode: 0 };
         }
         return originalExec!(cmd, args, opts);
@@ -1871,11 +1880,15 @@ describe("standalone harness (no submodules)", () => {
     const recoverCmd = mock.getCommand("harness:recover")!;
     await recoverCmd.handler("", ctx);
 
-    const managerPrompt = piPrompts.find((p) => p.includes("Launch Manager"));
+    const managerPrompt = await readFile(join(repo, MANAGER_DIR, ".pi-agent-prompt.md"), "utf-8");
     expect(managerPrompt).toBeDefined();
     expect(managerPrompt).toContain("Unanswered questions (2)");
     expect(managerPrompt).toContain("OAuth token lifecycle");
-    expect(managerPrompt).toContain("NOT stalled");
+
+    // "NOT stalled" instruction is now in the static instructions file
+    const instructionsPath2 = join(repo, PI_AGENT_DIR, ".manager-instructions.md");
+    const instructions2 = await readFile(instructionsPath2, "utf-8");
+    expect(instructions2).toContain("NOT stalled");
 
     // KEY ASSERTION: turn_end status bar shows question count suffix
     // Pre-seed manager status for turn_end
@@ -1898,7 +1911,7 @@ describe("standalone harness (no submodules)", () => {
 
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "harness",
-      "harness: 2/4 goals, running, 2?",
+      "harness: 2/4 goals, running, 1a/0s/0d, 2?",
     );
 
     // ---------------------------------------------------------------
@@ -2012,7 +2025,7 @@ describe("standalone harness (no submodules)", () => {
 // Mailbox + Queue + Registry integration tests
 // ---------------------------------------------------------------------------
 
-describe("mailbox system integration", () => {
+describe("mailbox system integration", { timeout: 15000 }, () => {
   let baseDir: string;
   let repo: string;
 
@@ -2068,7 +2081,7 @@ describe("mailbox system integration", () => {
     await rm(baseDir, { recursive: true, force: true });
   });
 
-  it("mailbox flow: launch → worker sends question → parent reads inbox", async () => {
+  it("mailbox flow: launch → worker sends question → parent reads inbox", { timeout: 30000 }, async () => {
     const mock = createMockExtensionAPI();
     initExtension(mock.api as any);
 
@@ -2094,7 +2107,7 @@ describe("mailbox system integration", () => {
 
     // Launch the harness
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Verify mailbox directories were created
     const parentMailbox = mailboxPath(repo, "parent");
@@ -2216,7 +2229,7 @@ describe("mailbox system integration", () => {
 
     // Launch to make harness active
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Drain any existing manager messages from launch
     const priorMessages = await readMailbox(repo, "manager");
@@ -2273,7 +2286,7 @@ describe("mailbox system integration", () => {
     await mock.emit("session_start", {}, ctx);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Verify registry was created
     const registry = await readRegistry(repo);
@@ -2324,7 +2337,7 @@ describe("mailbox system integration", () => {
     await mock.emit("session_start", {}, ctx);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Drain manager messages
     const priorMessages = await readMailbox(repo, "manager");
@@ -2461,7 +2474,7 @@ describe("mailbox system integration", () => {
     await mock.emit("session_start", {}, ctx);
 
     const launchCmd = mock.getCommand("harness:launch")!;
-    await launchCmd.handler("", ctx);
+    await launchCmd.handler("--stagger 0", ctx);
 
     // Manager should have received a directive about pending queue items
     const managerMessages = await readMailbox(repo, "manager");
@@ -2483,5 +2496,2142 @@ describe("mailbox system integration", () => {
     } catch {
       // ignore
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cleanup and summary integration tests
+// ---------------------------------------------------------------------------
+
+describe("harness cleanup and summary integration", () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-cleanup-integ-"));
+    repo = join(baseDir, "project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      `echo "# Project" > README.md && git add . && git commit -m "init"`,
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    // Clean up any leftover state from previous tests
+    try {
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    // Clean up worktrees
+    try {
+      const list = git("worktree list --porcelain", repo);
+      for (const line of list.split("\n")) {
+        if (line.startsWith("worktree ") && line.includes(".pi-agent")) {
+          const wtPath = line.replace("worktree ", "");
+          try { git(`worktree remove ${wtPath} --force`, repo); } catch { /* ignore */ }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    // Clean up branches
+    try {
+      const branches = git("branch", repo);
+      for (const br of branches.split("\n")) {
+        const name = br.replace("*", "").trim();
+        if (name.startsWith("pi-agent/")) {
+          try { git(`branch -D ${name}`, repo); } catch { /* ignore */ }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  function freshHarness() {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi" || cmd === "tmux") {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+    return originalExec;
+  }
+
+  it("/harness:cleanup removes worktrees, branches, and state files", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Create a task and launch
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "cleanup-test.md"),
+      "# cleanup-test\npath: .\n\n## Goals\n- [ ] Goal 1\n",
+    );
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    // Verify worktree exists
+    const worktrees = git("worktree list", repo);
+    expect(worktrees).toContain("cleanup-test");
+
+    // Run cleanup
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+
+    // Verify worktree was removed
+    const worktreesAfter = git("worktree list", repo);
+    expect(worktreesAfter).not.toContain("cleanup-test");
+
+    // Verify state files removed
+    await expect(
+      readFile(join(repo, QUEUE_FILE), "utf-8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    ).rejects.toThrow();
+
+    // Verify summary message sent
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-cleanup",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("/harness:stop writes .summary.json with correct data", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+    await writeFile(
+      join(piDir, "summary-worker.md"),
+      "# summary-worker\npath: .\n\n## Goals\n- [x] Done\n- [ ] Pending\n",
+    );
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    const stopCmd = mock.getCommand("harness:stop")!;
+    await stopCmd.handler("", ctx);
+
+    // Read summary file
+    const summaryPath = join(repo, ".pi-agent/.summary.json");
+    const summaryRaw = await readFile(summaryPath, "utf-8");
+    const summary = JSON.parse(summaryRaw);
+
+    expect(summary.stopReason).toBe("user_stop");
+    expect(summary.workers).toHaveProperty("summary-worker");
+    expect(summary.workers["summary-worker"].goalsTotal).toBe(2);
+    expect(summary.workers["summary-worker"].goalsCompleted).toBe(1);
+    expect(summary.duration).toBeTruthy();
+
+    // Cleanup
+    try {
+      const cleanupCmd = mock.getCommand("harness:cleanup")!;
+      await cleanupCmd.handler("--force", ctx);
+    } catch {
+      // Force cleanup of worktree
+      try {
+        git(
+          `worktree remove ${join(repo, WORKTREE_DIR, "summary-worker")} --force`,
+          repo,
+        );
+        git("branch -D pi-agent/summary-worker", repo);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  it("/harness:launch --max-workers limits spawned workers", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const piDir = join(repo, PI_AGENT_DIR);
+    await mkdir(piDir, { recursive: true });
+
+    // Create 3 tasks
+    for (const name of ["mw-alpha", "mw-beta", "mw-gamma"]) {
+      await writeFile(
+        join(piDir, `${name}.md`),
+        `# ${name}\npath: .\n\n## Goals\n- [ ] Goal 1\n- [ ] Goal 2\n`,
+      );
+    }
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--max-workers 1 --stagger 0", ctx);
+
+    // Only 1 worktree should exist (plus the main one)
+    const worktrees = git("worktree list", repo)
+      .split("\n")
+      .filter((l) => l.includes("pi-agent/mw-"));
+    expect(worktrees.length).toBe(1);
+
+    // Queue should have 2 items
+    const queue = await readQueue(repo);
+    expect(queue.items.filter((i) => i.status === "pending").length).toBe(2);
+
+    // Report should mention queued tasks
+    const startedMsg = mock.api.sendMessage.mock.calls.find(
+      (call: any[]) => call[0]?.customType === "harness-started",
+    );
+    expect(startedMsg).toBeDefined();
+    expect(startedMsg![0].content).toContain("Queued (--max-workers 1)");
+
+    // Cleanup
+    try {
+      const cleanupCmd = mock.getCommand("harness:cleanup")!;
+      await cleanupCmd.handler("--force", ctx);
+    } catch {
+      // Force cleanup
+      for (const name of ["mw-alpha", "mw-beta", "mw-gamma"]) {
+        try {
+          git(
+            `worktree remove ${join(repo, WORKTREE_DIR, name)} --force`,
+            repo,
+          );
+          git(`branch -D pi-agent/${name}`, repo);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E tmux verification with real tmux sessions
+// ---------------------------------------------------------------------------
+
+describe("e2e tmux verification (real tmux sessions)", () => {
+  const E2E_SERVER = "pi-harness-e2e";
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-e2e-tmux-"));
+    repo = join(baseDir, "project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      `echo "# Project" > README.md && git add . && git commit -m "init"`,
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    // Kill e2e tmux server
+    try {
+      execSync(`tmux -L ${E2E_SERVER} kill-server`, { encoding: "utf-8" });
+    } catch {
+      // ignore
+    }
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    // Clean up state
+    try {
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+    } catch { /* ignore */ }
+    try {
+      const list = git("worktree list --porcelain", repo);
+      for (const line of list.split("\n")) {
+        if (line.startsWith("worktree ") && line.includes(".pi-agent")) {
+          const wtPath = line.replace("worktree ", "");
+          try { git(`worktree remove ${wtPath} --force`, repo); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      const branches = git("branch", repo);
+      for (const br of branches.split("\n")) {
+        const name = br.replace("*", "").trim();
+        if (name.startsWith("pi-agent/")) {
+          try { git(`branch -D ${name}`, repo); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+    // Kill any leftover e2e tmux sessions
+    try {
+      execSync(`tmux -L ${E2E_SERVER} kill-server`, { encoding: "utf-8" });
+    } catch { /* ignore */ }
+  });
+
+  function createE2EMockAPI() {
+    const handlers = new Map<string, Function[]>();
+    const tools: Array<{ name: string; [k: string]: any }> = [];
+    const commands = new Map<
+      string,
+      { description: string; handler: Function }
+    >();
+
+    const api = {
+      on(event: string, handler: Function) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool(def: any) {
+        tools.push(def);
+      },
+      registerCommand(name: string, def: any) {
+        commands.set(name, def);
+      },
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+      exec: vi
+        .fn()
+        .mockImplementation(
+          async (cmd: string, args: string[], opts?: any) => {
+            const cwd = opts?.cwd || ".";
+
+            // For tmux commands: redirect to e2e server with proper quoting
+            if (cmd === "tmux") {
+              const adjustedArgs = args.map((a: string) =>
+                a === "pi-harness" ? E2E_SERVER : a,
+              );
+              const quotedArgs = adjustedArgs.map((a: string) =>
+                /[;\s"'$`\\(){}]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a,
+              );
+              try {
+                const stdout = execSync(
+                  `tmux ${quotedArgs.join(" ")}`,
+                  { cwd, encoding: "utf-8", timeout: 10_000 },
+                );
+                return { stdout, stderr: "", exitCode: 0 };
+              } catch (e: any) {
+                throw new Error(e.stderr?.toString() || "tmux command failed");
+              }
+            }
+
+            // Intercept pi commands (don't actually spawn)
+            if (cmd === "pi") {
+              return { stdout: "", stderr: "", exitCode: 0 };
+            }
+
+            // Pass through git and other commands
+            try {
+              const quotedArgs = args.map((a: string) => `'${a.replace(/'/g, "'\\''")}'`);
+          const stdout = execSync(`${cmd} ${quotedArgs.join(" ")}`, {
+                cwd,
+                encoding: "utf-8",
+                timeout: 10_000,
+              });
+              return { stdout, stderr: "", exitCode: 0 };
+            } catch (e: any) {
+              return {
+                stdout: e.stdout?.toString() || "",
+                stderr: e.stderr?.toString() || "",
+                exitCode: e.status || 1,
+              };
+            }
+          },
+        ),
+    };
+
+    return {
+      api,
+      async emit(event: string, eventData: any, ctx: any) {
+        const fns = handlers.get(event) ?? [];
+        for (const fn of fns) await fn(eventData, ctx);
+      },
+      getCommand(name: string) {
+        return commands.get(name);
+      },
+      getTool(name: string) {
+        return tools.find((t) => t.name === name);
+      },
+    };
+  }
+
+  function freshE2E() {
+    const mock = createE2EMockAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function tmuxSessions(): string[] {
+    try {
+      const out = execSync(
+        `tmux -L ${E2E_SERVER} list-sessions -F '#{session_name}'`,
+        { encoding: "utf-8" },
+      );
+      return out.trim().split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  function tmuxHas(name: string): boolean {
+    try {
+      execSync(`tmux -L ${E2E_SERVER} has-session -t '${name}'`, {
+        encoding: "utf-8",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("launch creates real tmux sessions for workers and manager", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "e2e-worker",
+      goals: ["Test tmux spawning"],
+    });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    // Verify real tmux sessions exist
+    const sessions = tmuxSessions();
+    expect(sessions).toContain("worker-e2e-worker");
+    expect(sessions).toContain("harness-manager");
+    expect(tmuxHas("worker-e2e-worker")).toBe(true);
+    expect(tmuxHas("harness-manager")).toBe(true);
+
+    // Verify state file
+    const state: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(state.managerTmuxSession).toBe("harness-manager");
+    expect(state.sessions["e2e-worker"].tmuxSession).toBe("worker-e2e-worker");
+
+    // Verify prompt files
+    const wtPath = join(repo, WORKTREE_DIR, "e2e-worker");
+    const prompt = await readFile(join(wtPath, ".pi-agent-prompt.md"), "utf-8");
+    expect(prompt).toContain("e2e-worker");
+
+    const mgrPrompt = await readFile(
+      join(repo, MANAGER_DIR, ".pi-agent-prompt.md"),
+      "utf-8",
+    );
+    expect(mgrPrompt).toContain(".manager-instructions.md");
+    expect(mgrPrompt).toContain("Current Submodules");
+
+    // Verify static instructions file was created
+    const instructionsFile = await readFile(
+      join(repo, PI_AGENT_DIR, ".manager-instructions.md"),
+      "utf-8",
+    );
+    expect(instructionsFile).toContain("Launch Manager");
+
+    // Clean up
+    try {
+      git(`worktree remove ${wtPath} --force`, repo);
+      git("branch -D pi-agent/e2e-worker", repo);
+    } catch { /* ignore */ }
+  });
+
+  it("/harness:stop kills real tmux sessions", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "stop-e2e", goals: ["Test stop"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    expect(tmuxHas("worker-stop-e2e")).toBe(true);
+    expect(tmuxHas("harness-manager")).toBe(true);
+
+    const stopCmd = mock.getCommand("harness:stop")!;
+    await stopCmd.handler("", ctx);
+
+    expect(tmuxHas("worker-stop-e2e")).toBe(false);
+    expect(tmuxHas("harness-manager")).toBe(false);
+
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "stop-e2e")} --force`, repo);
+      git("branch -D pi-agent/stop-e2e", repo);
+    } catch { /* ignore */ }
+  });
+
+  it("/harness:cleanup kills entire real tmux server", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "cleanup-e2e", goals: ["Test cleanup"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    expect(tmuxSessions().length).toBeGreaterThanOrEqual(2);
+
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+
+    expect(tmuxSessions()).toEqual([]);
+  });
+
+  it("/harness:logs captures real tmux pane output", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "logs-e2e", goals: ["Log capture"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await new Promise((r) => setTimeout(r, 1000));
+    mock.api.sendMessage.mockClear();
+
+    const logsCmd = mock.getCommand("harness:logs")!;
+    await logsCmd.handler("manager", ctx);
+
+    const logCall = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-logs",
+    );
+    expect(logCall).toBeDefined();
+    expect(logCall![0].content).toContain("harness-manager");
+
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "logs-e2e")} --force`, repo);
+      git("branch -D pi-agent/logs-e2e", repo);
+    } catch { /* ignore */ }
+  });
+
+  it("/harness:attach lists real tmux sessions", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "attach-e2e", goals: ["Attach test"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+    mock.api.sendMessage.mockClear();
+
+    const attachCmd = mock.getCommand("harness:attach")!;
+    await attachCmd.handler("", ctx);
+
+    const sessionList = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-sessions",
+    );
+    expect(sessionList).toBeDefined();
+    expect(sessionList![0].content).toContain("worker-attach-e2e");
+    expect(sessionList![0].content).toContain("harness-manager");
+
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "attach-e2e")} --force`, repo);
+      git("branch -D pi-agent/attach-e2e", repo);
+    } catch { /* ignore */ }
+  });
+
+  it("turn_end detects externally killed tmux sessions", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "liveness-e2e", goals: ["Liveness test"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+    expect(tmuxHas("worker-liveness-e2e")).toBe(true);
+
+    // Externally kill the worker (simulating crash)
+    execSync(`tmux -L ${E2E_SERVER} kill-session -t worker-liveness-e2e`, {
+      encoding: "utf-8",
+    });
+
+    // Write manager status so turn_end proceeds
+    await writeFile(
+      join(repo, MANAGER_STATUS_FILE),
+      JSON.stringify({
+        status: "running",
+        updatedAt: new Date().toISOString(),
+        submodules: { "liveness-e2e": { completed: 0, total: 1, allDone: false } },
+        stallCount: 0,
+      }),
+    );
+
+    ctx.ui.setStatus.mockClear();
+    await mock.emit("turn_end", {}, ctx);
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      expect.stringContaining("0a/0s/1d"),
+    );
+
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "liveness-e2e")} --force`, repo);
+      git("branch -D pi-agent/liveness-e2e", repo);
+    } catch { /* ignore */ }
+  });
+
+  it("multiple workers spawn as separate real tmux sessions", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "multi-a", goals: ["First"] });
+    await addTool.execute("c2", { name: "multi-b", goals: ["Second"] });
+    await addTool.execute("c3", { name: "multi-c", goals: ["Third"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    const sessions = tmuxSessions();
+    expect(sessions).toContain("worker-multi-a");
+    expect(sessions).toContain("worker-multi-b");
+    expect(sessions).toContain("worker-multi-c");
+    expect(sessions).toContain("harness-manager");
+    expect(sessions.length).toBe(4);
+
+    for (const name of ["multi-a", "multi-b", "multi-c"]) {
+      try {
+        git(`worktree remove ${join(repo, WORKTREE_DIR, name)} --force`, repo);
+        git(`branch -D pi-agent/${name}`, repo);
+      } catch { /* ignore */ }
+    }
+  });
+
+  it("/harness:status shows real tmux alive/dead status", async () => {
+    const { mock, ctx } = freshE2E();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", { name: "status-e2e", goals: ["Status test"] });
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+    mock.api.sendMessage.mockClear();
+
+    const statusCmd = mock.getCommand("harness:status")!;
+    await statusCmd.handler("", ctx);
+
+    const statusCall = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-status",
+    );
+    expect(statusCall).toBeDefined();
+    expect(statusCall![0].content).toContain("status-e2e");
+    expect(statusCall![0].content).toContain("tmux: alive");
+
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "status-e2e")} --force`, repo);
+      git("branch -D pi-agent/status-e2e", repo);
+    } catch { /* ignore */ }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BMAD E2E: Build → Monitor → Audit → Deploy
+//
+// A sophisticated end-to-end test modeling a multi-role software delivery
+// pipeline. Four workers with dependency chains, questions, mailbox
+// communication, merge conflict resolution, queue overflow, and dashboard.
+//
+// Topology:
+//   build-backend (developer)  ←─┐
+//   build-frontend (designer)  ←─┤── audit-security (reviewer, depends on both)
+//   deploy-infra (builder)     ←──── (queued via --max-workers, no dependency)
+//
+// Scenario:
+//   1. Init harness + add 4 tasks with roles & depends_on
+//   2. Launch with --max-workers 3 (deploy-infra queued)
+//   3. Build workers ask questions, parent answers
+//   4. Simulate commits in worktrees
+//   5. Complete build goals → audit-security unblocks
+//   6. Audit worker completes, merge all workers
+//   7. Dashboard shows correct state throughout
+//   8. Stop → verify summary, cleanup → verify pristine
+// ---------------------------------------------------------------------------
+
+describe("BMAD e2e: Build → Monitor → Audit → Deploy pipeline", { timeout: 60000 }, () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-bmad-"));
+    repo = join(baseDir, "bmad-project");
+    git(`init ${repo}`, baseDir);
+    // Seed the repo with realistic project structure
+    execSync(
+      [
+        'mkdir -p src/api src/web infra',
+        'echo "# BMAD Project" > README.md',
+        'echo "export const version = \\"1.0\\";" > src/api/index.ts',
+        'echo "export const App = () => \\"hello\\";" > src/web/app.tsx',
+        'echo "provider: aws" > infra/main.tf',
+        'git add .',
+        'git commit -m "initial commit: project scaffold"',
+      ].join(" && "),
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    // Clean up all harness state between tests
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      try {
+        const entries = await readdir(wtDir);
+        for (const entry of entries) {
+          try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+        }
+      } catch { /* worktree dir may not exist */ }
+      try { git("worktree prune", repo); } catch { /* ignore */ }
+      try {
+        const branches = git("branch --list pi-agent/*", repo);
+        for (const branch of branches.split("\n")) {
+          const b = branch.trim();
+          if (b) { try { git(`branch -D ${b}`, repo); } catch { /* ignore */ } }
+        }
+      } catch { /* ignore */ }
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+    } catch { /* first test — nothing to clean */ }
+  });
+
+  function freshBMAD() {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi" || cmd === "tmux") {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+    return originalExec;
+  }
+
+  it("full pipeline: init → add(4 roles) → launch(maxWorkers) → questions → work → depends_on unblock → merge → queue dispatch → dashboard → stop → cleanup", async () => {
+    const { mock, ctx } = freshBMAD();
+    await mock.emit("session_start", {}, ctx);
+
+    // =====================================================================
+    // Phase 1: Initialize and create tasks via /harness:init + /harness:add
+    // =====================================================================
+
+    const initCmd = mock.getCommand("harness:init")!;
+    await initCmd.handler("", ctx);
+
+    // Verify scaffolding
+    const piDir = join(repo, PI_AGENT_DIR);
+    const dirs = await readdir(piDir);
+    expect(dirs).toContain(".mailboxes");
+
+    // Add tasks via harness_add_task tool
+    const addTool = mock.getTool("harness_add_task")!;
+
+    // 1. build-backend: developer role
+    await addTool.execute("c1", {
+      name: "build-backend",
+      goals: ["Implement REST endpoints", "Add database migrations", "Write unit tests"],
+      role: "developer",
+      context: "Backend API using Express + TypeORM. Must support PostgreSQL.",
+    });
+
+    // 2. build-frontend: designer role
+    await addTool.execute("c2", {
+      name: "build-frontend",
+      goals: ["Create login page", "Build dashboard components"],
+      role: "designer",
+      context: "React + Tailwind CSS. Must be accessible (WCAG 2.1 AA).",
+    });
+
+    // 3. audit-security: reviewer role with depends_on (write manually)
+    const auditGoalFile = join(piDir, "audit-security.md");
+    await writeFile(
+      auditGoalFile,
+      [
+        "# audit-security",
+        "path: .",
+        "role: reviewer",
+        "depends_on: build-backend, build-frontend",
+        "",
+        "## Context",
+        "Review the backend and frontend code for OWASP Top 10 vulnerabilities.",
+        "",
+        "## Goals",
+        "- [ ] Audit authentication flow",
+        "- [ ] Check for XSS in frontend",
+        "- [ ] Write security report",
+      ].join("\n") + "\n",
+    );
+
+    // 4. deploy-infra: builder role (will be queued due to --max-workers)
+    await addTool.execute("c4", {
+      name: "deploy-infra",
+      goals: ["Write Terraform modules", "Set up CI/CD pipeline"],
+      role: "builder",
+      context: "AWS infrastructure with Terraform. Use module composition.",
+    });
+
+    // Verify all 4 goal files exist
+    const goalFiles = (await readdir(piDir)).filter(f => f.endsWith(".md") && !f.startsWith("."));
+    expect(goalFiles.sort()).toEqual([
+      "audit-security.md",
+      "build-backend.md",
+      "build-frontend.md",
+      "deploy-infra.md",
+    ]);
+
+    // Verify audit-security has depends_on parsed correctly
+    const auditContent = await readFile(auditGoalFile, "utf-8");
+    const auditParsed = parseGoalFile(auditContent, "audit-security.md");
+    expect(auditParsed.dependsOn).toEqual(["build-backend", "build-frontend"]);
+    expect(auditParsed.role).toBe("reviewer");
+
+    // =====================================================================
+    // Phase 2: Launch with --max-workers 3 → audit-security depends_on
+    //          blocks it, so build-backend, build-frontend, deploy-infra
+    //          spawn. But --max-workers 3 caps at 3.
+    //          Actually: depends_on means audit-security goes to waiting→queue,
+    //          so only build-backend, build-frontend, deploy-infra are ready.
+    //          With --max-workers 2, only 2 spawn and 1 queues.
+    // =====================================================================
+
+    interceptPiSpawns(mock);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--max-workers 2 --stagger 0", ctx);
+
+    // Verify launch state
+    const state: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(state.active).toBe(true);
+
+    // Exactly 2 workers should have been spawned (the two with most goals)
+    const spawnedWorkers = Object.keys(state.sessions);
+    expect(spawnedWorkers.length).toBe(2);
+
+    // build-backend has 3 goals (most), build-frontend has 2 → these two spawn
+    expect(spawnedWorkers).toContain("build-backend");
+    expect(spawnedWorkers).toContain("build-frontend");
+
+    // deploy-infra and audit-security should be in queue
+    const queue = await readQueue(repo);
+    const queuedNames = queue.items.map(i => i.topic);
+    // deploy-infra is overflow from max-workers, audit-security is waiting on deps
+    expect(queuedNames).toContain("deploy-infra");
+    expect(queuedNames).toContain("audit-security");
+
+    // Verify worktrees exist
+    const backendWt = join(repo, WORKTREE_DIR, "build-backend");
+    const frontendWt = join(repo, WORKTREE_DIR, "build-frontend");
+    expect(git("branch --show-current", backendWt)).toBe("pi-agent/build-backend");
+    expect(git("branch --show-current", frontendWt)).toBe("pi-agent/build-frontend");
+
+    // Verify heartbeat files contain role-specific content
+    const backendHb = await readFile(join(backendWt, "heartbeat.md"), "utf-8");
+    expect(backendHb).toContain("build-backend");
+    expect(backendHb).toContain("Implement REST endpoints");
+
+    // Verify worker prompts have correct role personas
+    const backendPrompt = await readFile(join(backendWt, ".pi-agent-prompt.md"), "utf-8");
+    expect(backendPrompt).toContain("a methodical software developer");
+    expect(backendPrompt).toContain("Write tests first (red)");
+
+    const frontendPrompt = await readFile(join(frontendWt, ".pi-agent-prompt.md"), "utf-8");
+    expect(frontendPrompt).toContain("a frontend developer focused on UI/UX");
+
+    // =====================================================================
+    // Phase 3: Workers ask questions, parent answers
+    // =====================================================================
+
+    // Backend worker writes questions to goal file
+    const backendGoalPath = join(piDir, "build-backend.md");
+    let backendGoal = await readFile(backendGoalPath, "utf-8");
+    backendGoal = backendGoal.trimEnd() +
+      "\n\n## Questions\n- ? Which ORM should I use: TypeORM or Prisma?\n- ? Should REST endpoints use versioned paths (e.g. /v1/...)?\n";
+    await writeFile(backendGoalPath, backendGoal, "utf-8");
+
+    // Verify status shows questions
+    const statusTool = mock.getTool("harness_status")!;
+    let statusResult = await statusTool.execute("s1", {});
+    expect(statusResult.details.unansweredQuestions).toBe(2);
+
+    // Parent answers via harness_answer
+    const answerTool = mock.getTool("harness_answer")!;
+    await answerTool.execute("a1", {
+      submodule: "build-backend",
+      question: "ORM",
+      answer: "Use Prisma — it has better TypeScript support",
+    });
+    await answerTool.execute("a2", {
+      submodule: "build-backend",
+      question: "versioned paths",
+      answer: "Yes, use /v1/ prefix for all endpoints",
+    });
+
+    // All questions answered
+    statusResult = await statusTool.execute("s2", {});
+    expect(statusResult.details.unansweredQuestions).toBe(0);
+
+    // Verify answers are in the file
+    backendGoal = await readFile(backendGoalPath, "utf-8");
+    expect(backendGoal).toContain("→ Use Prisma");
+    expect(backendGoal).toContain("→ Yes, use /v1/ prefix");
+
+    // =====================================================================
+    // Phase 4: Simulate work in worktrees
+    // =====================================================================
+
+    // Backend worker creates commits
+    // Use `git add src/` to match how a real worker would commit — only their
+    // actual work files, not harness-managed files. Both heartbeat.md and
+    // .pi-agent-prompt.md are now excluded via the per-worktree git exclude
+    // file, but using specific paths is still best practice.
+    execSync(
+      [
+        'echo "import express from \\"express\\";" > src/api/routes.ts',
+        'echo "import { PrismaClient } from \\"@prisma/client\\";" > src/api/db.ts',
+        'git add src/',
+        'git commit -m "feat: add REST endpoints with Prisma"',
+      ].join(" && "),
+      { cwd: backendWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    execSync(
+      [
+        'echo "CREATE TABLE users (id SERIAL PRIMARY KEY);" > src/api/migration.sql',
+        'git add src/',
+        'git commit -m "feat: add database migration"',
+      ].join(" && "),
+      { cwd: backendWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    execSync(
+      [
+        'echo "test(\\"routes\\", () => expect(1).toBe(1));" > src/api/routes.test.ts',
+        'git add src/',
+        'git commit -m "test: add unit tests for routes"',
+      ].join(" && "),
+      { cwd: backendWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+
+    // Frontend worker creates commits
+    execSync(
+      [
+        'echo "<form aria-label=\\"login\\"><input name=\\"email\\" /></form>" > src/web/login.tsx',
+        'git add src/',
+        'git commit -m "feat: create accessible login page"',
+      ].join(" && "),
+      { cwd: frontendWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+    execSync(
+      [
+        'echo "export const Dashboard = () => <main>Dashboard</main>;" > src/web/dashboard.tsx',
+        'git add src/',
+        'git commit -m "feat: build dashboard components"',
+      ].join(" && "),
+      { cwd: frontendWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+
+    // Complete backend goals
+    const updateTool = mock.getTool("harness_update_goal")!;
+    await updateTool.execute("u1", { submodule: "build-backend", action: "complete", goal: "Implement REST endpoints" });
+    await updateTool.execute("u2", { submodule: "build-backend", action: "complete", goal: "Add database migrations" });
+    await updateTool.execute("u3", { submodule: "build-backend", action: "complete", goal: "Write unit tests" });
+
+    // Complete frontend goals
+    await updateTool.execute("u4", { submodule: "build-frontend", action: "complete", goal: "Create login page" });
+    await updateTool.execute("u5", { submodule: "build-frontend", action: "complete", goal: "Build dashboard components" });
+
+    // Verify both are DONE
+    statusResult = await statusTool.execute("s3", {});
+    expect(statusResult.content[0].text).toContain("build-backend");
+    expect(statusResult.content[0].text).toContain("DONE");
+    expect(statusResult.content[0].text).toContain("build-frontend");
+
+    // =====================================================================
+    // Phase 5: Mailbox communication — worker sends status to parent
+    // =====================================================================
+
+    await sendMailboxMessage(repo, "parent", "build-backend", "status_report", {
+      text: "All 3 goals complete. Backend ready for security audit.",
+      commits: 3,
+    });
+
+    // turn_end should surface the non-question inbox message (Issue #5 fix)
+    // First write manager status for turn_end
+    const mgrStatus: ManagerStatusFile = {
+      status: "running",
+      updatedAt: new Date().toISOString(),
+      submodules: {
+        "build-backend": { completed: 3, total: 3, allDone: true },
+        "build-frontend": { completed: 2, total: 2, allDone: true },
+      },
+      stallCount: 0,
+    };
+    await writeFile(join(repo, MANAGER_STATUS_FILE), JSON.stringify(mgrStatus), "utf-8");
+
+    ctx.ui.setStatus.mockClear();
+    mock.api.sendMessage.mockClear();
+    await mock.emit("turn_end", {}, ctx);
+
+    // Status bar should show goal progress
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      expect.stringContaining("5/5 goals"),
+    );
+
+    // Non-question inbox message should have been surfaced
+    const inboxCalls = mock.api.sendMessage.mock.calls.filter(
+      (c: any) => c[0]?.customType === "harness-inbox",
+    );
+    expect(inboxCalls.length).toBe(1);
+    expect(inboxCalls[0][0].content).toContain("status_report");
+    expect(inboxCalls[0][0].content).toContain("build-backend");
+
+    // Message should be deleted from inbox
+    const parentInbox = await readMailbox(repo, "parent");
+    expect(parentInbox).toHaveLength(0);
+
+    // =====================================================================
+    // Phase 6: Merge completed workers
+    // =====================================================================
+
+    const mergeCmd = mock.getCommand("harness:merge")!;
+
+    // Merge backend
+    await mergeCmd.handler("build-backend", ctx);
+    let mainFiles = git("ls-files", repo);
+    expect(mainFiles).toContain("src/api/routes.ts");
+    expect(mainFiles).toContain("src/api/db.ts");
+    expect(mainFiles).toContain("src/api/migration.sql");
+    expect(mainFiles).toContain("src/api/routes.test.ts");
+
+    // Merge frontend
+    await mergeCmd.handler("build-frontend", ctx);
+    mainFiles = git("ls-files", repo);
+    expect(mainFiles).toContain("src/web/login.tsx");
+    expect(mainFiles).toContain("src/web/dashboard.tsx");
+
+    // After merge, removeWorktree uses --force to clean up excluded files
+    // (heartbeat.md, .pi-agent-prompt.md) that block non-force removal.
+
+    // =====================================================================
+    // Phase 7: Dashboard shows comprehensive state
+    // =====================================================================
+
+    mock.api.sendMessage.mockClear();
+    const dashboardCmd = mock.getCommand("harness:dashboard")!;
+    await dashboardCmd.handler("", ctx);
+
+    const dashCall = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-dashboard",
+    );
+    expect(dashCall).toBeDefined();
+    const dashContent = dashCall![0].content;
+    expect(dashContent).toContain("Harness Dashboard");
+    expect(dashContent).toContain("build-backend");
+    expect(dashContent).toContain("build-frontend");
+
+    // Queue section should mention queued items
+    expect(dashContent).toContain("Queue");
+
+    // =====================================================================
+    // Phase 8: Queue tool dispatches deploy-infra while active
+    // =====================================================================
+
+    // Now use the queue tool to add more work
+    const queueTool = mock.getTool("harness_queue")!;
+    const queueResult = await queueTool.execute("q1", {
+      topic: "perf-optimization",
+      description: "Optimize database queries and add caching",
+      priority: 5,
+      goals: ["Add query optimization", "Implement Redis caching"],
+      role: "developer",
+    });
+    expect(queueResult.content[0].text).toContain("perf-optimization");
+
+    // Verify it was added to queue
+    const updatedQueue = await readQueue(repo);
+    const perfItem = updatedQueue.items.find(i => i.topic === "perf-optimization");
+    expect(perfItem).toBeDefined();
+    expect(perfItem!.priority).toBe(5);
+
+    // =====================================================================
+    // Phase 9: Verify depends_on — audit-security checks at re-launch
+    //          Since both deps are now complete, re-launching should
+    //          pick up audit-security from queue.
+    // =====================================================================
+
+    // Verify the dependency was tracked — re-read goal files to confirm
+    const allConfigs = await Promise.all(
+      (await readdir(piDir))
+        .filter(f => f.endsWith(".md") && !f.startsWith("."))
+        .map(async f => {
+          const content = await readFile(join(piDir, f), "utf-8");
+          return parseGoalFile(content, f);
+        }),
+    );
+    const auditConfig = allConfigs.find(c => c.name === "audit-security");
+    expect(auditConfig).toBeDefined();
+    expect(auditConfig!.dependsOn).toEqual(["build-backend", "build-frontend"]);
+
+    // Verify both deps are complete
+    const backendConfig = allConfigs.find(c => c.name === "build-backend");
+    expect(backendConfig!.goals.every(g => g.completed)).toBe(true);
+    const frontendConfig = allConfigs.find(c => c.name === "build-frontend");
+    expect(frontendConfig!.goals.every(g => g.completed)).toBe(true);
+
+    // =====================================================================
+    // Phase 10: Stop → verify run summary
+    // =====================================================================
+
+    const stopCmd = mock.getCommand("harness:stop")!;
+    await stopCmd.handler("", ctx);
+
+    // Verify stop signal
+    const stopSignal = await readFile(join(repo, STOP_SIGNAL_FILE), "utf-8");
+    expect(stopSignal.trim()).toBeTruthy();
+
+    // Verify state is inactive
+    const finalState: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(finalState.active).toBe(false);
+
+    // Verify summary was written
+    const summary = JSON.parse(await readFile(join(repo, SUMMARY_FILE), "utf-8"));
+    expect(summary.stopReason).toBe("user_stop");
+    expect(summary.duration).toBeTruthy();
+    expect(summary.workers["build-backend"]).toBeDefined();
+    expect(summary.workers["build-backend"].role).toBe("developer");
+    expect(summary.workers["build-backend"].goalsCompleted).toBe(3);
+    expect(summary.workers["build-backend"].goalsTotal).toBe(3);
+    expect(summary.workers["build-frontend"]).toBeDefined();
+    expect(summary.workers["build-frontend"].role).toBe("designer");
+    expect(summary.workers["build-frontend"].goalsCompleted).toBe(2);
+
+    // =====================================================================
+    // Phase 11: Cleanup → verify pristine state
+    // =====================================================================
+
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+
+    // Verify no worktrees remain (cleanup --force removes orphaned worktrees)
+    const worktrees = git("worktree list", repo);
+    expect(worktrees).not.toContain(WORKTREE_DIR);
+
+    // Orphaned worktree cleanup now also deletes associated pi-agent/* branches.
+
+    // State files should be cleaned
+    await expect(readFile(join(repo, LAUNCH_STATE_FILE), "utf-8")).rejects.toThrow();
+    await expect(readFile(join(repo, QUEUE_FILE), "utf-8")).rejects.toThrow();
+
+    // But the merged code should persist in main
+    mainFiles = git("ls-files", repo);
+    expect(mainFiles).toContain("src/api/routes.ts");
+    expect(mainFiles).toContain("src/web/login.tsx");
+    expect(mainFiles).toContain("README.md");
+
+    // Verify git log shows all the merged commits
+    const log = git("log --oneline", repo);
+    expect(log).toContain("REST endpoints");
+    expect(log).toContain("login page");
+    expect(log).toContain("dashboard components");
+  });
+
+  it("merge conflict scenario: parallel workers editing same file", async () => {
+    const { mock, ctx } = freshBMAD();
+    await mock.emit("session_start", {}, ctx);
+
+    // Two workers, both will edit the same file
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "worker-alpha",
+      goals: ["Update README header"],
+    });
+    await addTool.execute("c2", {
+      name: "worker-beta",
+      goals: ["Update README footer"],
+    });
+
+    // mergeWorktree now checks exitCode explicitly (not just try/catch),
+    // so the default mock's non-throwing behavior works for conflict detection.
+    interceptPiSpawns(mock);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    const alphaWt = join(repo, WORKTREE_DIR, "worker-alpha");
+    const betaWt = join(repo, WORKTREE_DIR, "worker-beta");
+
+    // Alpha modifies top of README
+    // NOTE: Use `git add README.md` instead of `git add .` to avoid staging
+    // .pi-agent-prompt.md (see BUG note in full pipeline test above).
+    execSync(
+      [
+        'echo "# BMAD Project v2 - Updated by alpha" > README.md',
+        'git add README.md',
+        'git commit -m "update README header"',
+      ].join(" && "),
+      { cwd: alphaWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+
+    // Beta modifies the same file differently
+    execSync(
+      [
+        'echo "# BMAD Project - Footer by beta" > README.md',
+        'git add README.md',
+        'git commit -m "update README footer"',
+      ].join(" && "),
+      { cwd: betaWt, shell: "/bin/bash", encoding: "utf-8" },
+    );
+
+    // Merge alpha first — should succeed (fast-forward)
+    const mergeCmd = mock.getCommand("harness:merge")!;
+    mock.api.sendMessage.mockClear();
+    await mergeCmd.handler("worker-alpha", ctx);
+
+    const mergeAlpha = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-merge-result",
+    );
+    expect(mergeAlpha).toBeDefined();
+    expect(mergeAlpha![0].content).toContain("Merged");
+
+    // Merge beta — should fail with conflict
+    mock.api.sendMessage.mockClear();
+    await mergeCmd.handler("worker-beta", ctx);
+
+    const mergeBeta = mock.api.sendMessage.mock.calls.find(
+      (c: any) => c[0]?.customType === "harness-merge-result",
+    );
+    expect(mergeBeta).toBeDefined();
+    // Merge conflict detection: message should contain "conflict" (case-insensitive)
+    const betaContent = mergeBeta![0].content.toLowerCase();
+    expect(betaContent).toContain("conflict");
+
+    // Force cleanup
+    for (const name of ["worker-alpha", "worker-beta"]) {
+      try {
+        git(`worktree remove ${join(repo, WORKTREE_DIR, name)} --force`, repo);
+      } catch { /* ignore */ }
+      try {
+        git(`branch -D pi-agent/${name}`, repo);
+      } catch { /* ignore */ }
+    }
+  });
+
+  it("registry tracks worker metadata across lifecycle", async () => {
+    const { mock, ctx } = freshBMAD();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "reg-dev",
+      goals: ["Build feature", "Write tests"],
+      role: "developer",
+    });
+    await addTool.execute("c2", {
+      name: "reg-test",
+      goals: ["Run integration tests"],
+      role: "tester",
+    });
+
+    interceptPiSpawns(mock);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    // Verify registry was created with correct metadata
+    const registry = await readRegistry(repo);
+    expect(registry).not.toBeNull();
+    expect(Object.keys(registry!.workers)).toHaveLength(2);
+
+    expect(registry!.workers["reg-dev"].role).toBe("developer");
+    expect(registry!.workers["reg-dev"].goalsTotal).toBe(2);
+    expect(registry!.workers["reg-dev"].goalsCompleted).toBe(0);
+    expect(registry!.workers["reg-dev"].status).toBe("active");
+
+    expect(registry!.workers["reg-test"].role).toBe("tester");
+    expect(registry!.workers["reg-test"].goalsTotal).toBe(1);
+    expect(registry!.workers["reg-test"].status).toBe("active");
+
+    // Cleanup
+    for (const name of ["reg-dev", "reg-test"]) {
+      try {
+        git(`worktree remove ${join(repo, WORKTREE_DIR, name)} --force`, repo);
+        git(`branch -D pi-agent/${name}`, repo);
+      } catch { /* ignore */ }
+    }
+  });
+
+  it("session persistence and recovery across simulated restart", async () => {
+    const { mock, ctx } = freshBMAD();
+    await mock.emit("session_start", {}, ctx);
+
+    const addTool = mock.getTool("harness_add_task")!;
+    await addTool.execute("c1", {
+      name: "persist-bmad",
+      goals: ["Persist across restart"],
+      role: "developer",
+    });
+
+    interceptPiSpawns(mock);
+
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    // Simulate shutdown
+    await mock.emit("session_shutdown", {}, ctx);
+
+    // Verify state was persisted
+    const state: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(state.active).toBe(true);
+    expect(state.sessions["persist-bmad"]).toBeDefined();
+
+    // Simulate new session (fresh extension instance)
+    const fresh = freshBMAD();
+    await fresh.mock.emit("session_start", {}, fresh.ctx);
+
+    // Should restore as active
+    expect(fresh.ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: active",
+    );
+
+    // Cleanup
+    try {
+      git(`worktree remove ${join(repo, WORKTREE_DIR, "persist-bmad")} --force`, repo);
+      git("branch -D pi-agent/persist-bmad", repo);
+    } catch { /* ignore */ }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// /harness:bmad command integration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("/harness:bmad command integration", { timeout: 30000 }, () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-bmad-cmd-"));
+    repo = join(baseDir, "bmad-test-project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      [
+        'echo "# BMAD Test Project" > README.md',
+        'mkdir -p bmad docs',
+        'git add .',
+        'git commit -m "initial commit"',
+      ].join(" && "),
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    // Clean up harness state
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      try {
+        const entries = await readdir(wtDir);
+        for (const entry of entries) {
+          try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+        }
+      } catch { /* worktree dir may not exist */ }
+      try { git("worktree prune", repo); } catch { /* ignore */ }
+      try {
+        const branches = git("branch --list pi-agent/*", repo);
+        for (const branch of branches.split("\n")) {
+          const b = branch.trim();
+          if (b) { try { git(`branch -D ${b}`, repo); } catch { /* ignore */ } }
+        }
+      } catch { /* ignore */ }
+      await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true });
+    } catch { /* first test — nothing to clean */ }
+  });
+
+  function freshBmadHarness() {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi" || cmd === "tmux") {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+    return originalExec;
+  }
+
+  it("full /harness:bmad lifecycle: config → DAG → goal files → prompts → .bmad-mode.json → launch", async () => {
+    // Write BMAD config (must use bmm: section for workflow_status_file)
+    const bmadConfig = [
+      "version: '6.0.0'",
+      "project_name: TestBmadProject",
+      "project_type: web-app",
+      "project_level: 2",
+      "user_name: test-user",
+      "output_folder: docs",
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      '  sprint_status_file: "docs/sprint-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+      "  stories: docs/stories",
+      "  tests: tests",
+    ].join("\n");
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), bmadConfig);
+
+    // Write workflow status (product-brief already completed)
+    const workflowStatus = [
+      "# BMAD Workflow Status",
+      "",
+      "workflow_status:",
+      "  - name: product-brief",
+      "    phase: 1",
+      '    status: "docs/product-brief-test-2026.md"',
+      '    description: "Create product brief"',
+      "",
+      "  - name: brainstorm",
+      "    phase: 1",
+      '    status: "optional"',
+      '    description: "Brainstorming session"',
+      "",
+      "  - name: research",
+      "    phase: 1",
+      '    status: "optional"',
+      '    description: "Market research"',
+      "",
+      "  - name: prd",
+      "    phase: 2",
+      '    status: "required"',
+      '    description: "Product Requirements Document"',
+      "",
+      "  - name: tech-spec",
+      "    phase: 2",
+      '    status: "optional"',
+      '    description: "Technical Specification"',
+      "",
+      "  - name: create-ux-design",
+      "    phase: 2",
+      '    status: "optional"',
+      '    description: "UX design"',
+      "",
+      "  - name: architecture",
+      "    phase: 3",
+      '    status: "required"',
+      '    description: "System architecture"',
+      "",
+      "  - name: solutioning-gate-check",
+      "    phase: 3",
+      '    status: "optional"',
+      '    description: "Validate architecture"',
+      "",
+      "  - name: sprint-planning",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Plan sprint iterations"',
+      "",
+      "  - name: create-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Create user stories"',
+      "",
+      "  - name: dev-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Implement story"',
+    ].join("\n");
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), workflowStatus);
+    git("add . && git commit -m 'add bmad config and status'", repo);
+
+    const { mock, ctx } = freshBmadHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    expect(bmadCmd).toBeDefined();
+
+    await bmadCmd.handler("--max-workers 2", ctx);
+
+    // Verify .bmad-mode.json was created
+    const bmadModeRaw = await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8");
+    const bmadMode = JSON.parse(bmadModeRaw);
+    expect(bmadMode.enabled).toBe(true);
+    expect(bmadMode.projectLevel).toBe(2);
+    expect(bmadMode.projectName).toBe("TestBmadProject");
+    expect(bmadMode.workflows.length).toBeGreaterThan(0);
+
+    // product-brief was completed, so should NOT be in workflows
+    const workflowNames = bmadMode.workflows.map((w: any) => w.workflowName);
+    expect(workflowNames).not.toContain("product-brief");
+
+    // prd and architecture should be present (L2)
+    expect(workflowNames).toContain("prd");
+    expect(workflowNames).toContain("architecture");
+    expect(workflowNames).toContain("sprint-planning");
+    expect(workflowNames).toContain("create-story");
+    expect(workflowNames).toContain("dev-story");
+
+    // Verify goal files were created
+    const goalFiles = await readdir(join(repo, PI_AGENT_DIR));
+    const bmadGoalFiles = goalFiles.filter((f) => f.startsWith("bmad-") && f.endsWith(".md"));
+    expect(bmadGoalFiles.length).toBeGreaterThan(0);
+
+    // Verify a specific goal file has correct depends_on
+    const prdGoal = await readFile(join(repo, PI_AGENT_DIR, "bmad-prd.md"), "utf-8");
+    const prdParsed = parseGoalFile(prdGoal, "bmad-prd.md");
+    expect(prdParsed.name).toBe("bmad-prd");
+    // prd depends_on product-brief, but product-brief is already completed,
+    // so prd should have no dependencies (the completed dep is filtered out)
+    expect(prdParsed.dependsOn ?? []).toEqual([]);
+
+    // Verify prompt files were pre-generated
+    const promptFiles = await readdir(join(repo, PI_AGENT_DIR, ".prompts"));
+    expect(promptFiles.length).toBeGreaterThan(0);
+    expect(promptFiles).toContain("bmad-prd.md");
+
+    // Verify prompt content contains autonomous preamble
+    const prdPrompt = await readFile(join(repo, PI_AGENT_DIR, ".prompts", "bmad-prd.md"), "utf-8");
+    expect(prdPrompt).toContain("Autonomous BMAD Worker");
+    expect(prdPrompt).toContain("no interactive user");
+
+    // Verify manager instructions contain BMAD section
+    const mgrInstructions = await readFile(
+      join(repo, PI_AGENT_DIR, ".manager-instructions.md"),
+      "utf-8",
+    );
+    expect(mgrInstructions).toContain("BMAD Phase Management");
+    expect(mgrInstructions).toContain("TestBmadProject");
+    expect(mgrInstructions).toContain("Dev-story fan-out");
+
+    // Verify launch message was sent
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "harness-bmad-started" }),
+      { triggerTurn: false },
+    );
+
+    // Verify status was set
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith("harness", "harness: bmad active");
+
+    // Verify state was persisted
+    const state: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(state.active).toBe(true);
+
+    // Verify mailbox directories created
+    const mailboxes = await readdir(join(repo, MAILBOX_DIR));
+    expect(mailboxes).toContain("manager");
+    expect(mailboxes).toContain("parent");
+
+    // Cleanup worktrees
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      const entries = await readdir(wtDir);
+      for (const entry of entries) {
+        try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  });
+
+  it("errors when no BMAD config exists", async () => {
+    // Make sure there's no bmad config
+    await rm(join(repo, "bmad"), { recursive: true, force: true });
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("No BMAD configuration"),
+      "error",
+    );
+  });
+
+  it("L0 project: minimal 4-workflow chain with correct dependencies and role mapping", async () => {
+    // L0 = single atomic change — smallest possible BMAD run
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), [
+      'project_name: "TinyFix"',
+      "project_type: library",
+      "project_level: 0",
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+      "  stories: docs/stories",
+      "  tests: tests",
+    ].join("\n"));
+
+    // Empty status — nothing completed yet
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), [
+      "workflow_status:",
+      "  - name: tech-spec",
+      "    phase: 2",
+      '    status: "required"',
+      '    description: "Tech spec"',
+      "  - name: sprint-planning",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Sprint planning"',
+      "  - name: create-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Create stories"',
+      "  - name: dev-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Develop story"',
+    ].join("\n"));
+    git("add . && git commit -m 'L0 project scaffold'", repo);
+
+    const { mock, ctx } = freshBmadHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 4", ctx);
+
+    // --- Verify .bmad-mode.json ---
+    const modeRaw = await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8");
+    const mode = JSON.parse(modeRaw);
+    expect(mode.projectLevel).toBe(0);
+    const wfNames = mode.workflows.map((w: any) => w.workflowName);
+    // L0 = tech-spec → sprint-planning → create-story → dev-story
+    expect(wfNames).toEqual(["tech-spec", "sprint-planning", "create-story", "dev-story"]);
+
+    // --- Verify dependency chain ---
+    const byName = (n: string) => mode.workflows.find((w: any) => w.workflowName === n);
+    expect(byName("tech-spec").dependsOn).toEqual([]);
+    expect(byName("sprint-planning").dependsOn).toEqual(["bmad-tech-spec"]);
+    expect(byName("create-story").dependsOn).toEqual(["bmad-sprint-planning"]);
+    expect(byName("dev-story").dependsOn).toEqual(["bmad-create-story"]);
+
+    // --- Only tech-spec should be ready (no deps), rest should be queued ---
+    // With max-workers 4 but only 1 has no deps, only 1 should be active
+    const activeWfs = mode.workflows.filter((w: any) => w.status === "active");
+    const pendingWfs = mode.workflows.filter((w: any) => w.status === "pending");
+    expect(activeWfs.length).toBe(1);
+    expect(activeWfs[0].workflowName).toBe("tech-spec");
+    expect(pendingWfs.length).toBe(3);
+
+    // --- Verify goal files ---
+    const goalFiles = (await readdir(join(repo, PI_AGENT_DIR)))
+      .filter(f => f.startsWith("bmad-") && f.endsWith(".md"))
+      .sort();
+    expect(goalFiles).toEqual([
+      "bmad-create-story.md",
+      "bmad-dev-story.md",
+      "bmad-sprint-planning.md",
+      "bmad-tech-spec.md",
+    ]);
+
+    // --- Verify goal file content (round-trip) ---
+    for (const gf of goalFiles) {
+      const content = await readFile(join(repo, PI_AGENT_DIR, gf), "utf-8");
+      const parsed = parseGoalFile(content, gf);
+      expect(parsed.goals.length).toBeGreaterThan(0);
+      expect(parsed.goals.every(g => !g.completed)).toBe(true);
+      expect(parsed.role).toBeTruthy();
+    }
+
+    // --- Verify role mapping correctness ---
+    const tsGoal = await readFile(join(repo, PI_AGENT_DIR, "bmad-tech-spec.md"), "utf-8");
+    const tsParsed = parseGoalFile(tsGoal, "bmad-tech-spec.md");
+    // tech-spec agent is "Product Manager" → role should be "researcher"
+    expect(tsParsed.role).toBe("researcher");
+
+    const spGoal = await readFile(join(repo, PI_AGENT_DIR, "bmad-sprint-planning.md"), "utf-8");
+    const spParsed = parseGoalFile(spGoal, "bmad-sprint-planning.md");
+    // sprint-planning agent is "Scrum Master" → role should be "planner"
+    expect(spParsed.role).toBe("planner");
+
+    const dsGoal = await readFile(join(repo, PI_AGENT_DIR, "bmad-dev-story.md"), "utf-8");
+    const dsParsed = parseGoalFile(dsGoal, "bmad-dev-story.md");
+    // dev-story agent is "Developer" → role should be "developer"
+    // But developer is default so the serializer omits it
+    expect(dsParsed.role).toBe("developer");
+
+    // --- Verify prompt files ---
+    const promptFiles = (await readdir(join(repo, PI_AGENT_DIR, ".prompts"))).sort();
+    expect(promptFiles).toEqual([
+      "bmad-create-story.md",
+      "bmad-dev-story.md",
+      "bmad-sprint-planning.md",
+      "bmad-tech-spec.md",
+    ]);
+
+    // --- Prompt content quality checks ---
+    for (const pf of promptFiles) {
+      const content = await readFile(join(repo, PI_AGENT_DIR, ".prompts", pf), "utf-8");
+      // All prompts must have autonomous preamble
+      expect(content).toContain("Autonomous BMAD Worker");
+      expect(content).toContain("no interactive user");
+      expect(content).toContain("Do NOT ask questions");
+      // All prompts must have harness instructions
+      expect(content).toContain("goal file");
+      expect(content).toContain("heartbeat.md");
+      expect(content).toContain("Mailbox");
+    }
+
+    // --- Verify worktree was created only for ready worker ---
+    const wtDir = join(repo, WORKTREE_DIR);
+    const worktrees = await readdir(wtDir);
+    expect(worktrees).toContain("bmad-tech-spec");
+    // The others are queued, so NO worktrees for them
+    expect(worktrees).not.toContain("bmad-sprint-planning");
+    expect(worktrees).not.toContain("bmad-create-story");
+    expect(worktrees).not.toContain("bmad-dev-story");
+
+    // --- Verify worktree has prompt file copied in ---
+    const wtPrompt = await readFile(join(wtDir, "bmad-tech-spec", ".pi-agent-prompt.md"), "utf-8");
+    expect(wtPrompt).toContain("Technical Specification");
+    expect(wtPrompt).toContain("Autonomous BMAD Worker");
+
+    // --- Verify worktree has heartbeat.md ---
+    const wtHeartbeat = await readFile(join(wtDir, "bmad-tech-spec", "heartbeat.md"), "utf-8");
+    expect(wtHeartbeat).toContain("bmad-tech-spec");
+
+    // --- Verify worker state sidecar ---
+    const stateRaw = await readFile(join(repo, PI_AGENT_DIR, "bmad-tech-spec.state.json"), "utf-8");
+    const state: WorkerState = JSON.parse(stateRaw);
+    expect(state.name).toBe("bmad-tech-spec");
+    expect(state.status).toBe("active");
+    expect(state.goalsCompleted).toBe(0);
+    expect(state.goalsTotal).toBe(1);
+    expect(state.mergeStatus).toBe("pending");
+    expect(state.dependenciesMet).toBe(true);
+
+    // --- Verify queue contains the 3 waiting workflows ---
+    const queue = await readQueue(repo);
+    const pendingQueueItems = queue.items.filter(i => i.status === "pending");
+    expect(pendingQueueItems.length).toBe(3);
+    const queueTopics = pendingQueueItems.map(i => i.topic).sort();
+    expect(queueTopics).toEqual(["bmad-create-story", "bmad-dev-story", "bmad-sprint-planning"]);
+
+    // --- Verify registry ---
+    const registry = await readRegistry(repo);
+    expect(registry.workers["bmad-tech-spec"]).toBeDefined();
+    expect(registry.workers["bmad-tech-spec"].status).toBe("active");
+    expect(registry.workers["bmad-tech-spec"].role).toBe("researcher");
+    // Queued workers should NOT be in registry (not yet spawned)
+    expect(registry.workers["bmad-sprint-planning"]).toBeUndefined();
+
+    // --- Verify manager instructions ---
+    const mgrInstructions = await readFile(
+      join(repo, PI_AGENT_DIR, ".manager-instructions.md"),
+      "utf-8",
+    );
+    expect(mgrInstructions).toContain("BMAD Phase Management");
+    expect(mgrInstructions).toContain("TinyFix");
+    expect(mgrInstructions).toContain("Level 0");
+    expect(mgrInstructions).toContain("Dev-story fan-out");
+    expect(mgrInstructions).toContain("bmad-mode.json");
+
+    // --- Verify mailbox directories ---
+    const mailboxes = (await readdir(join(repo, MAILBOX_DIR))).sort();
+    expect(mailboxes).toContain("bmad-tech-spec");
+    expect(mailboxes).toContain("bmad-sprint-planning");
+    expect(mailboxes).toContain("bmad-create-story");
+    expect(mailboxes).toContain("bmad-dev-story");
+    expect(mailboxes).toContain("manager");
+    expect(mailboxes).toContain("parent");
+
+    // --- Verify manager was notified about queued items ---
+    const mgrMessages = await readMailbox(repo, "manager");
+    expect(mgrMessages.length).toBeGreaterThan(0);
+    const directiveMsg = mgrMessages.find(m => m.message.type === "directive");
+    expect(directiveMsg).toBeDefined();
+    expect(directiveMsg!.message.payload).toHaveProperty("text");
+
+    // --- Verify launch state persistence ---
+    const launchState: LaunchState = JSON.parse(
+      await readFile(join(repo, LAUNCH_STATE_FILE), "utf-8"),
+    );
+    expect(launchState.active).toBe(true);
+    expect(launchState.sessions["bmad-tech-spec"]).toBeDefined();
+    expect(launchState.sessions["bmad-tech-spec"].spawned).toBe(true);
+    expect(launchState.managerSpawned).toBe(true);
+
+    // Cleanup
+    try {
+      const entries = await readdir(wtDir);
+      for (const entry of entries) {
+        try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  });
+
+  it("L3 project with mixed completion: verifies correct partial DAG and parallel fan-out", async () => {
+    // L3 = complex integration project. Pre-complete Phase 1+2 and partially Phase 3.
+    // This simulates resuming mid-project.
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), [
+      'project_name: "EnterpriseApp"',
+      "project_type: web-app",
+      "project_level: 3",
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+      "  stories: docs/stories",
+      "  tests: tests",
+    ].join("\n"));
+
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), [
+      "workflow_status:",
+      // Phase 1 - all completed
+      "  - name: product-brief",
+      "    phase: 1",
+      '    status: "docs/product-brief-enterprise-2026.md"',
+      '    description: "Product brief"',
+      "  - name: brainstorm",
+      "    phase: 1",
+      '    status: "docs/brainstorm-enterprise-2026.md"',
+      '    description: "Brainstorm"',
+      "  - name: research",
+      "    phase: 1",
+      '    status: "docs/research-enterprise-2026.md"',
+      '    description: "Research"',
+      // Phase 2 - PRD completed, others still pending
+      "  - name: prd",
+      "    phase: 2",
+      '    status: "docs/prd-enterprise-2026.md"',
+      '    description: "PRD"',
+      "  - name: create-ux-design",
+      "    phase: 2",
+      '    status: "optional"',
+      '    description: "UX design"',
+      // Phase 3 - architecture not completed
+      "  - name: architecture",
+      "    phase: 3",
+      '    status: "required"',
+      '    description: "Architecture"',
+      "  - name: solutioning-gate-check",
+      "    phase: 3",
+      '    status: "optional"',
+      '    description: "Gate check"',
+      // Phase 4 - all pending
+      "  - name: sprint-planning",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Sprint planning"',
+      "  - name: create-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Create stories"',
+      "  - name: dev-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Develop story"',
+    ].join("\n"));
+    git("add . && git commit -m 'L3 project mid-progress'", repo);
+
+    const { mock, ctx } = freshBmadHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 3", ctx);
+
+    const modeRaw = await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8");
+    const mode = JSON.parse(modeRaw);
+    const wfNames = mode.workflows.map((w: any) => w.workflowName);
+
+    // Completed workflows should be excluded
+    expect(wfNames).not.toContain("product-brief");
+    expect(wfNames).not.toContain("brainstorm");
+    expect(wfNames).not.toContain("research");
+    expect(wfNames).not.toContain("prd");
+
+    // Remaining workflows should be present
+    expect(wfNames).toContain("create-ux-design");
+    expect(wfNames).toContain("architecture");
+    expect(wfNames).toContain("solutioning-gate-check");
+    expect(wfNames).toContain("sprint-planning");
+    expect(wfNames).toContain("create-story");
+    expect(wfNames).toContain("dev-story");
+
+    // --- Verify dependency correctness with partial completion ---
+    const byName = (n: string) => mode.workflows.find((w: any) => w.workflowName === n);
+
+    // create-ux-design depends on prd, but prd is already completed → no deps
+    expect(byName("create-ux-design").dependsOn).toEqual([]);
+
+    // architecture depends on prd (completed, filtered out) → no remaining deps
+    expect(byName("architecture").dependsOn).toEqual([]);
+
+    // solutioning-gate-check depends on architecture (still in plan)
+    expect(byName("solutioning-gate-check").dependsOn).toEqual(["bmad-architecture"]);
+
+    // sprint-planning depends on architecture (still in plan)
+    expect(byName("sprint-planning").dependsOn).toEqual(["bmad-architecture"]);
+
+    // --- With deps resolved, both create-ux-design and architecture should be ready ---
+    const activeWfs = mode.workflows.filter((w: any) => w.status === "active");
+    // create-ux-design has no deps, architecture has no deps → both ready
+    // With max-workers 3, we can spawn up to 3 ready workers
+    expect(activeWfs.length).toBeGreaterThanOrEqual(2);
+    const activeNames = activeWfs.map((w: any) => w.workflowName);
+    expect(activeNames).toContain("create-ux-design");
+    expect(activeNames).toContain("architecture");
+
+    // --- Verify each active worker has a worktree ---
+    const wtDir = join(repo, WORKTREE_DIR);
+    const worktrees = await readdir(wtDir);
+    for (const name of activeNames) {
+      expect(worktrees).toContain(`bmad-${name}`);
+    }
+
+    // --- Verify prompt files reference correct BMAD workflows ---
+    const archPrompt = await readFile(join(repo, PI_AGENT_DIR, ".prompts", "bmad-architecture.md"), "utf-8");
+    expect(archPrompt).toContain("System Architect");
+    expect(archPrompt).toContain("architecture");
+
+    const uxPrompt = await readFile(join(repo, PI_AGENT_DIR, ".prompts", "bmad-create-ux-design.md"), "utf-8");
+    expect(uxPrompt).toContain("UX Designer");
+
+    // --- Verify report message mentions active and queued ---
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "harness-bmad-started" }),
+      { triggerTurn: false },
+    );
+    const reportCall = mock.api.sendMessage.mock.calls.find(
+      (call: any) => call[0]?.customType === "harness-bmad-started"
+    );
+    expect(reportCall).toBeDefined();
+    const reportContent: string = reportCall[0].content;
+    expect(reportContent).toContain("EnterpriseApp");
+    expect(reportContent).toContain("Level 3");
+
+    // Cleanup
+    try {
+      const entries = await readdir(wtDir);
+      for (const entry of entries) {
+        try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  });
+
+  it("all-complete scenario: returns early without spawning anything", async () => {
+    // Project where every workflow is already completed
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), [
+      'project_name: "DoneProject"',
+      "project_type: api",
+      "project_level: 0",
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+    ].join("\n"));
+
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), [
+      "workflow_status:",
+      "  - name: tech-spec",
+      "    phase: 2",
+      '    status: "docs/tech-spec-done.md"',
+      '    description: "Tech spec"',
+      "  - name: sprint-planning",
+      "    phase: 4",
+      '    status: "docs/sprint-plan-done.md"',
+      '    description: "Sprint planning"',
+      "  - name: create-story",
+      "    phase: 4",
+      '    status: "docs/stories-done.md"',
+      '    description: "Create stories"',
+      "  - name: dev-story",
+      "    phase: 4",
+      '    status: "docs/dev-story-done.md"',
+      '    description: "Develop story"',
+    ].join("\n"));
+    git("add . && git commit -m 'all-complete project'", repo);
+
+    const { mock, ctx } = freshBmadHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("", ctx);
+
+    // Should notify all complete and NOT create .pi-agent/ artifacts
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("already complete"),
+      "info",
+    );
+    // No .bmad-mode.json should exist
+    let modeExists = true;
+    try { await readFile(join(repo, PI_AGENT_DIR, ".bmad-mode.json"), "utf-8"); } catch { modeExists = false; }
+    expect(modeExists).toBe(false);
+  });
+
+  it("verifies cross-level DAG consistency: L0 ⊂ L1 ⊂ L2", async () => {
+    // Run buildBmadWorkflowDag at all levels and verify subset relationships
+    const { WORKFLOW_DEFS: WF_DEFS } = await import("./bmad.js");
+    const dag0 = buildBmadWorkflowDag(0, [], WF_DEFS).map(s => s.workflowName);
+    const dag1 = buildBmadWorkflowDag(1, [], WF_DEFS).map(s => s.workflowName);
+    const dag2 = buildBmadWorkflowDag(2, [], WF_DEFS).map(s => s.workflowName);
+    const dag3 = buildBmadWorkflowDag(3, [], WF_DEFS).map(s => s.workflowName);
+
+    // L0 core workflows must appear in all higher levels
+    for (const wf of dag0) {
+      // L1 may use tech-spec instead of prd, so core chain should be present
+      if (wf === "sprint-planning" || wf === "create-story" || wf === "dev-story") {
+        expect(dag1).toContain(wf);
+        expect(dag2).toContain(wf);
+        expect(dag3).toContain(wf);
+      }
+    }
+
+    // L2+ must have prd and architecture (L0/L1 may not)
+    expect(dag2).toContain("prd");
+    expect(dag2).toContain("architecture");
+    expect(dag3).toContain("prd");
+    expect(dag3).toContain("architecture");
+
+    // L0 should NOT have product-brief, brainstorm, research, prd, architecture
+    expect(dag0).not.toContain("product-brief");
+    expect(dag0).not.toContain("brainstorm");
+    expect(dag0).not.toContain("prd");
+    expect(dag0).not.toContain("architecture");
+
+    // L1 adds product-brief but not prd
+    expect(dag1).toContain("product-brief");
+    expect(dag1).not.toContain("prd");
+
+    // Verify no duplicate entries at any level
+    expect(new Set(dag0).size).toBe(dag0.length);
+    expect(new Set(dag1).size).toBe(dag1.length);
+    expect(new Set(dag2).size).toBe(dag2.length);
+    expect(new Set(dag3).size).toBe(dag3.length);
+  });
+
+  it("refuses to launch when harness is already active", async () => {
+    // Write BMAD config
+    await mkdir(join(repo, "bmad"), { recursive: true });
+    await writeFile(join(repo, "bmad", "config.yaml"), [
+      "version: '6.0.0'",
+      "project_name: Test",
+      "project_type: web-app",
+      "project_level: 0",
+      "user_name: test",
+      "output_folder: docs",
+      "",
+      "bmm:",
+      '  workflow_status_file: "docs/bmm-workflow-status.yaml"',
+      '  sprint_status_file: "docs/sprint-status.yaml"',
+      "",
+      "paths:",
+      "  docs: docs",
+      "  stories: docs/stories",
+      "  tests: tests",
+    ].join("\n"));
+
+    // Write workflow status
+    await mkdir(join(repo, "docs"), { recursive: true });
+    await writeFile(join(repo, "docs", "bmm-workflow-status.yaml"), [
+      "workflow_status:",
+      "  - name: tech-spec",
+      "    phase: 2",
+      '    status: "required"',
+      '    description: "Tech spec"',
+      "",
+      "  - name: sprint-planning",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Sprint planning"',
+      "",
+      "  - name: create-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Create stories"',
+      "",
+      "  - name: dev-story",
+      "    phase: 4",
+      '    status: "required"',
+      '    description: "Develop story"',
+    ].join("\n"));
+    git("add . && git commit -m 'add L0 bmad config'", repo);
+
+    const { mock, ctx } = freshBmadHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // First launch should succeed
+    const bmadCmd = mock.getCommand("harness:bmad")!;
+    await bmadCmd.handler("--max-workers 1", ctx);
+
+    // Second launch should be blocked
+    await bmadCmd.handler("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("already active"),
+      "warning",
+    );
+
+    // Cleanup
+    try {
+      const wtDir = join(repo, WORKTREE_DIR);
+      const entries = await readdir(wtDir);
+      for (const entry of entries) {
+        try { git(`worktree remove ${join(wtDir, entry)} --force`, repo); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
   });
 });
