@@ -3,6 +3,11 @@
  * the resulting trace log for manual review.
  */
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+
+vi.mock("@mariozechner/pi-tui", () => ({
+  Text: class { constructor(public text: string, public x: number, public y: number) {} },
+}));
+
 import { mkdtemp, readFile, writeFile, mkdir, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";

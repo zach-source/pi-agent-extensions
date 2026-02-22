@@ -2,6 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
+
+// Mock @mariozechner/pi-tui (runtime-only Pi dependency)
+vi.mock("@mariozechner/pi-tui", () => ({
+  Text: class MockText {
+    constructor(public text: string, public x: number, public y: number) {}
+  },
+}));
+
 import {
   parseGoalFile,
   serializeGoalFile,
@@ -8587,5 +8595,265 @@ describe("/harness:trace command", () => {
 
     const content = await readFile(logPath, "utf-8");
     expect(content).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Custom tool rendering
+// ---------------------------------------------------------------------------
+
+describe("custom tool rendering", () => {
+  const mockTheme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+
+  beforeEach(() => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+  });
+
+  it("harness_status renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_status")!;
+    expect(tool.renderCall).toBeDefined();
+    expect(tool.renderResult).toBeDefined();
+    const call = tool.renderCall({}, mockTheme);
+    expect(call).toBeTruthy();
+    expect(call.text).toContain("status");
+
+    // With data
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "summary" }], details: { submodules: 2, totalGoals: 5, completedGoals: 3, totalQuestions: 1, unansweredQuestions: 1, loopActive: true } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res).toBeTruthy();
+    expect(res.text).toContain("3/5");
+
+    // isPartial
+    const partial = tool.renderResult(
+      { content: [], details: {} },
+      { expanded: false, isPartial: true },
+      mockTheme,
+    );
+    expect(partial.text).toContain("Loading");
+
+    // No active sessions
+    const empty = tool.renderResult(
+      { content: [{ type: "text", text: "none" }], details: {} },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(empty.text).toContain("No active");
+  });
+
+  it("harness_update_goal renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_update_goal")!;
+    expect(tool.renderCall).toBeDefined();
+    const call = tool.renderCall({ action: "add", submodule: "api", goal: "Add auth endpoint" }, mockTheme);
+    expect(call.text).toContain("add");
+    expect(call.text).toContain("api");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { goals: [{ completed: true }, { completed: false }] } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("1/2");
+
+    // No goals in details (error case)
+    const err = tool.renderResult(
+      { content: [{ type: "text", text: "Not found" }], details: {} },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(err.text).toContain("Not found");
+  });
+
+  it("harness_add_task renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_add_task")!;
+    const call = tool.renderCall({ name: "auth-refactor", goals: ["g1", "g2"], role: "architect" }, mockTheme);
+    expect(call.text).toContain("auth-refactor");
+    expect(call.text).toContain("2 goal(s)");
+    expect(call.text).toContain("architect");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { name: "auth-refactor" } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("auth-refactor");
+  });
+
+  it("harness_ask renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_ask")!;
+    const call = tool.renderCall({ submodule: "api", question: "Which auth provider should we use?" }, mockTheme);
+    expect(call.text).toContain("api");
+    expect(call.text).toContain("Which auth");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "staged" }], details: { unanswered: 3 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("3 unanswered");
+  });
+
+  it("harness_answer renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_answer")!;
+    const call = tool.renderCall({ submodule: "api", question: "Auth provider?", answer: "OAuth2" }, mockTheme);
+    expect(call.text).toContain("api");
+    expect(call.text).toContain("Auth provider?");
+    expect(call.text).toContain("OAuth2");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "answered" }], details: { remaining: 0 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("0 remaining");
+  });
+
+  it("harness_queue renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_queue")!;
+    const call = tool.renderCall({ topic: "refactor-auth", role: "architect", priority: 5 }, mockTheme);
+    expect(call.text).toContain("refactor-auth");
+    expect(call.text).toContain("architect");
+    expect(call.text).toContain("p=5");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "queued" }], details: { queueLength: 3 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("Queued");
+    expect(res.text).toContain("3 pending");
+  });
+
+  it("harness_send renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_send")!;
+    const call = tool.renderCall({ to: "manager", type: "directive" }, mockTheme);
+    expect(call.text).toContain("manager");
+    expect(call.text).toContain("directive");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "sent" }], details: { to: "manager", type: "directive" } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("Sent to manager");
+  });
+
+  it("harness_inbox renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_inbox")!;
+    const call = tool.renderCall({}, mockTheme);
+    expect(call.text).toContain("inbox");
+
+    // Empty inbox
+    const empty = tool.renderResult(
+      { content: [{ type: "text", text: "none" }], details: { count: 0 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(empty.text).toContain("Empty inbox");
+
+    // With messages, expanded
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "msgs" }], details: { count: 2, messages: [{ type: "directive", from: "worker-a" }, { type: "status_report", from: "worker-b" }] } },
+      { expanded: true, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("2 message(s)");
+    expect(res.text).toContain("worker-a");
+  });
+
+  it("harness_remember renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_remember")!;
+    const call = tool.renderCall({ category: "decision", content: "Use OAuth2 for authentication" }, mockTheme);
+    expect(call.text).toContain("decision");
+    expect(call.text).toContain("Use OAuth2");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { id: "abc123" } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("Stored");
+    expect(res.text).toContain("abc123");
+  });
+
+  it("harness_recall renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_recall")!;
+    const call = tool.renderCall({ query: "auth patterns", limit: 5 }, mockTheme);
+    expect(call.text).toContain("auth patterns");
+    expect(call.text).toContain("limit 5");
+
+    // No matches
+    const empty = tool.renderResult(
+      { content: [{ type: "text", text: "none" }], details: { count: 0 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(empty.text).toContain("No matches");
+
+    // With memories, expanded
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { count: 2, memories: [{ category: "decision", content: "Use OAuth" }, { category: "pattern", content: "Repository pattern" }] } },
+      { expanded: true, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("2 memories");
+    expect(res.text).toContain("Use OAuth");
+  });
+
+  it("harness_send_message renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_send_message")!;
+    const call = tool.renderCall({ to: "worker-a", message: "Please review the PR", type: "directive" }, mockTheme);
+    expect(call.text).toContain("worker-a");
+    expect(call.text).toContain("directive");
+    expect(call.text).toContain("Please review");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { to: "worker-a" } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("Sent to worker-a");
+  });
+
+  it("harness_read_messages renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_read_messages")!;
+    const call = tool.renderCall({ actor: "worker-b", limit: 10 }, mockTheme);
+    expect(call.text).toContain("worker-b");
+    expect(call.text).toContain("limit 10");
+
+    // Default actor
+    const callDefault = tool.renderCall({}, mockTheme);
+    expect(callDefault.text).toContain("parent");
+
+    // No messages
+    const empty = tool.renderResult(
+      { content: [{ type: "text", text: "none" }], details: { count: 0 } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(empty.text).toContain("No messages");
+  });
+
+  it("harness_rate_template renderCall/renderResult", () => {
+    const tool = mock.getTool("harness_rate_template")!;
+    const call = tool.renderCall({ rating: 4, role: "developer" }, mockTheme);
+    expect(call.text).toContain("\u2605\u2605\u2605\u2605\u2606");
+    expect(call.text).toContain("developer");
+
+    const res = tool.renderResult(
+      { content: [{ type: "text", text: "ok" }], details: { rating: 4, role: "developer" } },
+      { expanded: false, isPartial: false },
+      mockTheme,
+    );
+    expect(res.text).toContain("\u2605\u2605\u2605\u2605\u2606");
+    expect(res.text).toContain("developer");
   });
 });

@@ -20,6 +20,11 @@ import {
   beforeEach,
   afterAll,
 } from "vitest";
+
+vi.mock("@mariozechner/pi-tui", () => ({
+  Text: class { constructor(public text: string, public x: number, public y: number) {} },
+}));
+
 import {
   mkdtemp,
   readFile,

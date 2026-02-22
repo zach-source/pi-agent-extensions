@@ -43,6 +43,7 @@
  *   session_shutdown   - Persist state
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { readFile, writeFile, appendFile, readdir, mkdir, rm, rename, stat, copyFile } from "fs/promises";
@@ -4373,6 +4374,24 @@ export default function (pi: ExtensionAPI) {
       "Returns per-submodule goal completion status.",
     parameters: Type.Object({}),
 
+    renderCall(_args: Record<string, never>, theme: any) {
+      return new Text(theme.fg("toolTitle", theme.bold("harness ")) + theme.fg("accent", "status"), 0, 0);
+    },
+    renderResult(result: any, { expanded, isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Loading status..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      if (!d.totalGoals) return new Text(theme.fg("muted", "No active sessions"), 0, 0);
+      let text = theme.fg("success", `${d.completedGoals}/${d.totalGoals} goals`);
+      text += theme.fg("dim", ` across ${d.submodules} worker(s)`);
+      if ((d.unansweredQuestions as number) > 0) {
+        text += theme.fg("warning", ` [${d.unansweredQuestions} ?]`);
+      }
+      if (expanded) {
+        text += "\n" + (result.content[0] as { text: string })?.text;
+      }
+      return new Text(text, 0, 0);
+    },
+
     async execute() {
       const configs = await readGoalFiles();
       if (configs.length === 0) {
@@ -4417,6 +4436,21 @@ export default function (pi: ExtensionAPI) {
       "Add, complete, or remove a goal for a submodule. " +
       "Updates the .pi-agent/<submodule>.md goal file.",
     parameters: UpdateGoalParams,
+
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("goal "));
+      text += theme.fg("accent", args.action);
+      text += theme.fg("dim", ` ${args.submodule}: "${args.goal.slice(0, 60)}"`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Updating..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      const goals = d.goals as Array<{ completed: boolean }> | undefined;
+      if (!goals) return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+      const done = goals.filter(g => g.completed).length;
+      return new Text(theme.fg("success", `${done}/${goals.length} complete`), 0, 0);
+    },
 
     async execute(_toolCallId, params: UpdateGoalInput) {
       const configs = await readGoalFiles();
@@ -4544,6 +4578,20 @@ export default function (pi: ExtensionAPI) {
       "goal file that can be launched with /harness:launch.",
     parameters: AddTaskParams,
 
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("task+ "));
+      text += theme.fg("accent", args.name);
+      text += theme.fg("dim", ` (${args.goals.length} goal(s))`);
+      if (args.role) text += theme.fg("muted", ` [${args.role}]`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Creating..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      if (!d.name) return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+      return new Text(theme.fg("success", `Created "${d.name}"`) + theme.fg("dim", ` at .pi-agent/${d.name}.md`), 0, 0);
+    },
+
     async execute(_toolCallId, params: AddTaskInput) {
       const name = params.name.trim();
       if (!name || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name)) {
@@ -4626,6 +4674,21 @@ export default function (pi: ExtensionAPI) {
       "Workers waiting on answers are not considered stalled.",
     parameters: AskParams,
 
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("? "));
+      text += theme.fg("accent", args.submodule);
+      text += theme.fg("dim", ` "${args.question.slice(0, 60)}"`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Staging..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      if (typeof d.unanswered === "number") {
+        return new Text(theme.fg("warning", `${d.unanswered} unanswered`), 0, 0);
+      }
+      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+    },
+
     async execute(_toolCallId, params: AskInput) {
       const configs = await readGoalFiles();
       const config = configs.find(
@@ -4686,6 +4749,22 @@ export default function (pi: ExtensionAPI) {
       "Answer a staged question in a submodule's goal file. " +
       "Fuzzy-matches the question text against unanswered questions.",
     parameters: AnswerParams,
+
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("! "));
+      text += theme.fg("accent", args.submodule);
+      text += theme.fg("dim", ` "${args.question.slice(0, 40)}" → "${args.answer.slice(0, 40)}"`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Answering..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      if (typeof d.remaining === "number") {
+        const color = d.remaining === 0 ? "success" : "warning";
+        return new Text(theme.fg(color, `${d.remaining} remaining`), 0, 0);
+      }
+      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+    },
 
     async execute(_toolCallId, params: AnswerInput) {
       const configs = await readGoalFiles();
@@ -4777,6 +4856,22 @@ export default function (pi: ExtensionAPI) {
       "to workers based on role and capacity.",
     parameters: QueueToolParams,
 
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("queue+ "));
+      text += theme.fg("accent", args.topic);
+      if (args.role) text += theme.fg("muted", ` [${args.role}]`);
+      if (args.priority && args.priority !== 10) text += theme.fg("dim", ` p=${args.priority}`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Queuing..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      if (d.queueLength) {
+        return new Text(theme.fg("success", "Queued") + theme.fg("dim", ` (${d.queueLength} pending)`), 0, 0);
+      }
+      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+    },
+
     async execute(_toolCallId, params: QueueToolInput) {
       if (!loopActive) {
         return {
@@ -4828,6 +4923,18 @@ export default function (pi: ExtensionAPI) {
       "Send a message to an actor's mailbox (parent, manager, or worker name).",
     parameters: SendToolParams,
 
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("→ "));
+      text += theme.fg("accent", args.to);
+      text += theme.fg("dim", ` [${args.type}]`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Sending..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      return new Text(theme.fg("success", `Sent to ${d.to}`) + theme.fg("dim", ` [${d.type}]`), 0, 0);
+    },
+
     async execute(_toolCallId, params: SendToolInput) {
       const id = await sendMailboxMessage(
         cwd,
@@ -4855,6 +4962,26 @@ export default function (pi: ExtensionAPI) {
     description:
       "Read all messages in the parent's mailbox. Messages are deleted after reading.",
     parameters: Type.Object({}),
+
+    renderCall(_args: Record<string, never>, theme: any) {
+      return new Text(theme.fg("toolTitle", theme.bold("inbox")), 0, 0);
+    },
+    renderResult(result: any, { expanded, isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Reading inbox..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      const count = (d.count as number) ?? 0;
+      if (count === 0) return new Text(theme.fg("muted", "Empty inbox"), 0, 0);
+      let text = theme.fg("success", `${count} message(s)`);
+      if (expanded) {
+        const msgs = d.messages as Array<{ type: string; from: string }> | undefined;
+        if (msgs) {
+          for (const m of msgs.slice(0, 20)) {
+            text += "\n" + theme.fg("dim", `  [${m.type}] from ${m.from}`);
+          }
+        }
+      }
+      return new Text(text, 0, 0);
+    },
 
     async execute() {
       const messages = await readMailbox(cwd, "parent");
@@ -4903,6 +5030,17 @@ export default function (pi: ExtensionAPI) {
       ),
       tags: Type.Array(Type.String(), { description: "Tags for searchability" }),
     }),
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("remember "));
+      text += theme.fg("accent", `[${args.category}]`);
+      text += theme.fg("dim", ` "${args.content.slice(0, 50)}"`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Remembering..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      return new Text(theme.fg("success", "Stored") + theme.fg("dim", ` (id: ${d.id})`), 0, 0);
+    },
     async execute(_toolCallId, params: { content: string; category: HarnessMemory["category"]; tags: string[] }) {
       const memory = await addMemory("parent", params.category, params.content, params.tags);
       return {
@@ -4921,6 +5059,28 @@ export default function (pi: ExtensionAPI) {
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }),
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("recall "));
+      text += theme.fg("accent", `"${args.query}"`);
+      if (args.limit) text += theme.fg("dim", ` (limit ${args.limit})`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { expanded, isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Searching..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      const count = (d.count as number) ?? 0;
+      if (count === 0) return new Text(theme.fg("muted", "No matches"), 0, 0);
+      let text = theme.fg("success", `${count} memor${count === 1 ? "y" : "ies"}`);
+      if (expanded) {
+        const memories = d.memories as Array<{ category: string; content: string }> | undefined;
+        if (memories) {
+          for (const m of memories.slice(0, 10)) {
+            text += "\n" + theme.fg("dim", `  [${m.category}] ${m.content.slice(0, 80)}`);
+          }
+        }
+      }
+      return new Text(text, 0, 0);
+    },
     async execute(_toolCallId, params: { query: string; limit?: number }) {
       const store = await readMemoryStore();
       const results = searchMemories(store.memories, params.query, params.limit ?? 10);
@@ -4958,6 +5118,18 @@ export default function (pi: ExtensionAPI) {
         ),
       ),
     }),
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("→ "));
+      text += theme.fg("accent", args.to);
+      if (args.type) text += theme.fg("dim", ` [${args.type}]`);
+      text += theme.fg("muted", ` "${args.message.slice(0, 50)}"`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Sending..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      return new Text(theme.fg("success", `Sent to ${d.to}`), 0, 0);
+    },
     async execute(_toolCallId, params: { to: string; message: string; type?: MailboxMessage["type"] }) {
       // Validate target exists
       const validTargets = new Set([...sessions.keys(), "manager", "parent"]);
@@ -4985,6 +5157,23 @@ export default function (pi: ExtensionAPI) {
       actor: Type.Optional(Type.String({ description: "Actor name (default: parent)" })),
       limit: Type.Optional(Type.Number({ description: "Max messages to read (default: all)" })),
     }),
+    renderCall(args: any, theme: any) {
+      let text = theme.fg("toolTitle", theme.bold("messages "));
+      text += theme.fg("accent", args.actor ?? "parent");
+      if (args.limit) text += theme.fg("dim", ` (limit ${args.limit})`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { expanded, isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      const count = (d.count as number) ?? 0;
+      if (count === 0) return new Text(theme.fg("muted", "No messages"), 0, 0);
+      let text = theme.fg("success", `${count} message(s)`);
+      if (expanded) {
+        text += "\n" + (result.content[0] as { text: string })?.text;
+      }
+      return new Text(text, 0, 0);
+    },
     async execute(_toolCallId, params: { actor?: string; limit?: number }) {
       const actor = params.actor ?? "parent";
       const messages = await readMailbox(cwd, actor);
@@ -5024,6 +5213,21 @@ export default function (pi: ExtensionAPI) {
       role: Type.Optional(Type.String({ description: "Your role (e.g. developer, architect, analyst)" })),
       taskName: Type.Optional(Type.String({ description: "Your task/worker name (e.g. bmad-tech-spec)" })),
     }),
+    renderCall(args: any, theme: any) {
+      const r = Math.max(1, Math.min(5, args.rating));
+      const stars = "\u2605".repeat(r) + "\u2606".repeat(5 - r);
+      let text = theme.fg("toolTitle", theme.bold("rate "));
+      text += theme.fg("accent", stars);
+      if (args.role) text += theme.fg("dim", ` [${args.role}]`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "Rating..."), 0, 0);
+      const d = result.details as Record<string, unknown>;
+      const rating = d.rating as number;
+      const stars = "\u2605".repeat(rating) + "\u2606".repeat(5 - rating);
+      return new Text(theme.fg("success", stars) + theme.fg("dim", ` for ${d.role}`), 0, 0);
+    },
     async execute(_toolCallId, params: { rating: number; feedback: string; adjustments: string[]; role?: string; taskName?: string }) {
       const store = await readTemplateStore();
       store.ratings.push({

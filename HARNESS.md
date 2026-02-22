@@ -711,6 +711,26 @@ The harness automatically writes structured NDJSON trace entries to `.pi-agent/.
 
 The log auto-rotates at 5000 lines (keeping the most recent 3000).
 
+## Custom Tool Rendering
+
+All harness tools have compact terminal rendering via `renderCall`/`renderResult`. The collapsed view shows a one-line summary; press `ctrl+e` to expand and see full details.
+
+| Tool | Collapsed | Expanded |
+|------|-----------|----------|
+| `harness_status` | `3/5 goals across 2 worker(s)` | Full progress summary |
+| `harness_update_goal` | `1/2 complete` | — |
+| `harness_add_task` | `Created "auth-refactor"` | — |
+| `harness_ask` | `3 unanswered` | — |
+| `harness_answer` | `0 remaining` | — |
+| `harness_queue` | `Queued (3 pending)` | — |
+| `harness_send` | `Sent to manager [directive]` | — |
+| `harness_inbox` | `2 message(s)` | Per-message type/sender |
+| `harness_remember` | `Stored (id: abc)` | — |
+| `harness_recall` | `3 memories` | Per-memory category/content |
+| `harness_send_message` | `Sent to worker-a` | — |
+| `harness_read_messages` | `5 message(s)` | Full message content |
+| `harness_rate_template` | `★★★★☆ for developer` | — |
+
 ## Tips
 
 - **Start small**: Launch 2-3 workers first to understand the flow

@@ -9,6 +9,7 @@ Extensions for the [Pi coding agent](https://github.com/badlogic/pi-mono/tree/ma
 - **bmad.ts** - BMAD Method (Breakthrough Method for Agile AI-Driven Development) with 4 phases, 13 workflow commands, and 4 LLM-callable tools
 - **graphiti.ts** - Graphiti temporal knowledge graph integration (search, add memories, status)
 - **heartbeat.ts** - Periodic task runner that reads `heartbeat.md` and wakes the agent to work through tasks
+- **submodule-launcher.ts** - Multi-agent harness orchestration with git worktrees, tmux workers, manager agent, BMAD integration, autonomous mode, and 10 advanced features (model routing, memory persistence, heartbeat config, auto-recovery, inter-agent comms, self-improving templates, cron scheduling, Docker sandboxing, webhook triggers, web dashboard). See [HARNESS.md](HARNESS.md)
 
 ### Workflow
 
