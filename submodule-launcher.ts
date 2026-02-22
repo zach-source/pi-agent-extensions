@@ -32,6 +32,7 @@
  *   /harness:stop      - Write stop signal, deactivate loop
  *   /harness:init      - Discover submodules, scaffold .pi-agent/
  *   /harness:add       - Create a standalone worktree task (supports --role flag)
+ *   /harness:discover  - Interactive repo assessment & multi-task creation
  *   /harness:merge     - Merge a specific submodule's worktree branch back
  *   /harness:recover   - Respawn stale/dead manager
  *   /harness:cleanup   - Remove all worktrees, branches, and state files
@@ -55,6 +56,7 @@ import {
   buildContextBlock as bmadContextBlock,
   buildToolsBlock as bmadToolsBlock,
   buildCompletionBlock as bmadCompletionBlock,
+  getTemplate as getBmadTemplate,
   type BmadConfig,
   type WorkflowEntry,
 } from "./bmad.js";
@@ -81,6 +83,17 @@ export interface SubmoduleConfig {
   context: string;
   rawContent: string;
   dependsOn?: string[];
+}
+
+export interface RepoSnapshot {
+  fileTree: string;
+  languages: string[];
+  frameworks: string[];
+  recentCommits: string[];
+  existingTasks: string[];
+  todoCount: number;
+  testFramework: string | null;
+  branchName: string;
 }
 
 export interface HarnessRole {
@@ -201,6 +214,57 @@ export const HARNESS_ROLES: HarnessRole[] = [
 
 export function getRole(name: string): HarnessRole {
   return HARNESS_ROLES.find((r) => r.name === name) ?? HARNESS_ROLES[0];
+}
+
+// --- Role-Based Tool Policies ---
+
+export interface ToolPolicy {
+  role: string;
+  mode: "full" | "read-only" | "targeted-write";
+  instructions: string;
+}
+
+export const ROLE_TOOL_POLICIES: ToolPolicy[] = [
+  {
+    role: "researcher",
+    mode: "read-only",
+    instructions:
+      "You have READ-ONLY access. Do NOT create, modify, or delete any files. " +
+      "Use Read, Glob, Grep, and web tools only. Write findings to your goal file and mailbox messages only.",
+  },
+  {
+    role: "reviewer",
+    mode: "targeted-write",
+    instructions:
+      "You have TARGETED-WRITE access. You may make targeted fixes for specific issues you identify, " +
+      "but do NOT refactor, reorganize, or make sweeping changes. Each edit must address a specific finding.",
+  },
+  {
+    role: "analyst",
+    mode: "read-only",
+    instructions:
+      "You have READ-ONLY access. Do NOT create, modify, or delete source files. " +
+      "Use Read, Glob, Grep, and BMAD document tools (bmad_save_document, bmad_update_status) only.",
+  },
+  {
+    role: "planner",
+    mode: "read-only",
+    instructions:
+      "You have READ-ONLY access. Do NOT create, modify, or delete source files. " +
+      "Use Read, Glob, Grep, and BMAD planning tools (bmad_save_document, bmad_update_status) only.",
+  },
+  {
+    role: "architect",
+    mode: "targeted-write",
+    instructions:
+      "You have TARGETED-WRITE access for structural changes only. You may refactor interfaces, " +
+      "module boundaries, and code organization. Do NOT implement features or business logic.",
+  },
+];
+
+/** Get the tool policy for a role, or null for full-access roles. */
+export function getToolPolicy(roleName: string): ToolPolicy | null {
+  return ROLE_TOOL_POLICIES.find((p) => p.role === roleName) ?? null;
 }
 
 /** Maps BMAD agent names to harness role names. */
@@ -451,11 +515,75 @@ export const MAX_CONSECUTIVE_FAILURES = 5;
 export const WORKER_STALL_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 export const RECOVERY_BACKOFF = [2, 4, 8]; // stale cycles required for each recovery attempt
 
+// --- Feature 1: Multi-Model Worker Routing ---
+export const MODEL_ROUTES_FILE = ".pi-agent/.model-routes.json";
+export const DEFAULT_MODEL_ROUTES: ModelRoute[] = [
+  { model: "default", roles: ["developer", "builder", "tester", "designer"] },
+  { model: "claude-opus-4-6", roles: ["architect", "analyst", "researcher"] },
+];
+
+// --- Feature 2: Memory/Context Persistence ---
+export const MEMORY_FILE = ".pi-agent/.memory.json";
+export const MAX_MEMORIES = 200;
+
+// --- Feature 3: Heartbeat-Driven Proactive Manager ---
+export const HEARTBEAT_CONFIG_FILE = ".pi-agent/.heartbeat-config.json";
+export const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
+  intervalMs: 60_000,
+  stalledThresholdMs: 300_000,
+  activeHoursOnly: false,
+  activeHoursStart: 9,
+  activeHoursEnd: 17,
+};
+
+// --- Feature 4: Worker Health Monitoring & Auto-Recovery ---
+export const MAX_WORKER_RECOVERIES = 3;
+export const WORKER_RECOVERY_COOLDOWN_MS = 30_000;
+
+// --- Feature 6: Self-Improving Worker Templates ---
+export const TEMPLATE_STORE_FILE = ".pi-agent/.template-store.json";
+
+// --- Feature 7: Cron-Scheduled Autonomous Runs ---
+export const SCHEDULE_FILE = ".pi-agent/.schedule.json";
+
+// --- Feature 8: Sandboxed Worker Execution ---
+export const SANDBOX_CONFIG_FILE = ".pi-agent/.sandbox.json";
+export const DEFAULT_SANDBOX_IMAGE = "node:20-slim";
+
+// --- Feature 9: Webhook/Event Triggers ---
+export const TRIGGERS_DIR = ".pi-agent/.triggers";
+
 // --- Auto Mode Types & Constants ---
 
 export const AUTO_MODE_FILE = ".pi-agent/.auto-mode.json";
 export const SCOUT_ANALYSIS_FILE = ".pi-agent/.scout-analysis.json";
 export const SCOUT_REPORT_FILE = ".pi-agent/.scout-report.md";
+
+// --- Live Config Reload ---
+export const HARNESS_CONFIG_FILE = ".pi-agent/.harness-config.json";
+
+export interface HarnessRuntimeConfig {
+  maxWorkers?: number;   // 1-50, default: Infinity (no limit)
+  staggerMs?: number;    // 0-60000, default: 5000
+}
+
+export function validateRuntimeConfig(raw: unknown): HarnessRuntimeConfig | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const result: HarnessRuntimeConfig = {};
+
+  if ("maxWorkers" in obj) {
+    const v = obj.maxWorkers;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 50) return null;
+    result.maxWorkers = v;
+  }
+  if ("staggerMs" in obj) {
+    const v = obj.staggerMs;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 60000) return null;
+    result.staggerMs = v;
+  }
+  return result;
+}
 
 export type ScoutCategory = "tests" | "quality" | "features" | "docs" | "security" | "performance" | "cleanup" | "bugs";
 
@@ -516,6 +644,93 @@ export interface WorkerState {
   mergeStatus: "pending" | "merged" | "conflict" | null;
   dependsOn: string[];
   dependenciesMet: boolean;
+  recoveryAttempts?: number;
+  maxRecoveries?: number;
+  lastRecoveryAt?: string;
+}
+
+// --- Feature 1: Multi-Model Worker Routing ---
+
+export interface ModelRoute {
+  model: string;
+  roles?: string[];
+  taskPattern?: string;
+}
+
+// --- Feature 2: Memory/Context Persistence ---
+
+export interface HarnessMemory {
+  id: string;
+  timestamp: string;
+  source: string;
+  category: "decision" | "pattern" | "error" | "insight";
+  content: string;
+  tags: string[];
+  relevance: number;
+}
+
+export interface MemoryStore {
+  version: 1;
+  memories: HarnessMemory[];
+}
+
+// --- Feature 3: Heartbeat-Driven Proactive Manager ---
+
+export interface HeartbeatConfig {
+  intervalMs: number;
+  stalledThresholdMs: number;
+  activeHoursOnly: boolean;
+  activeHoursStart: number;
+  activeHoursEnd: number;
+}
+
+// --- Feature 6: Self-Improving Worker Templates ---
+
+export interface TemplateRating {
+  role: string;
+  taskName: string;
+  rating: number;
+  feedback: string;
+  timestamp: string;
+  adjustments: string[];
+}
+
+export interface TemplateStore {
+  version: 1;
+  ratings: TemplateRating[];
+  roleOverrides: Record<string, string[]>;
+}
+
+// --- Feature 7: Cron-Scheduled Autonomous Runs ---
+
+export interface ScheduledRun {
+  id: string;
+  cron: string;
+  objective?: string;
+  focus?: ScoutCategory[];
+  maxWorkers: number;
+  maxIterations: number;
+  enabled: boolean;
+  lastRunAt?: string;
+}
+
+// --- Feature 8: Sandboxed Worker Execution ---
+
+export interface SandboxConfig {
+  enabled: boolean;
+  image: string;
+  mountPaths: string[];
+  networkMode: string;
+  memoryLimit: string;
+}
+
+// --- Feature 9: Webhook/Event Triggers ---
+
+export interface TriggerEvent {
+  id: string;
+  type: "launch" | "auto" | "queue";
+  config: Record<string, unknown>;
+  createdAt: string;
 }
 
 // --- Validation Schemas (Typebox) ---
@@ -588,6 +803,7 @@ export interface MailboxMessage {
     | "ack";
   timestamp: string;
   payload: Record<string, unknown>;
+  system?: boolean;
 }
 
 export interface QueueItem {
@@ -769,6 +985,7 @@ export async function sendMailboxMessage(
   from: string,
   type: MailboxMessage["type"],
   payload: Record<string, unknown>,
+  options?: { system?: boolean },
 ): Promise<string> {
   const id = generateMessageId();
   const msg: MailboxMessage = {
@@ -779,6 +996,7 @@ export async function sendMailboxMessage(
     timestamp: new Date().toISOString(),
     payload,
   };
+  if (options?.system) msg.system = true;
   const dir = mailboxPath(baseCwd, to);
   await mkdir(dir, { recursive: true });
   const filename = `${id}.json`;
@@ -1295,6 +1513,113 @@ export function buildPlanFromAnalysis(
   return { configs, ready, queued };
 }
 
+/**
+ * Gather a lightweight snapshot of a repository for interactive discovery.
+ * Pure async function — read-only, no side effects.
+ */
+export async function buildRepoSnapshot(
+  baseCwd: string,
+  pi: { exec: (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<{ stdout: string; stderr: string; exitCode: number }> },
+): Promise<RepoSnapshot> {
+  // File tree — top 2 levels (excluding node_modules, .git, etc.)
+  let fileTree = "";
+  try {
+    const result = await pi.exec("find", [
+      ".", "-maxdepth", "2",
+      "-not", "-path", "*/node_modules/*",
+      "-not", "-path", "*/.git/*",
+      "-not", "-path", "*/dist/*",
+      "-not", "-path", "*/.pi-agent/worktrees/*",
+    ], { cwd: baseCwd });
+    fileTree = result.stdout.trim();
+  } catch { /* no find */ }
+
+  // Languages & frameworks from manifest files
+  const languages: string[] = [];
+  const frameworks: string[] = [];
+  let testFramework: string | null = null;
+
+  const manifestChecks: Array<{ file: string; lang: string; parse: (content: string) => void }> = [
+    {
+      file: "package.json", lang: "TypeScript/JavaScript",
+      parse: (content: string) => {
+        try {
+          const pkg = JSON.parse(content);
+          const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+          if (allDeps.react) frameworks.push("react");
+          if (allDeps.next) frameworks.push("next");
+          if (allDeps.express) frameworks.push("express");
+          if (allDeps.vue) frameworks.push("vue");
+          if (allDeps.svelte) frameworks.push("svelte");
+          if (allDeps.vitest) { frameworks.push("vitest"); testFramework = "vitest"; }
+          if (allDeps.jest) { frameworks.push("jest"); testFramework = testFramework ?? "jest"; }
+          if (allDeps.mocha) { frameworks.push("mocha"); testFramework = testFramework ?? "mocha"; }
+          if (allDeps.typescript) languages.push("TypeScript");
+        } catch { /* malformed JSON */ }
+      },
+    },
+    { file: "go.mod", lang: "Go", parse: () => { testFramework = testFramework ?? "go test"; } },
+    { file: "Cargo.toml", lang: "Rust", parse: () => { testFramework = testFramework ?? "cargo test"; } },
+    { file: "pyproject.toml", lang: "Python", parse: (c) => { if (c.includes("pytest")) { frameworks.push("pytest"); testFramework = testFramework ?? "pytest"; } } },
+    { file: "requirements.txt", lang: "Python", parse: (c) => { if (c.includes("pytest")) { frameworks.push("pytest"); testFramework = testFramework ?? "pytest"; } } },
+    { file: "Gemfile", lang: "Ruby", parse: (c) => { if (c.includes("rspec")) { frameworks.push("rspec"); testFramework = testFramework ?? "rspec"; } } },
+  ];
+
+  for (const check of manifestChecks) {
+    try {
+      const content = await readFile(join(baseCwd, check.file), "utf-8");
+      if (!languages.includes(check.lang)) languages.push(check.lang);
+      check.parse(content);
+    } catch { /* file doesn't exist */ }
+  }
+
+  // Recent git commits
+  let recentCommits: string[] = [];
+  try {
+    const result = await pi.exec("git", ["log", "--oneline", "-15"], { cwd: baseCwd });
+    recentCommits = result.stdout.trim().split("\n").filter(Boolean);
+  } catch { /* not a git repo */ }
+
+  // Branch name
+  let branchName = "unknown";
+  try {
+    const result = await pi.exec("git", ["branch", "--show-current"], { cwd: baseCwd });
+    branchName = result.stdout.trim() || "HEAD (detached)";
+  } catch { /* not a git repo */ }
+
+  // Existing harness tasks
+  const existingTasks: string[] = [];
+  try {
+    const files = await readdir(join(baseCwd, PI_AGENT_DIR));
+    for (const file of files) {
+      if (file.endsWith(".md") && !file.startsWith(".")) {
+        existingTasks.push(file.replace(/\.md$/, ""));
+      }
+    }
+  } catch { /* directory doesn't exist */ }
+
+  // TODO/FIXME/HACK count
+  let todoCount = 0;
+  try {
+    const result = await pi.exec("grep", ["-r", "-c", "-E", "TODO|FIXME|HACK", "--include=*.ts", "--include=*.js", "--include=*.py", "--include=*.go", "--include=*.rs", "--include=*.rb", "."], { cwd: baseCwd });
+    for (const line of result.stdout.trim().split("\n")) {
+      const match = line.match(/:(\d+)$/);
+      if (match) todoCount += parseInt(match[1], 10);
+    }
+  } catch { /* grep returns non-zero if no matches */ }
+
+  return {
+    fileTree,
+    languages,
+    frameworks,
+    recentCommits,
+    existingTasks,
+    todoCount,
+    testFramework,
+    branchName,
+  };
+}
+
 /** Build static manager instructions (written once at launch). */
 export interface BmadModeConfig {
   projectLevel: number;
@@ -1532,6 +1857,196 @@ export async function readManagerStatus(
   }
 }
 
+// --- Feature 1: Multi-Model Worker Routing (Pure Function) ---
+
+/** Resolve which model a worker should use based on route config. */
+export function resolveModelForWorker(
+  routes: ModelRoute[],
+  role: string,
+  taskName: string,
+): string | null {
+  // First pass: match by taskPattern (regex)
+  for (const route of routes) {
+    if (route.taskPattern) {
+      try {
+        if (new RegExp(route.taskPattern).test(taskName)) {
+          return route.model === "default" ? null : route.model;
+        }
+      } catch {
+        // Invalid regex — skip
+      }
+    }
+  }
+  // Second pass: match by role
+  for (const route of routes) {
+    if (route.roles && route.roles.includes(role)) {
+      return route.model === "default" ? null : route.model;
+    }
+  }
+  return null;
+}
+
+// --- Feature 2: Memory/Context Persistence (Pure Functions) ---
+
+/** Tokenize text into lowercase terms, splitting on whitespace and punctuation. */
+export function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[\s\-_.,;:!?()[\]{}"'`/\\|@#$%^&*+=<>~]+/)
+    .filter((t) => t.length > 0);
+}
+
+/** Compute BM25 scores for a set of documents against query terms. */
+export function computeBM25(
+  queryTerms: string[],
+  documents: string[][],
+): number[] {
+  const k1 = 1.2;
+  const b = 0.75;
+  const N = documents.length;
+  if (N === 0 || queryTerms.length === 0) return documents.map(() => 0);
+
+  const avgdl = documents.reduce((sum, d) => sum + d.length, 0) / N;
+
+  // Document frequency for each query term
+  const df = new Map<string, number>();
+  for (const term of queryTerms) {
+    let count = 0;
+    for (const doc of documents) {
+      if (doc.includes(term)) count++;
+    }
+    df.set(term, count);
+  }
+
+  return documents.map((doc) => {
+    let score = 0;
+    const dl = doc.length;
+    for (const term of queryTerms) {
+      const termDf = df.get(term) ?? 0;
+      if (termDf === 0) continue;
+      const idf = Math.log((N - termDf + 0.5) / (termDf + 0.5) + 1);
+      const tf = doc.filter((t) => t === term).length;
+      const tfComponent = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / (avgdl || 1))));
+      score += idf * tfComponent;
+    }
+    return score;
+  });
+}
+
+/** Search memories using BM25 scoring with tag and category bonuses. Pure function. */
+export function searchMemories(
+  memories: HarnessMemory[],
+  query: string,
+  limit: number = 10,
+): HarnessMemory[] {
+  const queryTerms = tokenize(query);
+  if (queryTerms.length === 0) return [];
+
+  const contentTokens = memories.map((m) => tokenize(m.content));
+  const bm25Scores = computeBM25(queryTerms, contentTokens);
+
+  const scored = memories
+    .map((m, i) => {
+      let matchScore = bm25Scores[i];
+      // Tag bonus: +0.3 per matching tag
+      for (const tag of m.tags) {
+        const tagTokens = tokenize(tag);
+        if (queryTerms.some((qt) => tagTokens.includes(qt))) {
+          matchScore += 0.3;
+        }
+      }
+      // Category bonus
+      const catTokens = tokenize(m.category);
+      if (queryTerms.some((qt) => catTokens.includes(qt))) {
+        matchScore += 0.2;
+      }
+      return { memory: m, matchScore, totalScore: matchScore + m.relevance * 0.01 };
+    })
+    .filter((s) => s.matchScore > 0.01)
+    .sort((a, b) => b.totalScore - a.totalScore)
+    .slice(0, limit);
+  return scored.map((s) => s.memory);
+}
+
+// --- Feature 6: Self-Improving Templates (Pure Function) ---
+
+/** Get template overrides for a role based on prior ratings. */
+export function getTemplateOverrides(
+  store: TemplateStore,
+  role: string,
+): string[] {
+  // Check for explicit role overrides
+  if (store.roleOverrides[role]?.length) {
+    return store.roleOverrides[role];
+  }
+  // Compute from ratings: if average rating for role < 3, apply adjustments
+  const roleRatings = store.ratings.filter((r) => r.role === role);
+  if (roleRatings.length === 0) return [];
+  const avg = roleRatings.reduce((sum, r) => sum + r.rating, 0) / roleRatings.length;
+  if (avg >= 3) return [];
+  // Collect unique adjustments from low-rated entries
+  const adjustments = new Set<string>();
+  for (const r of roleRatings.filter((r) => r.rating < 3)) {
+    for (const adj of r.adjustments) {
+      adjustments.add(adj);
+    }
+  }
+  return Array.from(adjustments);
+}
+
+// --- Feature 8: Sandboxed Worker Execution (Pure Function) ---
+
+/** Build a docker run command for sandboxed worker execution. */
+export function buildDockerCmd(
+  sandboxConfig: SandboxConfig,
+  worktreePath: string,
+  piCmd: string,
+): string {
+  const parts = [
+    "docker", "run", "--rm",
+    "-v", `${worktreePath}:/workspace`,
+    "-w", "/workspace",
+    "--network", sandboxConfig.networkMode,
+    "--memory", sandboxConfig.memoryLimit,
+  ];
+  for (const mount of sandboxConfig.mountPaths) {
+    parts.push("-v", `${mount}:${mount}`);
+  }
+  parts.push(sandboxConfig.image, "bash", "-c", piCmd);
+  return parts.join(" ");
+}
+
+// --- Feature 7: Cron-Scheduled Runs (Pure Function) ---
+
+/** Check if a schedule is due to run. */
+export function isScheduleDue(schedule: ScheduledRun, now: Date): boolean {
+  if (!schedule.enabled) return false;
+  const lastRun = schedule.lastRunAt ? new Date(schedule.lastRunAt) : null;
+
+  if (schedule.cron === "hourly") {
+    return !lastRun || now.getTime() - lastRun.getTime() >= 3_600_000;
+  }
+  if (schedule.cron === "daily") {
+    return !lastRun || now.getTime() - lastRun.getTime() >= 86_400_000;
+  }
+  if (schedule.cron === "weekly") {
+    return !lastRun || now.getTime() - lastRun.getTime() >= 604_800_000;
+  }
+  // HH:MM format
+  const timeMatch = schedule.cron.match(/^(\d{1,2}):(\d{2})$/);
+  if (timeMatch) {
+    const targetHour = parseInt(timeMatch[1], 10);
+    const targetMin = parseInt(timeMatch[2], 10);
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+    const targetTotalMin = targetHour * 60 + targetMin;
+    // Within 5-minute window and not already run today
+    const inWindow = Math.abs(nowMin - targetTotalMin) <= 5;
+    const notRunToday = !lastRun || lastRun.toDateString() !== now.toDateString();
+    return inWindow && notRunToday;
+  }
+  return false;
+}
+
 // --- Tool Schemas ---
 
 const UpdateGoalParams = Type.Object({
@@ -1674,9 +2189,78 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Live config reload state
+  let cachedRuntimeConfig: { data: HarnessRuntimeConfig; mtime: number } | null = null;
+  let cachedModelRoutesMtime: number = 0;
+  let cachedHeartbeatConfigMtime: number = 0;
+  let effectiveMaxWorkers: number = Infinity;
+  let effectiveStaggerMs: number = 5000;
+
   function invalidateCache(): void {
     cachedManagerStatus = null;
     cachedGoalConfigs = null;
+    cachedRuntimeConfig = null;
+    cachedModelRoutesMtime = 0;
+    cachedHeartbeatConfigMtime = 0;
+  }
+
+  // --- Live Config Reload ---
+
+  async function checkConfigReload(ctx: { ui: { notify: Function; setStatus: Function } }): Promise<void> {
+    const changes: string[] = [];
+
+    // 1. Check .harness-config.json
+    try {
+      const configPath = join(cwd, HARNESS_CONFIG_FILE);
+      const mtime = await getFileMtime(configPath);
+      if (mtime > 0 && (!cachedRuntimeConfig || mtime !== cachedRuntimeConfig.mtime)) {
+        const raw = JSON.parse(await readFile(configPath, "utf-8"));
+        const validated = validateRuntimeConfig(raw);
+        if (validated) {
+          cachedRuntimeConfig = { data: validated, mtime };
+          if (validated.maxWorkers !== undefined && validated.maxWorkers !== effectiveMaxWorkers) {
+            changes.push(`maxWorkers: ${effectiveMaxWorkers} → ${validated.maxWorkers}`);
+            effectiveMaxWorkers = validated.maxWorkers;
+          }
+          if (validated.staggerMs !== undefined && validated.staggerMs !== effectiveStaggerMs) {
+            changes.push(`staggerMs: ${effectiveStaggerMs} → ${validated.staggerMs}`);
+            effectiveStaggerMs = validated.staggerMs;
+          }
+        } else {
+          ctx.ui.notify("Invalid .harness-config.json — keeping previous values", "warning");
+          cachedRuntimeConfig = { data: {}, mtime }; // prevent re-reading until next change
+        }
+      }
+    } catch { /* file doesn't exist or parse error — ignore */ }
+
+    // 2. Check .model-routes.json
+    try {
+      const mtime = await getFileMtime(join(cwd, MODEL_ROUTES_FILE));
+      if (mtime > 0 && mtime !== cachedModelRoutesMtime) {
+        if (cachedModelRoutesMtime > 0) changes.push("model routes updated (applied on next spawn)");
+        cachedModelRoutesMtime = mtime;
+      }
+    } catch { /* ignore */ }
+
+    // 3. Check .heartbeat-config.json
+    try {
+      const mtime = await getFileMtime(join(cwd, HEARTBEAT_CONFIG_FILE));
+      if (mtime > 0 && mtime !== cachedHeartbeatConfigMtime) {
+        if (cachedHeartbeatConfigMtime > 0) changes.push("heartbeat config updated");
+        cachedHeartbeatConfigMtime = mtime;
+      }
+    } catch { /* ignore */ }
+
+    if (changes.length > 0) {
+      pi.sendMessage(
+        {
+          customType: "harness-config-reload",
+          content: `Config reload: ${changes.join(", ")}`,
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    }
   }
 
   // --- tmux helpers ---
@@ -1803,6 +2387,92 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // --- Feature 2: Memory Store Helpers ---
+
+  async function readMemoryStore(): Promise<MemoryStore> {
+    try {
+      const content = await readFile(join(cwd, MEMORY_FILE), "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed?.version === 1 && Array.isArray(parsed.memories)) {
+        return parsed as MemoryStore;
+      }
+    } catch {
+      // File doesn't exist or is malformed
+    }
+    return { version: 1, memories: [] };
+  }
+
+  async function writeMemoryStore(store: MemoryStore): Promise<void> {
+    // Truncate to MAX_MEMORIES (drop lowest relevance)
+    if (store.memories.length > MAX_MEMORIES) {
+      store.memories.sort((a, b) => b.relevance - a.relevance);
+      store.memories = store.memories.slice(0, MAX_MEMORIES);
+    }
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(join(cwd, MEMORY_FILE), JSON.stringify(store, null, 2) + "\n");
+  }
+
+  async function addMemory(
+    source: string,
+    category: HarnessMemory["category"],
+    content: string,
+    tags: string[],
+  ): Promise<HarnessMemory> {
+    const store = await readMemoryStore();
+    const memory: HarnessMemory = {
+      id: generateMessageId(),
+      timestamp: new Date().toISOString(),
+      source,
+      category,
+      content,
+      tags,
+      relevance: 1.0,
+    };
+    store.memories.push(memory);
+    await writeMemoryStore(store);
+    return memory;
+  }
+
+  // --- Feature 6: Template Store Helpers ---
+
+  async function readTemplateStore(): Promise<TemplateStore> {
+    try {
+      const content = await readFile(join(cwd, TEMPLATE_STORE_FILE), "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed?.version === 1) return parsed as TemplateStore;
+    } catch {
+      // File doesn't exist or is malformed
+    }
+    return { version: 1, ratings: [], roleOverrides: {} };
+  }
+
+  async function writeTemplateStore(store: TemplateStore): Promise<void> {
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(join(cwd, TEMPLATE_STORE_FILE), JSON.stringify(store, null, 2) + "\n");
+  }
+
+  // --- Feature 7: Schedule Helpers ---
+
+  async function readSchedule(): Promise<ScheduledRun[]> {
+    try {
+      const content = await readFile(join(cwd, SCHEDULE_FILE), "utf-8");
+      const parsed = JSON.parse(content);
+      if (Array.isArray(parsed)) return parsed as ScheduledRun[];
+    } catch {
+      // File doesn't exist or is malformed
+    }
+    return [];
+  }
+
+  async function writeSchedule(schedules: ScheduledRun[]): Promise<void> {
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(join(cwd, SCHEDULE_FILE), JSON.stringify(schedules, null, 2) + "\n");
+  }
+
+  // --- Feature 10: Dashboard Server ---
+
+  let dashboardServer: { close: () => void } | null = null;
+
   function piAgentDir(): string {
     return join(cwd, PI_AGENT_DIR);
   }
@@ -1837,6 +2507,129 @@ export default function (pi: ExtensionAPI) {
       // Directory doesn't exist
     }
     return configs;
+  }
+
+  // --- Feature 4: Worker Recovery ---
+
+  async function recoverWorker(name: string, session: SubmoduleSession): Promise<boolean> {
+    const state = await readWorkerState(name);
+    const attempts = state?.recoveryAttempts ?? 0;
+    const maxRecoveries = state?.maxRecoveries ?? MAX_WORKER_RECOVERIES;
+
+    if (attempts >= maxRecoveries) return false;
+
+    // Check cooldown
+    if (state?.lastRecoveryAt) {
+      const elapsed = Date.now() - new Date(state.lastRecoveryAt).getTime();
+      if (elapsed < WORKER_RECOVERY_COOLDOWN_MS) return false;
+    }
+
+    // Kill dead tmux session
+    if (session.tmuxSession) {
+      await tmuxKillSession(session.tmuxSession);
+      session.tmuxSession = null;
+    }
+
+    // Re-read goal file to get remaining goals
+    const configs = await readGoalFiles();
+    const config = configs.find((c) => c.name === name);
+    if (!config) return false;
+
+    const incompleteGoals = config.goals.filter((g) => !g.completed);
+    if (incompleteGoals.length === 0) return false; // Worker finished normally
+
+    // Respawn
+    await spawnSession(session, config);
+
+    // Update state
+    await writeWorkerState(name, {
+      ...(state ?? {
+        name,
+        status: "active",
+        goalsCompleted: config.goals.filter((g) => g.completed).length,
+        goalsTotal: config.goals.length,
+        lastActivity: new Date().toISOString(),
+        errors: [],
+        mergeStatus: "pending",
+        dependsOn: config.dependsOn ?? [],
+        dependenciesMet: true,
+      }),
+      status: "active",
+      recoveryAttempts: attempts + 1,
+      lastRecoveryAt: new Date().toISOString(),
+    });
+
+    // Notify manager
+    await sendMailboxMessage(cwd, "manager", "system", "status_report", {
+      event: "worker_recovered",
+      worker: name,
+      attempt: attempts + 1,
+      maxRecoveries,
+    }, { system: true });
+
+    return true;
+  }
+
+  // --- Feature 10: Dashboard Server ---
+
+  async function startDashboardServer(port: number = 3847): Promise<void> {
+    if (dashboardServer) return;
+    const http = await import("http");
+    dashboardServer = http.createServer(async (req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      const url = req.url ?? "/";
+      try {
+        if (url === "/status") {
+          const managerStatus = await readManagerStatus(cwd);
+          const configs = await readGoalFiles();
+          res.end(JSON.stringify({
+            active: loopActive,
+            manager: managerStatus,
+            workerCount: sessions.size,
+            totalGoals: configs.reduce((s, c) => s + c.goals.length, 0),
+            completedGoals: configs.reduce((s, c) => s + c.goals.filter((g) => g.completed).length, 0),
+          }));
+        } else if (url === "/workers") {
+          const workers: Record<string, unknown> = {};
+          for (const [name] of sessions) {
+            workers[name] = await readWorkerState(name);
+          }
+          res.end(JSON.stringify(workers));
+        } else if (url === "/queue") {
+          const queue = await readQueue(cwd);
+          res.end(JSON.stringify(queue));
+        } else if (url === "/memory") {
+          const store = await readMemoryStore();
+          res.end(JSON.stringify(store));
+        } else if (url.startsWith("/logs/")) {
+          const name = url.slice(6);
+          const session = sessions.get(name);
+          const tmuxSess = name === "manager" ? managerTmuxSession : session?.tmuxSession;
+          if (tmuxSess) {
+            const output = await tmuxCapture(tmuxSess, 100);
+            res.end(JSON.stringify({ name, output }));
+          } else {
+            res.statusCode = 404;
+            res.end(JSON.stringify({ error: "Session not found" }));
+          }
+        } else {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: "Not found", endpoints: ["/status", "/workers", "/queue", "/memory", "/logs/<name>"] }));
+        }
+      } catch (e) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+      }
+    });
+    dashboardServer.listen(port);
+  }
+
+  function stopDashboardServer(): void {
+    if (dashboardServer) {
+      dashboardServer.close();
+      dashboardServer = null;
+    }
   }
 
   function countCompleted(config: SubmoduleConfig): number {
@@ -2036,6 +2829,62 @@ export default function (pi: ExtensionAPI) {
     // Goal file path for worker to write questions
     const goalFilePath = resolve(cwd, PI_AGENT_DIR, goalFileName(config.name));
 
+    // Feature 6: Self-improving template overrides
+    let templateOverrideSection = "";
+    try {
+      const storeContent = await readFile(join(cwd, TEMPLATE_STORE_FILE), "utf-8");
+      const store = JSON.parse(storeContent) as TemplateStore;
+      const overrides = getTemplateOverrides(store, config.role);
+      if (overrides.length > 0) {
+        templateOverrideSection = [
+          "",
+          "## Template Adjustments (from prior runs)",
+          ...overrides.map((o) => `- ${o}`),
+          "",
+        ].join("\n");
+      }
+    } catch {
+      // No template store or invalid — skip
+    }
+
+    // Feature 2: Memory context injection
+    let memorySection = "";
+    try {
+      const memStore = await readMemoryStore();
+      if (memStore.memories.length > 0) {
+        const relevant = searchMemories(memStore.memories, config.name, 5);
+        if (relevant.length > 0) {
+          memorySection = [
+            "",
+            "## Prior Learnings",
+            ...relevant.map((m) => `- [${m.category}] ${m.content}`),
+            "",
+          ].join("\n");
+        }
+      }
+    } catch {
+      // No memory store — skip
+    }
+
+    // Role-based tool policy injection
+    let toolPolicySection = "";
+    const toolPolicy = getToolPolicy(config.role);
+    if (toolPolicy) {
+      toolPolicySection = [
+        "",
+        "## Tool Access Policy",
+        `**Mode: ${toolPolicy.mode.toUpperCase()}**`,
+        "",
+        toolPolicy.instructions,
+        "",
+      ].join("\n");
+    }
+
+    // Feature 5: List active workers for inter-agent communication
+    const activeWorkerNames = Array.from(sessions.keys()).filter(
+      (n) => n !== config.name,
+    );
+
     const prompt = [
       `You are ${role.persona}, working on "${config.name}".`,
       "",
@@ -2044,6 +2893,9 @@ export default function (pi: ExtensionAPI) {
       "",
       config.context ? `## Context\n${config.context}\n` : "",
       answeredSection,
+      templateOverrideSection,
+      memorySection,
+      toolPolicySection,
       "## Instructions",
       ...role.instructions.map((i) => `- ${i}`),
       `- You are working in a git worktree on branch \`${session.branch}\``,
@@ -2054,13 +2906,14 @@ export default function (pi: ExtensionAPI) {
       "- NEVER modify heartbeat.md or .pi-agent-prompt.md — they are managed by the harness",
       "- Commit your work frequently, but do NOT commit or stage heartbeat.md or .pi-agent-prompt.md",
       "- Do not switch branches",
+      "- Before marking your final goal complete, rate this prompt template: write a JSON file to `.pi-agent/.template-ratings/` with `{ \"role\": \"" + config.role + "\", \"rating\": 1-5, \"feedback\": \"...\", \"adjustments\": [...] }`",
       "",
       "## Asking Questions",
       `If you need a decision or clarification from the user, write your question to the goal file at \`${goalFilePath}\`.`,
       "Append to the `## Questions` section using the format: `- ? Your question here`",
       "Then periodically re-read the goal file to check for answers (lines starting with `- !`).",
       "",
-      "## Mailbox",
+      "## Mailbox & Communication",
       `Your inbox is at \`${resolve(cwd, MAILBOX_DIR, config.name)}/\`.`,
       "Before starting any new goal, check your inbox for messages.",
       "Read all *.json files in your inbox directory, sorted by filename.",
@@ -2074,6 +2927,10 @@ export default function (pi: ExtensionAPI) {
       "To send a message to another actor, write a JSON file to `.pi-agent/.mailboxes/{recipient}/` with:",
       '`{ "id": "<timestamp>-<4chars>", "from": "' + config.name + '", "to": "<recipient>",',
       '  "type": "<type>", "timestamp": "<ISO 8601>", "payload": { ... } }`',
+      "",
+      activeWorkerNames.length > 0
+        ? `**Active workers you can message:** ${activeWorkerNames.join(", ")}, manager, parent`
+        : "**You can message:** manager, parent",
     ].join("\n");
 
     // Write prompt to file to avoid shell escaping issues
@@ -2084,8 +2941,31 @@ export default function (pi: ExtensionAPI) {
     // don't commit it — prevents add/add merge conflicts between branches.
     await addToWorktreeExclude(session.worktreePath, ".pi-agent-prompt.md");
 
+    // Feature 1: Resolve model for this worker
+    let modelRoutes = DEFAULT_MODEL_ROUTES;
+    try {
+      const routesContent = await readFile(join(cwd, MODEL_ROUTES_FILE), "utf-8");
+      modelRoutes = JSON.parse(routesContent) as ModelRoute[];
+    } catch {
+      // Use defaults
+    }
+    const model = resolveModelForWorker(modelRoutes, config.role, config.name);
+    const modelFlag = model ? ` --model ${model}` : "";
+
+    // Feature 8: Sandboxed execution
+    let sandboxConfig: SandboxConfig | null = null;
+    try {
+      const sbContent = await readFile(join(cwd, SANDBOX_CONFIG_FILE), "utf-8");
+      sandboxConfig = JSON.parse(sbContent) as SandboxConfig;
+    } catch {
+      // No sandbox config — run bare
+    }
+
     const tmuxName = `worker-${sanitizeTmuxName(config.name)}`;
-    const cmd = `pi -p "$(cat .pi-agent-prompt.md)"`;
+    const piCmd = `pi${modelFlag} -p "$(cat .pi-agent-prompt.md)"`;
+    const cmd = sandboxConfig?.enabled
+      ? buildDockerCmd(sandboxConfig, session.worktreePath, piCmd)
+      : piCmd;
     await tmuxNewSession(tmuxName, cmd, session.worktreePath);
 
     session.tmuxSession = tmuxName;
@@ -2110,6 +2990,10 @@ export default function (pi: ExtensionAPI) {
     session: SubmoduleSession,
     config: SubmoduleConfig,
   ): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
+    // Double-merge guard
+    if (mergedWorkers.has(config.name)) {
+      return { ok: true, message: `${config.name} already merged` };
+    }
     // Block merge if unanswered questions exist
     const unanswered =
       config.questions?.filter((q) => !q.answered).length ?? 0;
@@ -2183,7 +3067,7 @@ export default function (pi: ExtensionAPI) {
       submodule: config.name,
       branch: session.branch,
       error: errorMsg,
-    });
+    }, { system: true });
 
     return {
       ok: false,
@@ -2302,8 +3186,8 @@ export default function (pi: ExtensionAPI) {
       await spawnSession(session, config);
       launched.push(`${config.name} (${config.goals.length} goals)`);
 
-      if (i < ready.length - 1 && autoConfig.staggerMs > 0) {
-        await new Promise((r) => setTimeout(r, autoConfig.staggerMs));
+      if (i < ready.length - 1 && effectiveStaggerMs > 0) {
+        await new Promise((r) => setTimeout(r, effectiveStaggerMs));
       }
     }
 
@@ -2412,15 +3296,39 @@ export default function (pi: ExtensionAPI) {
     const promptFile = join(mgrDir, ".pi-agent-prompt.md");
     await atomicWriteFile(promptFile, prompt);
 
+    // Feature 3: Read heartbeat config for manager timing
+    let heartbeatConfig = DEFAULT_HEARTBEAT_CONFIG;
+    try {
+      const hbContent = await readFile(join(cwd, HEARTBEAT_CONFIG_FILE), "utf-8");
+      heartbeatConfig = { ...DEFAULT_HEARTBEAT_CONFIG, ...JSON.parse(hbContent) };
+    } catch {
+      // Use defaults
+    }
+    // Write heartbeat config so manager bash loop can read it
+    await atomicWriteFile(
+      join(cwd, HEARTBEAT_CONFIG_FILE),
+      JSON.stringify(heartbeatConfig, null, 2) + "\n",
+    );
+
+    const successSleepSec = Math.max(1, Math.round(heartbeatConfig.intervalMs / 1000));
+    const failureSleepSec = Math.max(1, Math.round(heartbeatConfig.intervalMs / 2000));
+
     const tmuxName = "harness-manager";
     const stopSignalPathEsc = shellEscape(join(cwd, STOP_SIGNAL_FILE));
     const statusFilePathEsc = shellEscape(join(cwd, MANAGER_STATUS_FILE));
     const errorLogPathEsc = shellEscape(join(mgrDir, ".pi-agent-errors.log"));
+
+    // Active-hours check (Feature 3)
+    const activeHoursCheck = heartbeatConfig.activeHoursOnly
+      ? `HOUR=$(date +%H); if [ "$HOUR" -lt ${heartbeatConfig.activeHoursStart} ] || [ "$HOUR" -ge ${heartbeatConfig.activeHoursEnd} ]; then sleep ${successSleepSec}; continue; fi;`
+      : "";
+
     // Exit-code-aware loop: track consecutive failures, log errors, bail after MAX_CONSECUTIVE_FAILURES
     const loopCmd = [
       "consecutive_failures=0;",
       "while true; do",
       `if [ -f ${stopSignalPathEsc} ]; then echo "Stop signal detected"; exit 0; fi;`,
+      activeHoursCheck,
       'pi -p "$(cat .pi-agent-prompt.md)";',
       "exit_code=$?;",
       "if [ $exit_code -ne 0 ]; then",
@@ -2430,10 +3338,10 @@ export default function (pi: ExtensionAPI) {
       `echo '{"status":"error","message":"Manager crashed ${MAX_CONSECUTIVE_FAILURES} times consecutively","updatedAt":"'$(date -u +%FT%TZ)'","submodules":{},"stallCount":0}' > ${statusFilePathEsc};`,
       "exit 1;",
       "fi;",
-      "sleep 30;",
+      `sleep ${failureSleepSec};`,
       "else",
       "consecutive_failures=0;",
-      "sleep 120;",
+      `sleep ${successSleepSec};`,
       "fi;",
       "done",
     ].join(" ");
@@ -2605,12 +3513,72 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Ensure mailbox directories exist
-    try {
-      await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
-      await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
-    } catch {
-      // Best effort
+    // Only create mailbox directories when harness is actively running.
+    // Previously this was unconditional, polluting every repo with .pi-agent/.
+    if (loopActive) {
+      try {
+        await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
+        await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
+      } catch {
+        // Best effort
+      }
+    }
+
+    // Feature 9: Process trigger files
+    if (!loopActive) {
+      try {
+        const triggersDir = join(cwd, TRIGGERS_DIR);
+        const triggerFiles = await readdir(triggersDir);
+        for (const file of triggerFiles) {
+          if (!file.endsWith(".json")) continue;
+          try {
+            const content = await readFile(join(triggersDir, file), "utf-8");
+            const trigger = JSON.parse(content) as TriggerEvent;
+            if (trigger.type === "launch" || trigger.type === "auto") {
+              // Notify parent about the trigger — actual execution happens via commands
+              pi.sendMessage(
+                {
+                  customType: "harness-trigger",
+                  content: `**Trigger detected:** ${trigger.type} (id: ${trigger.id}) — ${JSON.stringify(trigger.config)}`,
+                  display: true,
+                },
+                { triggerTurn: false },
+              );
+            }
+            // Delete processed trigger
+            await rm(join(triggersDir, file));
+          } catch {
+            // Skip malformed triggers
+          }
+        }
+      } catch {
+        // No triggers directory — normal
+      }
+    }
+
+    // Feature 7: Check scheduled runs
+    if (!loopActive) {
+      try {
+        const schedules = await readSchedule();
+        const now = new Date();
+        for (const schedule of schedules) {
+          if (isScheduleDue(schedule, now)) {
+            schedule.lastRunAt = now.toISOString();
+            await writeSchedule(schedules);
+            pi.sendMessage(
+              {
+                customType: "harness-schedule-due",
+                content: `**Scheduled run due:** ${schedule.id} (${schedule.cron}) — ${schedule.objective ?? "auto"}. Run \`/harness:auto\` to execute.`,
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+            break; // Only process one schedule per session_start
+          }
+        }
+      } catch {
+        // No schedule file — normal
+      }
     }
 
     if (loopActive) {
@@ -2651,6 +3619,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (_event, ctx) => {
     if (!loopActive) return;
     lastCtx = ctx;
+
+    // Live config reload check
+    await checkConfigReload(ctx);
 
     // Check context usage
     try {
@@ -2848,20 +3819,13 @@ export default function (pi: ExtensionAPI) {
     // Manager is alive — reset stale tracking
     managerStaleCount = 0;
 
-    // Update status bar
-    const totalGoals = Object.values(status.submodules).reduce(
-      (sum, s) => sum + s.total,
-      0,
-    );
-    const doneGoals = Object.values(status.submodules).reduce(
-      (sum, s) => sum + s.completed,
-      0,
-    );
-
-    // Check for unanswered questions (with mtime-based cache)
+    // --- Deterministic goal counting from goal files (not manager status) ---
+    let configs: SubmoduleConfig[] = [];
+    let totalGoals = 0;
+    let doneGoals = 0;
+    let unansweredCount = 0;
     let questionSuffix = "";
     try {
-      let configs: SubmoduleConfig[];
       let goalCacheValid = false;
       if (cachedGoalConfigs) {
         goalCacheValid = true;
@@ -2896,15 +3860,156 @@ export default function (pi: ExtensionAPI) {
         } catch { /* ignore */ }
         cachedGoalConfigs = { data: configs, mtimes };
       }
-      const unanswered = configs.reduce(
-        (sum, c) => sum + (c.questions?.filter((q) => !q.answered).length ?? 0),
-        0,
-      );
-      if (unanswered > 0) {
-        questionSuffix = `, ${unanswered}?`;
+      for (const c of configs) {
+        totalGoals += c.goals.length;
+        doneGoals += c.goals.filter((g) => g.completed).length;
+        unansweredCount += c.questions?.filter((q) => !q.answered).length ?? 0;
+      }
+      if (unansweredCount > 0) {
+        questionSuffix = `, ${unansweredCount}?`;
+      }
+      // Fall back to manager status when goal files are empty/unavailable
+      if (configs.length === 0 && status.submodules) {
+        totalGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.total, 0);
+        doneGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.completed, 0);
       }
     } catch {
-      // ignore
+      // Fall back to manager status counts
+      totalGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.total, 0);
+      doneGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.completed, 0);
+    }
+
+    // --- Deterministic auto-merge ---
+    try {
+      for (const config of configs) {
+        if (mergedWorkers.has(config.name)) continue;
+        if (config.goals.length === 0) continue;
+        if (!config.goals.every((g) => g.completed)) continue;
+        if ((config.questions?.filter((q) => !q.answered).length ?? 0) > 0) continue;
+        const session = sessions.get(config.name);
+        if (!session) continue;
+        // Verify branch still exists
+        try {
+          await pi.exec("git", ["rev-parse", "--verify", session.branch], { cwd });
+        } catch {
+          continue; // Branch gone — skip
+        }
+        const result = await mergeWorktree(session, config);
+        if (result.ok) {
+          sessions.delete(config.name);
+          pi.sendMessage(
+            {
+              customType: "harness-auto-merged",
+              content: `**Auto-merged:** ${config.name} (${config.goals.length} goals complete)`,
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+          // Notify manager mailbox
+          try {
+            await sendMailboxMessage(cwd, "manager", {
+              id: generateMessageId(),
+              from: "parent",
+              to: "manager",
+              type: "status_report",
+              timestamp: new Date().toISOString(),
+              payload: { action: "auto-merged", worker: config.name },
+            });
+          } catch { /* best effort */ }
+          // Update registry
+          try {
+            const registry = await readRegistry(cwd);
+            const entry = registry.workers.find((w) => w.name === config.name);
+            if (entry) {
+              entry.status = "merged";
+              entry.mergedAt = new Date().toISOString();
+              await writeRegistry(cwd, registry);
+            }
+          } catch { /* best effort */ }
+        }
+      }
+    } catch {
+      // Deterministic merge failed — manager is fallback
+    }
+
+    // --- Deterministic queue dispatch ---
+    try {
+      const queue = await readQueue(cwd);
+      const pendingItems = queue.items.filter((item) => item.status === "pending");
+      if (pendingItems.length > 0) {
+        // Determine max workers from live config + auto mode ceiling
+        let maxWorkersLimit = effectiveMaxWorkers;
+        const autoState2 = await readAutoModeState();
+        if (autoState2?.enabled && autoState2.config?.maxWorkers) {
+          maxWorkersLimit = Math.min(maxWorkersLimit, autoState2.config.maxWorkers);
+        }
+        const activeCount = Array.from(sessions.values()).filter(
+          (s) => s.spawned && s.tmuxSession,
+        ).length;
+        const openSlots = Math.max(0, maxWorkersLimit - activeCount);
+        if (openSlots > 0) {
+          let dispatched = 0;
+          for (const item of pendingItems) {
+            if (dispatched >= openSlots) break;
+            try {
+              // Skip if already in sessions (already spawned)
+              if (sessions.has(item.topic)) continue;
+              // Read existing goal file or create one from queue item
+              const goalFilePath = join(piAgentDir(), goalFileName(item.topic));
+              let config: SubmoduleConfig;
+              try {
+                const existing = await readFile(goalFilePath, "utf-8");
+                config = parseGoalFile(existing, goalFileName(item.topic));
+              } catch {
+                // No existing goal file — create from queue item
+                const goalContent = [
+                  `# ${item.topic}`,
+                  item.role ? `role: ${item.role}` : "",
+                  "path: .",
+                  "",
+                  "## Goals",
+                  ...(item.goals ?? [item.description]).map((g) => `- [ ] ${g}`),
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+                config = parseGoalFile(goalContent, goalFileName(item.topic));
+                await atomicWriteFile(goalFilePath, goalContent + "\n");
+              }
+              // Check dependencies are met before dispatching
+              if (config.dependsOn?.length) {
+                const unmet = config.dependsOn.filter((dep) => {
+                  const depConfig = configs.find((c) => c.name === dep);
+                  if (!depConfig) return true;
+                  return !depConfig.goals.every((g) => g.completed);
+                });
+                if (unmet.length > 0) continue; // Dependencies not met — skip
+              }
+              const session = await createWorktree(config);
+              await spawnSession(session, config);
+              item.status = "dispatched";
+              dispatched++;
+              // Notify manager
+              try {
+                await sendMailboxMessage(cwd, "manager", {
+                  id: generateMessageId(),
+                  from: "parent",
+                  to: "manager",
+                  type: "status_report",
+                  timestamp: new Date().toISOString(),
+                  payload: { action: "queue-dispatched", topic: item.topic },
+                });
+              } catch { /* best effort */ }
+            } catch {
+              // Skip this item on error — manager can retry
+            }
+          }
+          if (dispatched > 0) {
+            await writeQueue(cwd, queue);
+          }
+        }
+      }
+    } catch {
+      // Queue dispatch failed — manager is fallback
     }
 
     // Check parent inbox for messages
@@ -2973,13 +4078,29 @@ export default function (pi: ExtensionAPI) {
     let activeWorkerCount = 0;
     let stalledWorkerCount = 0;
     let deadWorkerCount = 0;
+    let recoveredWorkerCount = 0;
     for (const [name, session] of sessions) {
       if (session.tmuxSession) {
         const activity = await checkWorkerActivity(session);
         if (activity === "dead") {
-          session.spawned = false;
-          session.tmuxSession = null;
-          deadWorkerCount++;
+          // Feature 4: Attempt auto-recovery for dead workers with incomplete goals
+          const recovered = await recoverWorker(name, session);
+          if (recovered) {
+            recoveredWorkerCount++;
+            activeWorkerCount++;
+            pi.sendMessage(
+              {
+                customType: "harness-worker-recovered",
+                content: `Worker **${name}** died and was auto-recovered.`,
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+          } else {
+            session.spawned = false;
+            session.tmuxSession = null;
+            deadWorkerCount++;
+          }
         } else if (activity === "stalled") {
           stalledWorkerCount++;
         } else {
@@ -2993,11 +4114,19 @@ export default function (pi: ExtensionAPI) {
           await writeWorkerState(name, existing);
         }
       } else if (session.spawned) {
-        deadWorkerCount++;
+        // Feature 4: Try to recover workers that lost their tmux session
+        const recovered = await recoverWorker(name, session);
+        if (recovered) {
+          recoveredWorkerCount++;
+          activeWorkerCount++;
+        } else {
+          deadWorkerCount++;
+        }
       }
     }
+    const recoverySuffix = recoveredWorkerCount > 0 ? `/${recoveredWorkerCount}r` : "";
     const workerSuffix = sessions.size > 0
-      ? `, ${activeWorkerCount}a/${stalledWorkerCount}s/${deadWorkerCount}d`
+      ? `, ${activeWorkerCount}a/${stalledWorkerCount}s/${deadWorkerCount}d${recoverySuffix}`
       : "";
 
     ctx.ui.setStatus(
@@ -3620,6 +4749,165 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // --- Feature 2: Memory Tools ---
+
+  pi.registerTool({
+    name: "harness_remember",
+    label: "Remember Learning",
+    description:
+      "Persist a learning or insight to the harness memory store. " +
+      "Workers can use this to record decisions, patterns, errors, or insights.",
+    parameters: Type.Object({
+      content: Type.String({ description: "What to remember" }),
+      category: Type.Union(
+        [Type.Literal("decision"), Type.Literal("pattern"), Type.Literal("error"), Type.Literal("insight")],
+        { description: "Category of the memory" },
+      ),
+      tags: Type.Array(Type.String(), { description: "Tags for searchability" }),
+    }),
+    async execute(_toolCallId, params: { content: string; category: HarnessMemory["category"]; tags: string[] }) {
+      const memory = await addMemory("parent", params.category, params.content, params.tags);
+      return {
+        content: [{ type: "text", text: `Remembered: "${params.content}" [${params.category}] (id: ${memory.id})` }],
+        details: { id: memory.id },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_recall",
+    label: "Recall Memories",
+    description:
+      "Search the harness memory store for relevant learnings from prior runs.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Search query" }),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
+    }),
+    async execute(_toolCallId, params: { query: string; limit?: number }) {
+      const store = await readMemoryStore();
+      const results = searchMemories(store.memories, params.query, params.limit ?? 10);
+      if (results.length === 0) {
+        return {
+          content: [{ type: "text", text: "No matching memories found." }],
+          details: { count: 0 },
+        };
+      }
+      const lines = results.map(
+        (m) => `- **[${m.category}]** (${m.source}, ${m.timestamp}): ${m.content} [${m.tags.join(", ")}]`,
+      );
+      return {
+        content: [{ type: "text", text: `## Memories (${results.length})\n\n${lines.join("\n")}` }],
+        details: { count: results.length, memories: results },
+      };
+    },
+  });
+
+  // --- Feature 5: Inter-Agent Communication Tools ---
+
+  pi.registerTool({
+    name: "harness_send_message",
+    label: "Send Worker Message",
+    description:
+      "Send a message directly to another worker, the manager, or parent. " +
+      "Enables peer-to-peer coordination between workers.",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target worker name, 'manager', or 'parent'" }),
+      message: Type.String({ description: "Message content" }),
+      type: Type.Optional(
+        Type.Union(
+          [Type.Literal("directive"), Type.Literal("question"), Type.Literal("answer"), Type.Literal("status_report"), Type.Literal("ack")],
+          { description: "Message type (default: directive). Use 'question' for requests, 'answer' for responses." },
+        ),
+      ),
+    }),
+    async execute(_toolCallId, params: { to: string; message: string; type?: MailboxMessage["type"] }) {
+      // Validate target exists
+      const validTargets = new Set([...sessions.keys(), "manager", "parent"]);
+      if (!validTargets.has(params.to)) {
+        return {
+          content: [{ type: "text", text: `Unknown target "${params.to}". Available: ${Array.from(validTargets).join(", ")}` }],
+          isError: true,
+        };
+      }
+      const msgType = params.type ?? "directive";
+      const id = await sendMailboxMessage(cwd, params.to, "parent", msgType, { text: params.message });
+      return {
+        content: [{ type: "text", text: `Message sent to ${params.to} (id: ${id})` }],
+        details: { id, to: params.to },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "harness_read_messages",
+    label: "Read Worker Messages",
+    description:
+      "Read messages from a worker's or parent's mailbox.",
+    parameters: Type.Object({
+      actor: Type.Optional(Type.String({ description: "Actor name (default: parent)" })),
+      limit: Type.Optional(Type.Number({ description: "Max messages to read (default: all)" })),
+    }),
+    async execute(_toolCallId, params: { actor?: string; limit?: number }) {
+      const actor = params.actor ?? "parent";
+      const messages = await readMailbox(cwd, actor);
+      const toReturn = params.limit ? messages.slice(0, params.limit) : messages;
+      if (toReturn.length === 0) {
+        return {
+          content: [{ type: "text", text: `No messages in ${actor}'s inbox.` }],
+          details: { count: 0 },
+        };
+      }
+      const lines = toReturn.map(
+        ({ message }) => `- **[${message.type}]** from ${message.from}: ${JSON.stringify(message.payload)}`,
+      );
+      // Delete read messages
+      for (const { filename } of toReturn) {
+        await deleteMessage(cwd, actor, filename);
+      }
+      return {
+        content: [{ type: "text", text: `## Messages (${toReturn.length})\n\n${lines.join("\n")}` }],
+        details: { count: toReturn.length },
+      };
+    },
+  });
+
+  // --- Feature 6: Template Rating Tool ---
+
+  pi.registerTool({
+    name: "harness_rate_template",
+    label: "Rate Worker Template",
+    description:
+      "Rate the quality of the prompt template you received. " +
+      "Helps improve future worker prompts. Include your role and task name for targeted improvements.",
+    parameters: Type.Object({
+      rating: Type.Number({ description: "Quality rating 1-5" }),
+      feedback: Type.String({ description: "What worked, what didn't" }),
+      adjustments: Type.Array(Type.String(), { description: "Suggested prompt improvements" }),
+      role: Type.Optional(Type.String({ description: "Your role (e.g. developer, architect, analyst)" })),
+      taskName: Type.Optional(Type.String({ description: "Your task/worker name (e.g. bmad-tech-spec)" })),
+    }),
+    async execute(_toolCallId, params: { rating: number; feedback: string; adjustments: string[]; role?: string; taskName?: string }) {
+      const store = await readTemplateStore();
+      store.ratings.push({
+        role: params.role ?? "unknown",
+        taskName: params.taskName ?? "unknown",
+        rating: Math.max(1, Math.min(5, params.rating)),
+        feedback: params.feedback,
+        timestamp: new Date().toISOString(),
+        adjustments: params.adjustments,
+      });
+      // Keep last 100 ratings
+      if (store.ratings.length > 100) {
+        store.ratings = store.ratings.slice(-100);
+      }
+      await writeTemplateStore(store);
+      return {
+        content: [{ type: "text", text: `Template rated ${params.rating}/5 for role "${params.role ?? "unknown"}". Thank you for the feedback.` }],
+        details: { rating: params.rating, role: params.role ?? "unknown" },
+      };
+    },
+  });
+
   // --- BMAD Worker Prompt Builder ---
 
   function buildBmadWorkerPrompt(
@@ -3673,6 +4961,21 @@ export default function (pi: ExtensionAPI) {
       "",
       "---",
       "",
+      // Role-based tool policy for BMAD workers
+      ...((() => {
+        const toolPolicy = getToolPolicy(spec.role);
+        if (toolPolicy) {
+          return [
+            "## Tool Access Policy",
+            "",
+            `**Mode: ${toolPolicy.mode.toUpperCase()}**`,
+            "",
+            toolPolicy.instructions,
+            "",
+          ];
+        }
+        return [];
+      })()),
       "## Harness Worker Instructions",
       `- When you complete a goal, edit your goal file at \`${goalFilePath}\` to change \`- [ ]\` to \`- [x]\``,
       "- After completing each goal, immediately update the goal file so the manager can track progress",
@@ -3714,7 +5017,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("harness:launch", {
     description:
-      "Read .pi-agent/*.md goals, create worktrees, spawn workers + manager. Supports --max-workers N --stagger <ms>.",
+      "Read .pi-agent/*.md goals, create worktrees, spawn workers + manager. Supports --max-workers N --stagger <ms> --model-routes <path> --heartbeat <ms> --dashboard.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -3733,7 +5036,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Parse --max-workers and --stagger flags
+      // Parse --max-workers, --stagger, --model-routes, --heartbeat, --dashboard flags
       let maxWorkers = Infinity;
       let staggerMs = 5000;
       const remaining = (args ?? "").trim();
@@ -3745,6 +5048,36 @@ export default function (pi: ExtensionAPI) {
       if (staggerFlag) {
         staggerMs = parseInt(staggerFlag[1], 10);
       }
+
+      // Initialize live-reloadable effective values from CLI flags
+      effectiveMaxWorkers = maxWorkers;
+      effectiveStaggerMs = staggerMs;
+
+      // Feature 1: Model routes
+      const modelRoutesFlag = remaining.match(/--model-routes\s+(\S+)/);
+      if (modelRoutesFlag) {
+        try {
+          const routesContent = await readFile(modelRoutesFlag[1], "utf-8");
+          await mkdir(piAgentDir(), { recursive: true });
+          await atomicWriteFile(join(cwd, MODEL_ROUTES_FILE), routesContent);
+        } catch (e) {
+          ctx.ui.notify(`Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`, "warning");
+        }
+      }
+
+      // Feature 3: Heartbeat interval
+      const heartbeatFlag = remaining.match(/--heartbeat\s+(\d+)/);
+      if (heartbeatFlag) {
+        const hbConfig: HeartbeatConfig = {
+          ...DEFAULT_HEARTBEAT_CONFIG,
+          intervalMs: parseInt(heartbeatFlag[1], 10),
+        };
+        await mkdir(piAgentDir(), { recursive: true });
+        await atomicWriteFile(join(cwd, HEARTBEAT_CONFIG_FILE), JSON.stringify(hbConfig, null, 2) + "\n");
+      }
+
+      // Feature 10: Dashboard
+      const enableDashboard = remaining.includes("--dashboard");
 
       const configs = await readGoalFiles();
       if (configs.length === 0) {
@@ -3826,8 +5159,8 @@ export default function (pi: ExtensionAPI) {
         launched.push(`${config.name} (${incompleteGoals.length} goals)`);
 
         // Stagger spawning to avoid resource burst
-        if (i < toSpawn.length - 1 && staggerMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, staggerMs));
+        if (i < toSpawn.length - 1 && effectiveStaggerMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, effectiveStaggerMs));
         }
       }
 
@@ -3884,6 +5217,11 @@ export default function (pi: ExtensionAPI) {
 
       // Spawn the manager session
       await spawnManager(configs);
+
+      // Feature 10: Start dashboard if requested
+      if (enableDashboard) {
+        await startDashboardServer();
+      }
 
       loopActive = true;
       launchStartedAt = new Date();
@@ -4035,6 +5373,9 @@ export default function (pi: ExtensionAPI) {
 
       // Write run summary before deactivating
       await writeRunSummary("user_stop");
+
+      // Feature 10: Stop dashboard server
+      stopDashboardServer();
 
       // Clean up BMAD prompt files if they exist
       try {
@@ -4400,6 +5741,21 @@ export default function (pi: ExtensionAPI) {
         // git worktree list may fail
       }
 
+      // Remove any remaining pi-agent/* branches (may remain from
+      // manager-spawned workers or queued workflows that never had worktrees)
+      try {
+        const branchResult = await pi.exec("git", ["branch", "--list", "pi-agent/*"], { cwd });
+        const branches = (branchResult.stdout ?? "")
+          .split("\n")
+          .map((b: string) => b.trim())
+          .filter(Boolean);
+        for (const branch of branches) {
+          try {
+            await pi.exec("git", ["branch", force ? "-D" : "-d", branch], { cwd });
+          } catch { /* branch may be checked out or already deleted */ }
+        }
+      } catch { /* git branch list may fail */ }
+
       // Remove manager directory
       try {
         await rm(managerDirPath(), { recursive: true, force: true });
@@ -4448,6 +5804,29 @@ export default function (pi: ExtensionAPI) {
         try { await rm(join(cwd, f)); } catch { /* may not exist */ }
       }
       try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+
+      // Remove goal files, worker state sidecars, and manager instructions
+      try {
+        const piAgentFiles = await readdir(piAgentDir());
+        for (const f of piAgentFiles) {
+          if (
+            (f.endsWith(".md") && !f.startsWith(".")) ||
+            f.endsWith(".state.json") ||
+            f === ".manager-instructions.md"
+          ) {
+            try { await rm(join(piAgentDir(), f)); } catch { /* best effort */ }
+          }
+        }
+      } catch { /* .pi-agent may not exist */ }
+
+      // Remove .pi-agent/ directory if empty (or only contains empty worktrees/ dir)
+      try {
+        try { await rm(join(piAgentDir(), "worktrees"), { recursive: true, force: true }); } catch { /* may not exist */ }
+        const remaining = await readdir(piAgentDir());
+        if (remaining.length === 0) {
+          await rm(piAgentDir(), { recursive: true, force: true });
+        }
+      } catch { /* best effort */ }
 
       // Kill entire tmux server
       await tmuxKillServer();
@@ -4820,11 +6199,279 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // --- Feature 2: Forget Command ---
+
+  pi.registerCommand("harness:forget", {
+    description: "Clear the harness memory store",
+    handler: async (_args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+      try {
+        await rm(join(cwd, MEMORY_FILE));
+        ctx.ui.notify("Memory store cleared.", "info");
+      } catch {
+        ctx.ui.notify("No memory store to clear.", "info");
+      }
+    },
+  });
+
+  // --- Feature 7: Schedule Command ---
+
+  pi.registerCommand("harness:schedule", {
+    description:
+      "Manage scheduled autonomous runs. Sub-commands: add, list, remove <id>, enable <id>, disable <id>.",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+      const parts = (args ?? "").trim().split(/\s+/);
+      const subCmd = parts[0] ?? "list";
+
+      if (subCmd === "list") {
+        const schedules = await readSchedule();
+        if (schedules.length === 0) {
+          ctx.ui.notify("No scheduled runs.", "info");
+          return;
+        }
+        const lines = ["## Scheduled Runs", ""];
+        for (const s of schedules) {
+          lines.push(
+            `- **${s.id}** [${s.enabled ? "enabled" : "disabled"}] ${s.cron} — ${s.objective ?? "auto"} (max ${s.maxWorkers} workers, ${s.maxIterations} iterations)`,
+          );
+        }
+        pi.sendMessage({ customType: "harness-schedule", content: lines.join("\n"), display: true }, { triggerTurn: false });
+        return;
+      }
+
+      if (subCmd === "add") {
+        const schedule: ScheduledRun = {
+          id: generateMessageId(),
+          cron: "daily",
+          maxWorkers: 3,
+          maxIterations: 1,
+          enabled: true,
+        };
+        // Parse flags
+        const atMatch = (args ?? "").match(/--at\s+(\S+)/);
+        if (atMatch) schedule.cron = atMatch[1];
+        const focusMatch = (args ?? "").match(/--focus\s+([\w,]+)/);
+        if (focusMatch) schedule.focus = focusMatch[1].split(",") as ScoutCategory[];
+        const maxMatch = (args ?? "").match(/--max-workers\s+(\d+)/);
+        if (maxMatch) schedule.maxWorkers = parseInt(maxMatch[1], 10);
+        const iterMatch = (args ?? "").match(/--max-iterations\s+(\d+)/);
+        if (iterMatch) schedule.maxIterations = parseInt(iterMatch[1], 10);
+        // Extract objective: everything that's not a flag or sub-command
+        const objective = (args ?? "")
+          .replace(/^add\s*/, "")
+          .replace(/--at\s+\S+/g, "")
+          .replace(/--focus\s+[\w,]+/g, "")
+          .replace(/--max-workers\s+\d+/g, "")
+          .replace(/--max-iterations\s+\d+/g, "")
+          .replace(/"/g, "")
+          .trim();
+        if (objective) schedule.objective = objective;
+
+        const schedules = await readSchedule();
+        schedules.push(schedule);
+        await writeSchedule(schedules);
+        ctx.ui.notify(`Schedule added: ${schedule.id} (${schedule.cron})`, "info");
+        return;
+      }
+
+      if (subCmd === "remove") {
+        const id = parts[1];
+        if (!id) { ctx.ui.notify("Usage: /harness:schedule remove <id>", "warning"); return; }
+        const schedules = await readSchedule();
+        const idx = schedules.findIndex((s) => s.id === id);
+        if (idx === -1) { ctx.ui.notify(`Schedule "${id}" not found.`, "warning"); return; }
+        schedules.splice(idx, 1);
+        await writeSchedule(schedules);
+        ctx.ui.notify(`Schedule "${id}" removed.`, "info");
+        return;
+      }
+
+      if (subCmd === "enable" || subCmd === "disable") {
+        const id = parts[1];
+        if (!id) { ctx.ui.notify(`Usage: /harness:schedule ${subCmd} <id>`, "warning"); return; }
+        const schedules = await readSchedule();
+        const schedule = schedules.find((s) => s.id === id);
+        if (!schedule) { ctx.ui.notify(`Schedule "${id}" not found.`, "warning"); return; }
+        schedule.enabled = subCmd === "enable";
+        await writeSchedule(schedules);
+        ctx.ui.notify(`Schedule "${id}" ${subCmd}d.`, "info");
+        return;
+      }
+
+      ctx.ui.notify("Usage: /harness:schedule <add|list|remove|enable|disable>", "warning");
+    },
+  });
+
+  // --- Discover Command ---
+
+  pi.registerCommand("harness:discover", {
+    description:
+      "Interactive repo assessment — analyzes your repo and interviews you to create tasks. Flags: --focus <areas>",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+
+      // Parse --focus flag
+      let focusAreas: string[] | undefined;
+      const trimmed = (args ?? "").trim();
+      const focusMatch = trimmed.match(/--focus\s+(\S+)/);
+      if (focusMatch) {
+        focusAreas = focusMatch[1].split(",").map((a) => a.trim()).filter(Boolean);
+      }
+
+      ctx.ui.notify("Scanning repository...", "info");
+      const snapshot = await buildRepoSnapshot(cwd, pi);
+
+      // Format snapshot as markdown
+      const snapshotLines: string[] = [
+        "## Repo Analysis",
+        "",
+        `**Branch:** ${snapshot.branchName}`,
+        `**Languages:** ${snapshot.languages.length > 0 ? snapshot.languages.join(", ") : "unknown"}`,
+        `**Frameworks:** ${snapshot.frameworks.length > 0 ? snapshot.frameworks.join(", ") : "none detected"}`,
+        `**Test framework:** ${snapshot.testFramework ?? "none detected"}`,
+        `**TODO/FIXME/HACK count:** ${snapshot.todoCount}`,
+        "",
+      ];
+
+      if (snapshot.existingTasks.length > 0) {
+        snapshotLines.push(`**Existing tasks:** ${snapshot.existingTasks.join(", ")}`, "");
+      }
+
+      if (snapshot.recentCommits.length > 0) {
+        snapshotLines.push("### Recent Commits", "", ...snapshot.recentCommits.map((c) => `- ${c}`), "");
+      }
+
+      if (snapshot.fileTree) {
+        snapshotLines.push("### File Tree (top 2 levels)", "", "```", snapshot.fileTree, "```", "");
+      }
+
+      if (focusAreas) {
+        snapshotLines.push(`**Focus filter:** ${focusAreas.join(", ")}`, "");
+      }
+
+      // Compose interview instructions
+      const instructions = [
+        ...snapshotLines,
+        "## Your Task",
+        "",
+        "You just ran `/harness:discover`. Interview the user to create harness tasks:",
+        "",
+        "1. Present the repo summary above in a concise, readable format",
+        "2. Ask what they want to accomplish in this session",
+        "3. Based on their answer + the repo data, propose 2-5 tasks, each with:",
+        "   - A kebab-case name",
+        "   - A suggested role (developer, architect, tester, reviewer, researcher, designer, builder, analyst, planner)",
+        "   - 2-4 concrete goals",
+        "4. Let the user adjust names, roles, goals, or add/remove tasks",
+        "5. For each approved task, run: `/harness:add <name> --role <role> goal1, goal2, ...`",
+        "6. End with a summary of created tasks and suggest `/harness:launch`",
+        "",
+        "Available roles: developer (default), architect, tester, reviewer, researcher, designer, builder, analyst, planner",
+      ];
+
+      pi.sendMessage(
+        { customType: "harness-discover", content: instructions.join("\n"), display: true },
+        { triggerTurn: true },
+      );
+    },
+  });
+
+  // --- Live Config Reload Command ---
+
+  pi.registerCommand("harness:config", {
+    description: "Show current harness runtime configuration and live-reloadable settings.",
+    handler: async (_args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+
+      const lines: string[] = ["## Harness Runtime Config", ""];
+
+      // Effective values
+      lines.push("| Setting | Effective | Source |");
+      lines.push("|---------|-----------|--------|");
+
+      let configOnDisk: HarnessRuntimeConfig | null = null;
+      try {
+        const raw = JSON.parse(await readFile(join(cwd, HARNESS_CONFIG_FILE), "utf-8"));
+        configOnDisk = validateRuntimeConfig(raw);
+      } catch { /* no file */ }
+
+      const maxWSource = configOnDisk?.maxWorkers !== undefined ? ".harness-config.json" : "CLI / default";
+      const staggerSource = configOnDisk?.staggerMs !== undefined ? ".harness-config.json" : "CLI / default";
+      lines.push(`| maxWorkers | ${effectiveMaxWorkers === Infinity ? "∞ (no limit)" : effectiveMaxWorkers} | ${maxWSource} |`);
+      lines.push(`| staggerMs | ${effectiveStaggerMs} | ${staggerSource} |`);
+      lines.push("");
+
+      // Model routes summary
+      try {
+        const routesContent = await readFile(join(cwd, MODEL_ROUTES_FILE), "utf-8");
+        const routes = JSON.parse(routesContent) as ModelRoute[];
+        lines.push(`**Model routes**: ${routes.length} route(s) configured`);
+      } catch {
+        lines.push("**Model routes**: using defaults");
+      }
+
+      lines.push("");
+      lines.push('Edit `.pi-agent/.harness-config.json` to change — auto-detected on next cycle.');
+
+      pi.sendMessage(
+        { customType: "harness-config", content: lines.join("\n"), display: true },
+        { triggerTurn: false },
+      );
+    },
+  });
+
+  // --- Feature 8: Sandbox Command ---
+
+  pi.registerCommand("harness:sandbox", {
+    description: "Configure sandboxed worker execution. Sub-commands: on, off, config.",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+      const subCmd = (args ?? "").trim().split(/\s+/)[0] ?? "config";
+
+      if (subCmd === "on") {
+        const config: SandboxConfig = {
+          enabled: true,
+          image: DEFAULT_SANDBOX_IMAGE,
+          mountPaths: [],
+          networkMode: "host",
+          memoryLimit: "2g",
+        };
+        await mkdir(piAgentDir(), { recursive: true });
+        await atomicWriteFile(join(cwd, SANDBOX_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n");
+        ctx.ui.notify("Sandbox enabled. Workers will run inside Docker containers.", "info");
+        return;
+      }
+
+      if (subCmd === "off") {
+        try { await rm(join(cwd, SANDBOX_CONFIG_FILE)); } catch { /* may not exist */ }
+        ctx.ui.notify("Sandbox disabled.", "info");
+        return;
+      }
+
+      // Show current config
+      try {
+        const content = await readFile(join(cwd, SANDBOX_CONFIG_FILE), "utf-8");
+        pi.sendMessage(
+          { customType: "harness-sandbox", content: `## Sandbox Config\n\n\`\`\`json\n${content}\`\`\``, display: true },
+          { triggerTurn: false },
+        );
+      } catch {
+        ctx.ui.notify("No sandbox config. Use `/harness:sandbox on` to enable.", "info");
+      }
+    },
+  });
+
   // --- BMAD Command ---
 
   pi.registerCommand("harness:bmad", {
     description:
-      "Run full BMAD methodology via harness workers. Supports --max-workers N.",
+      "Run full BMAD methodology via harness workers. Supports --max-workers N, --init, --model-routes, --heartbeat, --dashboard.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -4837,7 +6484,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Parse --max-workers flag
+      // Parse flags
       let maxWorkers = 3;
       const remaining = (args ?? "").trim();
       const maxFlag = remaining.match(/--max-workers\s+(\d+)/);
@@ -4845,11 +6492,115 @@ export default function (pi: ExtensionAPI) {
         maxWorkers = parseInt(maxFlag[1], 10);
       }
 
+      // Initialize live-reloadable effective values from CLI flags
+      effectiveMaxWorkers = maxWorkers;
+      effectiveStaggerMs = 5000;
+
+      const hasInitFlag = /--init\b/.test(remaining);
+
+      // Parse --level flag (default: 2)
+      let initLevel = 2;
+      const levelFlag = remaining.match(/--level\s+(\d+)/);
+      if (levelFlag) {
+        initLevel = parseInt(levelFlag[1], 10);
+      }
+
+      // Feature 1: Model routes (shared with /harness:launch)
+      const modelRoutesFlag = remaining.match(/--model-routes\s+(\S+)/);
+      if (modelRoutesFlag) {
+        try {
+          const routesContent = await readFile(modelRoutesFlag[1], "utf-8");
+          await mkdir(piAgentDir(), { recursive: true });
+          await atomicWriteFile(join(cwd, MODEL_ROUTES_FILE), routesContent);
+        } catch (e) {
+          ctx.ui.notify(`Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`, "warning");
+        }
+      }
+
+      // Feature 3: Heartbeat interval (shared with /harness:launch)
+      const heartbeatFlag = remaining.match(/--heartbeat\s+(\d+)/);
+      if (heartbeatFlag) {
+        const hbConfig: HeartbeatConfig = {
+          ...DEFAULT_HEARTBEAT_CONFIG,
+          intervalMs: parseInt(heartbeatFlag[1], 10),
+        };
+        await mkdir(piAgentDir(), { recursive: true });
+        await atomicWriteFile(join(cwd, HEARTBEAT_CONFIG_FILE), JSON.stringify(hbConfig, null, 2) + "\n");
+      }
+
+      // Feature 10: Dashboard (shared with /harness:launch)
+      const enableDashboard = remaining.includes("--dashboard");
+
+      // If --init, auto-scaffold BMAD config + status before loading
+      if (hasInitFlag) {
+        const existingConfig = await loadBmadConfig(cwd);
+        if (existingConfig) {
+          ctx.ui.notify(
+            "BMAD config already exists. Skipping --init scaffold.",
+            "info",
+          );
+        } else {
+          // Auto-detect project name
+          let projectName = "";
+          let projectType = "web-app";
+          try {
+            const pkg = JSON.parse(await readFile(join(cwd, "package.json"), "utf-8"));
+            projectName = pkg.name || "";
+          } catch { /* no package.json */ }
+          if (!projectName) {
+            try {
+              const pyproject = await readFile(join(cwd, "pyproject.toml"), "utf-8");
+              const nameMatch = pyproject.match(/^name\s*=\s*"([^"]+)"/m);
+              if (nameMatch) projectName = nameMatch[1];
+            } catch { /* no pyproject.toml */ }
+          }
+          if (!projectName) {
+            projectName = cwd.split("/").pop() || "project";
+          }
+
+          // Auto-detect project type from files
+          try { await stat(join(cwd, "package.json")); projectType = "web-app"; }
+          catch {
+            try { await stat(join(cwd, "pyproject.toml")); projectType = "api"; }
+            catch {
+              try { await stat(join(cwd, "go.mod")); projectType = "api"; }
+              catch {
+                try { await stat(join(cwd, "Cargo.toml")); projectType = "library"; }
+                catch { projectType = "web-app"; }
+              }
+            }
+          }
+
+          // Write config
+          await mkdir(join(cwd, "bmad"), { recursive: true });
+          const configContent = getBmadTemplate("config", null, {
+            project_name: projectName,
+            project_type: projectType,
+            project_level: String(initLevel),
+          });
+          await writeFile(join(cwd, "bmad", "config.yaml"), configContent);
+
+          // Write status file
+          await mkdir(join(cwd, "docs"), { recursive: true });
+          const statusContent = getBmadTemplate("workflow-status", null, {
+            project_name: projectName,
+            project_type: projectType,
+            project_level: String(initLevel),
+          });
+          await writeFile(join(cwd, "docs", "bmm-workflow-status.yaml"), statusContent);
+
+          ctx.ui.notify(
+            `BMAD initialized: ${projectName} (${projectType}, level ${initLevel})`,
+            "info",
+          );
+        }
+      }
+
       // Load BMAD config
       const bmadConfig = await loadBmadConfig(cwd);
       if (!bmadConfig) {
         ctx.ui.notify(
-          "No BMAD configuration found. Run /bmad-init first.",
+          "No BMAD configuration found. Run /bmad-init or /harness:bmad --init first.",
           "error",
         );
         return;
@@ -5006,8 +6757,8 @@ export default function (pi: ExtensionAPI) {
 
         launched.push(`${config.name} (Phase ${dag.find((s) => `${BMAD_PREFIX}${s.workflowName}` === config.name)?.phase})`);
 
-        if (i < toSpawn.length - 1) {
-          await new Promise((r) => setTimeout(r, 5000));
+        if (i < toSpawn.length - 1 && effectiveStaggerMs > 0) {
+          await new Promise((r) => setTimeout(r, effectiveStaggerMs));
         }
       }
 
@@ -5097,6 +6848,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.setStatus("harness", "harness: bmad active");
+
+      // Feature 10: Start dashboard if requested
+      if (enableDashboard) {
+        await startDashboardServer();
+      }
 
       // Build launch report
       const reportLines = [
@@ -5266,6 +7022,10 @@ export default function (pi: ExtensionAPI) {
 
       const staggerMatch = remaining.match(/--stagger\s+(\d+)/);
       if (staggerMatch) staggerMs = parseInt(staggerMatch[1], 10);
+
+      // Initialize live-reloadable effective values from CLI flags
+      effectiveMaxWorkers = maxWorkers;
+      effectiveStaggerMs = staggerMs;
 
       if (remaining.includes("--yes")) autoApprove = true;
 

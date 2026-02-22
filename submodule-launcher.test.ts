@@ -59,6 +59,8 @@ import {
   buildBmadWorkflowDag,
   buildScoutPrompt,
   buildPlanFromAnalysis,
+  buildRepoSnapshot,
+  type RepoSnapshot,
   AUTO_MODE_FILE,
   SCOUT_ANALYSIS_FILE,
   SCOUT_REPORT_FILE,
@@ -69,6 +71,42 @@ import {
   type ScoutCategory,
   type AutoModeConfig,
   type AutoModeState,
+  // Feature 1-10 exports
+  tokenize,
+  computeBM25,
+  resolveModelForWorker,
+  searchMemories,
+  getToolPolicy,
+  ROLE_TOOL_POLICIES,
+  type ToolPolicy,
+  getTemplateOverrides,
+  buildDockerCmd,
+  isScheduleDue,
+  MODEL_ROUTES_FILE,
+  DEFAULT_MODEL_ROUTES,
+  MEMORY_FILE,
+  MAX_MEMORIES,
+  HEARTBEAT_CONFIG_FILE,
+  DEFAULT_HEARTBEAT_CONFIG,
+  MAX_WORKER_RECOVERIES,
+  WORKER_RECOVERY_COOLDOWN_MS,
+  TEMPLATE_STORE_FILE,
+  SCHEDULE_FILE,
+  SANDBOX_CONFIG_FILE,
+  DEFAULT_SANDBOX_IMAGE,
+  TRIGGERS_DIR,
+  HARNESS_CONFIG_FILE,
+  validateRuntimeConfig,
+  type HarnessRuntimeConfig,
+  type ModelRoute,
+  type HarnessMemory,
+  type MemoryStore,
+  type HeartbeatConfig,
+  type TemplateRating,
+  type TemplateStore,
+  type ScheduledRun,
+  type SandboxConfig,
+  type TriggerEvent,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 import { WORKFLOW_DEFS } from "./bmad.js";
@@ -3393,7 +3431,31 @@ describe("session_start mailbox setup", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("creates parent and manager mailbox directories", async () => {
+  it("does NOT create mailbox directories when harness is inactive", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const parentDir = mailboxPath(tmpDir, "parent");
+
+    // Mailboxes should NOT be created when loopActive is false
+    await expect(readdir(parentDir)).rejects.toThrow(/ENOENT/);
+  });
+
+  it("creates parent and manager mailbox directories when harness is active", async () => {
+    // Simulate active harness by writing a valid persisted state file
+    const piAgentPath = join(tmpDir, ".pi-agent");
+    await mkdir(piAgentPath, { recursive: true });
+    await writeFile(
+      join(tmpDir, LAUNCH_STATE_FILE),
+      JSON.stringify({
+        active: true,
+        sessions: {},
+        managerSpawned: false,
+        managerCwd: tmpDir,
+        managerSpawnedAt: null,
+      }),
+    );
+
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
 
@@ -4186,7 +4248,7 @@ describe("tmux helpers", () => {
     const cmdIndex = bashCArg.lastIndexOf("-c");
     const loopCmd = bashCArg[cmdIndex + 1];
     expect(loopCmd).toContain("while true");
-    expect(loopCmd).toContain("sleep 120");
+    expect(loopCmd).toContain("sleep 60"); // default heartbeat interval (60s)
     expect(loopCmd).toContain("stop-signal");
     expect(loopCmd).toContain('.pi-agent-prompt.md');
   });
@@ -4961,8 +5023,8 @@ describe("item #1: manager loop exit-code checking", () => {
     expect(loopCmd).toContain("consecutive_failures");
     expect(loopCmd).toContain(`consecutive_failures -ge ${MAX_CONSECUTIVE_FAILURES}`);
     expect(loopCmd).toContain(".pi-agent-errors.log");
-    expect(loopCmd).toContain("sleep 30");
-    expect(loopCmd).toContain("sleep 120");
+    expect(loopCmd).toContain("sleep 30"); // failure sleep (intervalMs / 2000)
+    expect(loopCmd).toContain("sleep 60"); // success sleep (default heartbeat intervalMs / 1000)
   });
 
   it("MAX_CONSECUTIVE_FAILURES constant is exported as 5", () => {
@@ -5039,10 +5101,11 @@ describe("item #2: worker heartbeat monitoring", () => {
     );
   });
 
-  it("turn_end classifies dead workers when tmux session is gone", async () => {
+  it("turn_end auto-recovers dead workers with incomplete goals", async () => {
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
 
+    let hasLaunched = false;
     mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
       if (cmd === "git" && args[0] === "worktree" && args[1] === "add") {
         await mkdir(args[2], { recursive: true });
@@ -5058,7 +5121,6 @@ describe("item #2: worker heartbeat monitoring", () => {
       return { stdout: "", stderr: "", exitCode: 0 };
     });
 
-    let hasLaunched = false;
     const cmd = mock.getCommand("harness:launch")!;
     await cmd.handler("--stagger 0", ctx);
     hasLaunched = true; // Now tmux sessions appear dead
@@ -5076,9 +5138,11 @@ describe("item #2: worker heartbeat monitoring", () => {
     ctx.ui.setStatus.mockClear();
     await mock.emit("turn_end", {}, ctx);
 
+    // Worker has incomplete goals, so auto-recovery kicks in
+    // Result: 1 active (recovered) + 1 recovery marker
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "harness",
-      expect.stringContaining("0a/0s/1d"),
+      expect.stringContaining("1r"), // recovery marker
     );
   });
 });
@@ -5140,8 +5204,7 @@ describe("item #3: cache invalidation", () => {
     // First turn_end — reads status (cache miss)
     await mock.emit("turn_end", {}, ctx);
 
-    // Update status file (changes mtime)
-    // Add small delay to ensure mtime changes
+    // Update both manager status AND goal file (simulate worker completing)
     await new Promise(resolve => setTimeout(resolve, 50));
     await writeFile(
       statusPath,
@@ -5151,6 +5214,11 @@ describe("item #3: cache invalidation", () => {
         submodules: { "cache-test": { completed: 1, total: 1, allDone: true } },
         stallCount: 0,
       }),
+    );
+    // Update goal file to match — deterministic counting reads from goal files
+    await writeFile(
+      join(tmpDir, PI_AGENT_DIR, "cache-test.md"),
+      "# cache-test\npath: .\n\n## Goals\n- [x] Goal 1\n",
     );
 
     // Second turn_end — should detect mtime change and re-read
@@ -7185,5 +7253,1094 @@ describe("/harness:auto cancel", () => {
       scoutGoalExists = false;
     }
     expect(scoutGoalExists).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 1: Multi-Model Worker Routing
+// ---------------------------------------------------------------------------
+describe("Feature 1: resolveModelForWorker", () => {
+  it("matches by role", () => {
+    const routes: ModelRoute[] = [
+      { model: "claude-opus-4-6", roles: ["architect", "analyst"] },
+      { model: "default", roles: ["developer"] },
+    ];
+    expect(resolveModelForWorker(routes, "architect", "my-task")).toBe("claude-opus-4-6");
+    expect(resolveModelForWorker(routes, "developer", "my-task")).toBeNull();
+  });
+
+  it("matches by taskPattern regex before role", () => {
+    const routes: ModelRoute[] = [
+      { model: "claude-opus-4-6", taskPattern: "^security-" },
+      { model: "default", roles: ["developer", "architect"] },
+    ];
+    expect(resolveModelForWorker(routes, "developer", "security-audit")).toBe("claude-opus-4-6");
+    expect(resolveModelForWorker(routes, "developer", "auth-api")).toBeNull();
+  });
+
+  it("returns null when no routes match", () => {
+    const routes: ModelRoute[] = [
+      { model: "claude-opus-4-6", roles: ["researcher"] },
+    ];
+    expect(resolveModelForWorker(routes, "developer", "my-task")).toBeNull();
+  });
+
+  it("handles invalid regex gracefully", () => {
+    const routes: ModelRoute[] = [
+      { model: "claude-opus-4-6", taskPattern: "[invalid" },
+      { model: "default", roles: ["developer"] },
+    ];
+    // Invalid regex is skipped, falls through to role match
+    expect(resolveModelForWorker(routes, "developer", "anything")).toBeNull();
+  });
+
+  it("DEFAULT_MODEL_ROUTES has expected structure", () => {
+    expect(DEFAULT_MODEL_ROUTES.length).toBeGreaterThanOrEqual(2);
+    expect(DEFAULT_MODEL_ROUTES[0].model).toBe("default");
+    expect(DEFAULT_MODEL_ROUTES[1].model).toBe("claude-opus-4-6");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 2: Memory/Context Persistence — BM25 Search
+// ---------------------------------------------------------------------------
+describe("tokenize", () => {
+  it("splits on whitespace and punctuation", () => {
+    expect(tokenize("Hello, world! Foo-bar")).toEqual(["hello", "world", "foo", "bar"]);
+  });
+
+  it("returns empty array for empty string", () => {
+    expect(tokenize("")).toEqual([]);
+  });
+
+  it("handles hyphenated words", () => {
+    expect(tokenize("rate-limit")).toEqual(["rate", "limit"]);
+  });
+
+  it("lowercases all tokens", () => {
+    expect(tokenize("PostgreSQL DATABASE")).toEqual(["postgresql", "database"]);
+  });
+});
+
+describe("computeBM25", () => {
+  it("scores higher TF higher", () => {
+    const docs = [
+      ["database", "database", "layer"],
+      ["database", "api", "service"],
+    ];
+    const scores = computeBM25(["database"], docs);
+    expect(scores[0]).toBeGreaterThan(scores[1]);
+  });
+
+  it("returns zeros for empty documents", () => {
+    const scores = computeBM25(["test"], []);
+    expect(scores).toEqual([]);
+  });
+
+  it("returns zeros for empty query terms", () => {
+    const scores = computeBM25([], [["a", "b"]]);
+    expect(scores).toEqual([0]);
+  });
+
+  it("rare terms score higher (IDF effect)", () => {
+    const docs = [
+      ["common", "rare"],
+      ["common", "common"],
+      ["common", "other"],
+    ];
+    const scoresRare = computeBM25(["rare"], docs);
+    const scoresCommon = computeBM25(["common"], docs);
+    // "rare" appears in 1 doc (high IDF), "common" in 3 docs (low IDF)
+    // The doc containing "rare" should score higher for "rare" than for "common"
+    expect(scoresRare[0]).toBeGreaterThan(scoresCommon[0]);
+  });
+});
+
+describe("Feature 2: searchMemories (BM25)", () => {
+  const memories: HarnessMemory[] = [
+    {
+      id: "1", timestamp: "2024-01-01", source: "worker-a",
+      category: "decision", content: "Use PostgreSQL for the database",
+      tags: ["database", "postgres"], relevance: 0.8,
+    },
+    {
+      id: "2", timestamp: "2024-01-02", source: "worker-b",
+      category: "error", content: "API rate limit hit on external service",
+      tags: ["api", "rate-limit"], relevance: 0.6,
+    },
+    {
+      id: "3", timestamp: "2024-01-03", source: "worker-a",
+      category: "pattern", content: "Repository pattern works well for data layer",
+      tags: ["pattern", "repository"], relevance: 0.9,
+    },
+  ];
+
+  it("finds memories by content term", () => {
+    const results = searchMemories(memories, "PostgreSQL");
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe("1");
+  });
+
+  it("finds memories by tag match", () => {
+    const results = searchMemories(memories, "api");
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe("2");
+  });
+
+  it("respects limit parameter", () => {
+    const results = searchMemories(memories, "the", 1);
+    expect(results.length).toBe(1);
+  });
+
+  it("ranks by BM25 score with tag bonus", () => {
+    const results = searchMemories(memories, "database");
+    expect(results[0].id).toBe("1"); // BM25 content match + tag match
+  });
+
+  it("returns empty array when nothing matches", () => {
+    const results = searchMemories(memories, "zzz-no-match");
+    expect(results.length).toBe(0);
+  });
+
+  it("returns empty array for empty query", () => {
+    const results = searchMemories(memories, "");
+    expect(results.length).toBe(0);
+  });
+
+  it("handles multi-term queries", () => {
+    const results = searchMemories(memories, "rate limit service");
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].id).toBe("2");
+  });
+
+  it("ranks by term frequency", () => {
+    const mems: HarnessMemory[] = [
+      {
+        id: "a", timestamp: "2024-01-01", source: "w",
+        category: "insight", content: "database database database query optimization",
+        tags: [], relevance: 0.5,
+      },
+      {
+        id: "b", timestamp: "2024-01-01", source: "w",
+        category: "insight", content: "database connection pooling",
+        tags: [], relevance: 0.5,
+      },
+    ];
+    const results = searchMemories(mems, "database");
+    expect(results[0].id).toBe("a"); // higher TF
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Role-Based Tool Policies
+// ---------------------------------------------------------------------------
+describe("getToolPolicy", () => {
+  it("returns read-only policy for researcher", () => {
+    const policy = getToolPolicy("researcher");
+    expect(policy).not.toBeNull();
+    expect(policy!.mode).toBe("read-only");
+    expect(policy!.role).toBe("researcher");
+  });
+
+  it("returns targeted-write policy for reviewer", () => {
+    const policy = getToolPolicy("reviewer");
+    expect(policy).not.toBeNull();
+    expect(policy!.mode).toBe("targeted-write");
+  });
+
+  it("returns read-only for analyst", () => {
+    const policy = getToolPolicy("analyst");
+    expect(policy).not.toBeNull();
+    expect(policy!.mode).toBe("read-only");
+  });
+
+  it("returns targeted-write for architect", () => {
+    const policy = getToolPolicy("architect");
+    expect(policy).not.toBeNull();
+    expect(policy!.mode).toBe("targeted-write");
+  });
+
+  it("returns null for developer (full access)", () => {
+    expect(getToolPolicy("developer")).toBeNull();
+  });
+
+  it("returns null for builder (full access)", () => {
+    expect(getToolPolicy("builder")).toBeNull();
+  });
+
+  it("returns null for unknown role", () => {
+    expect(getToolPolicy("nonexistent")).toBeNull();
+  });
+
+  it("has policies for exactly 5 restricted roles", () => {
+    expect(ROLE_TOOL_POLICIES).toHaveLength(5);
+  });
+});
+
+describe("Feature 2: memory tools", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-memory-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("harness_remember stores a memory", async () => {
+    const tool = mock.getTool("harness_remember");
+    expect(tool).toBeDefined();
+    const result = await tool!.execute("tc1", {
+      content: "Test memory",
+      category: "insight",
+      tags: ["test"],
+    });
+    expect(result.content[0].text).toContain("Remembered");
+
+    // Verify file written
+    const content = await readFile(join(tmpDir, MEMORY_FILE), "utf-8");
+    const store = JSON.parse(content);
+    expect(store.memories.length).toBe(1);
+    expect(store.memories[0].content).toBe("Test memory");
+  });
+
+  it("harness_recall searches memories", async () => {
+    // Pre-populate memory
+    const store: MemoryStore = {
+      version: 1,
+      memories: [{
+        id: "test-1", timestamp: "2024-01-01", source: "test",
+        category: "decision", content: "Use TypeScript", tags: ["typescript"], relevance: 1.0,
+      }],
+    };
+    await writeFile(join(tmpDir, MEMORY_FILE), JSON.stringify(store));
+
+    const tool = mock.getTool("harness_recall");
+    const result = await tool!.execute("tc1", { query: "TypeScript" });
+    expect(result.content[0].text).toContain("TypeScript");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 3: Heartbeat-Driven Manager
+// ---------------------------------------------------------------------------
+describe("Feature 3: heartbeat config", () => {
+  it("DEFAULT_HEARTBEAT_CONFIG has expected defaults", () => {
+    expect(DEFAULT_HEARTBEAT_CONFIG.intervalMs).toBe(60_000);
+    expect(DEFAULT_HEARTBEAT_CONFIG.stalledThresholdMs).toBe(300_000);
+    expect(DEFAULT_HEARTBEAT_CONFIG.activeHoursOnly).toBe(false);
+    expect(DEFAULT_HEARTBEAT_CONFIG.activeHoursStart).toBe(9);
+    expect(DEFAULT_HEARTBEAT_CONFIG.activeHoursEnd).toBe(17);
+  });
+
+  it("HEARTBEAT_CONFIG_FILE path is correct", () => {
+    expect(HEARTBEAT_CONFIG_FILE).toBe(".pi-agent/.heartbeat-config.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 4: Worker Health & Auto-Recovery
+// ---------------------------------------------------------------------------
+describe("Feature 4: worker recovery constants", () => {
+  it("MAX_WORKER_RECOVERIES is 3", () => {
+    expect(MAX_WORKER_RECOVERIES).toBe(3);
+  });
+
+  it("WORKER_RECOVERY_COOLDOWN_MS is 30 seconds", () => {
+    expect(WORKER_RECOVERY_COOLDOWN_MS).toBe(30_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 5: Inter-Agent Communication
+// ---------------------------------------------------------------------------
+describe("Feature 5: inter-agent communication tools", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-comm-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("harness_send_message sends to manager", async () => {
+    const tool = mock.getTool("harness_send_message");
+    expect(tool).toBeDefined();
+    const result = await tool!.execute("tc1", {
+      to: "manager",
+      message: "Hello manager",
+    });
+    expect(result.content[0].text).toContain("Message sent to manager");
+
+    // Verify message in mailbox
+    const msgs = await readMailbox(tmpDir, "manager");
+    expect(msgs.length).toBe(1);
+    expect(msgs[0].message.payload).toEqual({ text: "Hello manager" });
+  });
+
+  it("harness_send_message rejects unknown targets", async () => {
+    const tool = mock.getTool("harness_send_message");
+    const result = await tool!.execute("tc1", {
+      to: "nonexistent-worker",
+      message: "test",
+    });
+    expect(result.isError).toBe(true);
+  });
+
+  it("harness_read_messages reads and deletes", async () => {
+    // Pre-populate mailbox
+    await sendMailboxMessage(tmpDir, "parent", "worker-a", "status_report", { status: "ok" });
+
+    const tool = mock.getTool("harness_read_messages");
+    const result = await tool!.execute("tc1", {});
+    expect(result.content[0].text).toContain("Messages");
+
+    // Verify messages deleted
+    const remaining = await readMailbox(tmpDir, "parent");
+    expect(remaining.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 6: Self-Improving Templates
+// ---------------------------------------------------------------------------
+describe("Feature 6: getTemplateOverrides", () => {
+  it("returns empty array when no ratings exist", () => {
+    const store: TemplateStore = { version: 1, ratings: [], roleOverrides: {} };
+    expect(getTemplateOverrides(store, "developer")).toEqual([]);
+  });
+
+  it("returns role overrides when explicitly set", () => {
+    const store: TemplateStore = {
+      version: 1,
+      ratings: [],
+      roleOverrides: { developer: ["Be more verbose", "Include examples"] },
+    };
+    const result = getTemplateOverrides(store, "developer");
+    expect(result).toEqual(["Be more verbose", "Include examples"]);
+  });
+
+  it("returns adjustments from low-rated entries", () => {
+    const store: TemplateStore = {
+      version: 1,
+      ratings: [
+        { role: "tester", taskName: "t1", rating: 2, feedback: "too vague", timestamp: "2024-01-01", adjustments: ["Be more specific about test requirements"] },
+        { role: "tester", taskName: "t2", rating: 1, feedback: "missing context", timestamp: "2024-01-02", adjustments: ["Include project structure info"] },
+      ],
+      roleOverrides: {},
+    };
+    const result = getTemplateOverrides(store, "tester");
+    expect(result.length).toBe(2);
+    expect(result).toContain("Be more specific about test requirements");
+  });
+
+  it("returns empty array when average rating >= 3", () => {
+    const store: TemplateStore = {
+      version: 1,
+      ratings: [
+        { role: "developer", taskName: "t1", rating: 4, feedback: "good", timestamp: "2024-01-01", adjustments: [] },
+        { role: "developer", taskName: "t2", rating: 5, feedback: "great", timestamp: "2024-01-02", adjustments: [] },
+      ],
+      roleOverrides: {},
+    };
+    expect(getTemplateOverrides(store, "developer")).toEqual([]);
+  });
+});
+
+describe("Feature 6: harness_rate_template tool", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-template-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("stores a rating", async () => {
+    const tool = mock.getTool("harness_rate_template");
+    expect(tool).toBeDefined();
+    const result = await tool!.execute("tc1", {
+      rating: 4,
+      feedback: "Good prompt",
+      adjustments: [],
+    });
+    expect(result.content[0].text).toContain("rated 4/5");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 7: Cron-Scheduled Runs
+// ---------------------------------------------------------------------------
+describe("Feature 7: isScheduleDue", () => {
+  it("daily schedule is due when not run today", () => {
+    const schedule: ScheduledRun = {
+      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true,
+    };
+    expect(isScheduleDue(schedule, new Date())).toBe(true);
+  });
+
+  it("daily schedule is not due when run recently", () => {
+    const schedule: ScheduledRun = {
+      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true,
+      lastRunAt: new Date().toISOString(),
+    };
+    expect(isScheduleDue(schedule, new Date())).toBe(false);
+  });
+
+  it("disabled schedule is never due", () => {
+    const schedule: ScheduledRun = {
+      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: false,
+    };
+    expect(isScheduleDue(schedule, new Date())).toBe(false);
+  });
+
+  it("HH:MM schedule matches within 5-minute window", () => {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const schedule: ScheduledRun = {
+      id: "s1", cron: `${hh}:${mm}`, maxWorkers: 3, maxIterations: 1, enabled: true,
+    };
+    expect(isScheduleDue(schedule, now)).toBe(true);
+  });
+
+  it("HH:MM schedule does not match when already run today", () => {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const schedule: ScheduledRun = {
+      id: "s1", cron: `${hh}:${mm}`, maxWorkers: 3, maxIterations: 1, enabled: true,
+      lastRunAt: now.toISOString(),
+    };
+    expect(isScheduleDue(schedule, now)).toBe(false);
+  });
+
+  it("hourly schedule is due when not run in last hour", () => {
+    const schedule: ScheduledRun = {
+      id: "s1", cron: "hourly", maxWorkers: 3, maxIterations: 1, enabled: true,
+    };
+    expect(isScheduleDue(schedule, new Date())).toBe(true);
+  });
+
+  it("weekly schedule is due when not run in last week", () => {
+    const schedule: ScheduledRun = {
+      id: "s1", cron: "weekly", maxWorkers: 3, maxIterations: 1, enabled: true,
+      lastRunAt: new Date(Date.now() - 8 * 86_400_000).toISOString(),
+    };
+    expect(isScheduleDue(schedule, new Date())).toBe(true);
+  });
+});
+
+describe("Feature 7: /harness:schedule command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-schedule-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("add creates a schedule", async () => {
+    const cmd = mock.getCommand("harness:schedule")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler('add --at 02:00 "nightly cleanup"', ctx);
+
+    const content = await readFile(join(tmpDir, SCHEDULE_FILE), "utf-8");
+    const schedules = JSON.parse(content) as ScheduledRun[];
+    expect(schedules.length).toBe(1);
+    expect(schedules[0].cron).toBe("02:00");
+    expect(schedules[0].enabled).toBe(true);
+  });
+
+  it("list shows schedules", async () => {
+    // Pre-populate
+    const schedules: ScheduledRun[] = [
+      { id: "test-1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true },
+    ];
+    await writeFile(join(tmpDir, SCHEDULE_FILE), JSON.stringify(schedules));
+
+    const cmd = mock.getCommand("harness:schedule")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler("list", ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("test-1") }),
+      expect.anything(),
+    );
+  });
+
+  it("remove deletes a schedule", async () => {
+    const schedules: ScheduledRun[] = [
+      { id: "to-remove", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true },
+    ];
+    await writeFile(join(tmpDir, SCHEDULE_FILE), JSON.stringify(schedules));
+
+    const cmd = mock.getCommand("harness:schedule")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler("remove to-remove", ctx);
+
+    const content = await readFile(join(tmpDir, SCHEDULE_FILE), "utf-8");
+    expect(JSON.parse(content)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 8: Sandboxed Worker Execution
+// ---------------------------------------------------------------------------
+describe("Feature 8: buildDockerCmd", () => {
+  it("builds correct docker run command", () => {
+    const config: SandboxConfig = {
+      enabled: true,
+      image: "node:20-slim",
+      mountPaths: ["/home/user/.config"],
+      networkMode: "host",
+      memoryLimit: "2g",
+    };
+    const result = buildDockerCmd(config, "/path/to/worktree", "pi -p test");
+    expect(result).toContain("docker run --rm");
+    expect(result).toContain("-v /path/to/worktree:/workspace");
+    expect(result).toContain("-w /workspace");
+    expect(result).toContain("--network host");
+    expect(result).toContain("--memory 2g");
+    expect(result).toContain("-v /home/user/.config:/home/user/.config");
+    expect(result).toContain("node:20-slim");
+    expect(result).toContain("pi -p test");
+  });
+
+  it("handles empty mountPaths", () => {
+    const config: SandboxConfig = {
+      enabled: true,
+      image: "node:20-slim",
+      mountPaths: [],
+      networkMode: "bridge",
+      memoryLimit: "1g",
+    };
+    const result = buildDockerCmd(config, "/wt", "pi -p x");
+    expect(result).not.toContain("/home"); // no extra mounts
+    expect(result).toContain("--network bridge");
+    expect(result).toContain("--memory 1g");
+  });
+
+  it("DEFAULT_SANDBOX_IMAGE is node:20-slim", () => {
+    expect(DEFAULT_SANDBOX_IMAGE).toBe("node:20-slim");
+  });
+});
+
+describe("Feature 8: /harness:sandbox command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-sandbox-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("on creates sandbox config", async () => {
+    const cmd = mock.getCommand("harness:sandbox")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler("on", ctx);
+
+    const content = await readFile(join(tmpDir, SANDBOX_CONFIG_FILE), "utf-8");
+    const config = JSON.parse(content) as SandboxConfig;
+    expect(config.enabled).toBe(true);
+    expect(config.image).toBe("node:20-slim");
+  });
+
+  it("off removes sandbox config", async () => {
+    // Create first
+    await writeFile(join(tmpDir, SANDBOX_CONFIG_FILE), '{"enabled":true}');
+    const cmd = mock.getCommand("harness:sandbox")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler("off", ctx);
+
+    let exists = true;
+    try { await readFile(join(tmpDir, SANDBOX_CONFIG_FILE)); } catch { exists = false; }
+    expect(exists).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 9: Webhook/Event Triggers
+// ---------------------------------------------------------------------------
+describe("Feature 9: trigger processing", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-triggers-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    await mkdir(join(tmpDir, TRIGGERS_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("processes trigger files on session_start", async () => {
+    const trigger: TriggerEvent = {
+      id: "t1",
+      type: "launch",
+      config: { maxWorkers: 2 },
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(tmpDir, TRIGGERS_DIR, "t1.json"), JSON.stringify(trigger));
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Trigger should be surfaced as message
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-trigger",
+        content: expect.stringContaining("launch"),
+      }),
+      expect.anything(),
+    );
+
+    // Trigger file should be deleted
+    const files = await readdir(join(tmpDir, TRIGGERS_DIR));
+    expect(files.filter(f => f.endsWith(".json"))).toHaveLength(0);
+  });
+
+  it("ignores malformed trigger files", async () => {
+    await writeFile(join(tmpDir, TRIGGERS_DIR, "bad.json"), "not json");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    // Should not throw
+    await mock.emit("session_start", {}, ctx);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 10: Web Dashboard
+// ---------------------------------------------------------------------------
+describe("Feature 10: dashboard constants", () => {
+  it("/harness:launch description includes --dashboard", () => {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const cmd = mock.getCommand("harness:launch");
+    expect(cmd).toBeDefined();
+    expect(cmd!.description).toContain("--dashboard");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature 2: /harness:forget command
+// ---------------------------------------------------------------------------
+describe("Feature 2: /harness:forget command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-forget-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("clears memory store", async () => {
+    // Pre-populate
+    await writeFile(join(tmpDir, MEMORY_FILE), JSON.stringify({ version: 1, memories: [{ id: "1" }] }));
+
+    const cmd = mock.getCommand("harness:forget")!;
+    const ctx = createMockContext({ cwd: tmpDir });
+    await cmd.handler("", ctx);
+
+    let exists = true;
+    try { await readFile(join(tmpDir, MEMORY_FILE)); } catch { exists = false; }
+    expect(exists).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic Manager Operations
+// ---------------------------------------------------------------------------
+describe("Deterministic Operations: goal counting from goal files", () => {
+  it("parseGoalFile accurately counts completed vs total goals", () => {
+    const goalContent = [
+      "# test-worker",
+      "path: .",
+      "",
+      "## Goals",
+      "- [x] First goal",
+      "- [ ] Second goal",
+      "- [x] Third goal",
+    ].join("\n");
+    const config = parseGoalFile(goalContent, "test-worker.md");
+    expect(config.goals.length).toBe(3);
+    expect(config.goals.filter(g => g.completed).length).toBe(2);
+  });
+
+  it("parseGoalFile counts unanswered questions", () => {
+    const goalContent = [
+      "# test-worker",
+      "path: .",
+      "",
+      "## Goals",
+      "- [ ] Do something",
+      "",
+      "## Questions",
+      "- ? What database to use?",
+      "- ! How many replicas? → 3",
+    ].join("\n");
+    const config = parseGoalFile(goalContent, "test-worker.md");
+    const unanswered = config.questions.filter(q => !q.answered).length;
+    expect(unanswered).toBe(1);
+  });
+});
+
+describe("Deterministic Operations: auto-merge guards", () => {
+  it("blocks merge when unanswered questions exist", () => {
+    // This is tested via parseGoalFile — the turn_end auto-merge checks
+    // config.questions?.filter(q => !q.answered).length > 0
+    const goalContent = [
+      "# worker-a",
+      "path: .",
+      "",
+      "## Goals",
+      "- [x] Done",
+      "",
+      "## Questions",
+      "- ? Unanswered question",
+    ].join("\n");
+    const config = parseGoalFile(goalContent, "worker-a.md");
+    const allGoalsDone = config.goals.every(g => g.completed);
+    const hasUnanswered = (config.questions?.filter(q => !q.answered).length ?? 0) > 0;
+    expect(allGoalsDone).toBe(true);
+    expect(hasUnanswered).toBe(true);
+    // Auto-merge would skip this worker because hasUnanswered is true
+  });
+
+  it("allows merge when all goals done and no unanswered questions", () => {
+    const goalContent = [
+      "# worker-b",
+      "path: .",
+      "",
+      "## Goals",
+      "- [x] Done",
+      "- [x] Also done",
+    ].join("\n");
+    const config = parseGoalFile(goalContent, "worker-b.md");
+    const allGoalsDone = config.goals.every(g => g.completed);
+    const hasUnanswered = (config.questions?.filter(q => !q.answered).length ?? 0) > 0;
+    expect(allGoalsDone).toBe(true);
+    expect(hasUnanswered).toBe(false);
+    // Auto-merge would proceed for this worker
+  });
+
+  it("skips workers with no goals", () => {
+    const goalContent = [
+      "# worker-c",
+      "path: .",
+      "",
+      "## Goals",
+    ].join("\n");
+    const config = parseGoalFile(goalContent, "worker-c.md");
+    expect(config.goals.length).toBe(0);
+    // Auto-merge skips when goals.length === 0
+  });
+});
+
+describe("Deterministic Operations: queue dispatch logic", () => {
+  it("readQueue returns items with correct status", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "harness-queue-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    const queue = {
+      items: [
+        { id: "q1", topic: "task-a", description: "desc", priority: 10, status: "pending" as const, createdAt: new Date().toISOString() },
+        { id: "q2", topic: "task-b", description: "desc", priority: 5, status: "dispatched" as const, createdAt: new Date().toISOString() },
+      ],
+    };
+    await writeFile(join(tmpDir, QUEUE_FILE), JSON.stringify(queue));
+    const loaded = await readQueue(tmpDir);
+    const pending = loaded.items.filter(i => i.status === "pending");
+    expect(pending.length).toBe(1);
+    expect(pending[0].topic).toBe("task-a");
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("writeQueue persists dispatched status", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "harness-queue-"));
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    const queue = {
+      items: [
+        { id: "q1", topic: "task-a", description: "desc", priority: 10, status: "dispatched" as const, createdAt: new Date().toISOString() },
+      ],
+    };
+    await writeFile(join(tmpDir, QUEUE_FILE), JSON.stringify(queue));
+    const loaded = await readQueue(tmpDir);
+    expect(loaded.items[0].status).toBe("dispatched");
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe("Live Config Reload: validateRuntimeConfig", () => {
+  it("accepts valid config with both fields", () => {
+    const result = validateRuntimeConfig({ maxWorkers: 4, staggerMs: 3000 });
+    expect(result).toEqual({ maxWorkers: 4, staggerMs: 3000 });
+  });
+
+  it("accepts config with only maxWorkers", () => {
+    const result = validateRuntimeConfig({ maxWorkers: 10 });
+    expect(result).toEqual({ maxWorkers: 10 });
+  });
+
+  it("accepts config with only staggerMs", () => {
+    const result = validateRuntimeConfig({ staggerMs: 0 });
+    expect(result).toEqual({ staggerMs: 0 });
+  });
+
+  it("accepts empty object (no overrides)", () => {
+    const result = validateRuntimeConfig({});
+    expect(result).toEqual({});
+  });
+
+  it("accepts boundary values", () => {
+    expect(validateRuntimeConfig({ maxWorkers: 1 })).toEqual({ maxWorkers: 1 });
+    expect(validateRuntimeConfig({ maxWorkers: 50 })).toEqual({ maxWorkers: 50 });
+    expect(validateRuntimeConfig({ staggerMs: 0 })).toEqual({ staggerMs: 0 });
+    expect(validateRuntimeConfig({ staggerMs: 60000 })).toEqual({ staggerMs: 60000 });
+  });
+
+  it("rejects maxWorkers below 1", () => {
+    expect(validateRuntimeConfig({ maxWorkers: 0 })).toBeNull();
+  });
+
+  it("rejects maxWorkers above 50", () => {
+    expect(validateRuntimeConfig({ maxWorkers: 51 })).toBeNull();
+  });
+
+  it("rejects negative staggerMs", () => {
+    expect(validateRuntimeConfig({ staggerMs: -1 })).toBeNull();
+  });
+
+  it("rejects staggerMs above 60000", () => {
+    expect(validateRuntimeConfig({ staggerMs: 60001 })).toBeNull();
+  });
+
+  it("rejects non-integer maxWorkers", () => {
+    expect(validateRuntimeConfig({ maxWorkers: 3.5 })).toBeNull();
+  });
+
+  it("rejects non-integer staggerMs", () => {
+    expect(validateRuntimeConfig({ staggerMs: 1000.5 })).toBeNull();
+  });
+
+  it("rejects string values", () => {
+    expect(validateRuntimeConfig({ maxWorkers: "4" })).toBeNull();
+  });
+
+  it("rejects null input", () => {
+    expect(validateRuntimeConfig(null)).toBeNull();
+  });
+
+  it("rejects array input", () => {
+    expect(validateRuntimeConfig([1, 2])).toBeNull();
+  });
+
+  it("rejects non-object input", () => {
+    expect(validateRuntimeConfig("string")).toBeNull();
+    expect(validateRuntimeConfig(42)).toBeNull();
+    expect(validateRuntimeConfig(true)).toBeNull();
+  });
+
+  it("ignores unknown fields and validates known fields", () => {
+    const result = validateRuntimeConfig({ maxWorkers: 5, unknownField: "ignored" });
+    expect(result).toEqual({ maxWorkers: 5 });
+  });
+
+  it("returns null if any known field is invalid even if others are valid", () => {
+    expect(validateRuntimeConfig({ maxWorkers: 5, staggerMs: -1 })).toBeNull();
+    expect(validateRuntimeConfig({ maxWorkers: 0, staggerMs: 3000 })).toBeNull();
+  });
+});
+
+describe("Live Config Reload: HARNESS_CONFIG_FILE constant", () => {
+  it("points to .pi-agent/.harness-config.json", () => {
+    expect(HARNESS_CONFIG_FILE).toBe(".pi-agent/.harness-config.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildRepoSnapshot tests
+// ---------------------------------------------------------------------------
+
+describe("buildRepoSnapshot", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-discover-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns expected structure with mock pi", async () => {
+    // Create a package.json for language/framework detection
+    await writeFile(
+      join(tmpDir, "package.json"),
+      JSON.stringify({
+        dependencies: { react: "^18.0.0" },
+        devDependencies: { vitest: "^1.0.0", typescript: "^5.0.0" },
+      }),
+      "utf-8",
+    );
+
+    // Create a .pi-agent dir with a goal file
+    await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
+    await writeFile(join(tmpDir, PI_AGENT_DIR, "my-task.md"), "# my-task\npath: .\n", "utf-8");
+
+    const mockPi = {
+      exec: vi.fn().mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === "find") return Promise.resolve({ stdout: ".\n./src\n./tests", stderr: "", exitCode: 0 });
+        if (cmd === "git" && args[0] === "log") return Promise.resolve({ stdout: "abc123 initial commit\ndef456 add feature", stderr: "", exitCode: 0 });
+        if (cmd === "git" && args[0] === "branch") return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
+        if (cmd === "grep") return Promise.resolve({ stdout: "./src/index.ts:3", stderr: "", exitCode: 0 });
+        return Promise.resolve({ stdout: "", stderr: "", exitCode: 0 });
+      }),
+    };
+
+    const snapshot = await buildRepoSnapshot(tmpDir, mockPi);
+
+    expect(snapshot.fileTree).toContain("./src");
+    expect(snapshot.languages).toContain("TypeScript/JavaScript");
+    expect(snapshot.languages).toContain("TypeScript");
+    expect(snapshot.frameworks).toContain("react");
+    expect(snapshot.frameworks).toContain("vitest");
+    expect(snapshot.testFramework).toBe("vitest");
+    expect(snapshot.recentCommits).toHaveLength(2);
+    expect(snapshot.branchName).toBe("main");
+    expect(snapshot.existingTasks).toEqual(["my-task"]);
+    expect(snapshot.todoCount).toBe(3);
+  });
+
+  it("handles missing manifests gracefully", async () => {
+    const mockPi = {
+      exec: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
+    };
+
+    const snapshot = await buildRepoSnapshot(tmpDir, mockPi);
+
+    expect(snapshot.languages).toEqual([]);
+    expect(snapshot.frameworks).toEqual([]);
+    expect(snapshot.testFramework).toBeNull();
+    expect(snapshot.existingTasks).toEqual([]);
+    expect(snapshot.todoCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:discover command tests
+// ---------------------------------------------------------------------------
+
+describe("/harness:discover command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "harness-discover-cmd-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("is registered as a command", () => {
+    expect(mock.getCommand("harness:discover")).toBeDefined();
+  });
+
+  it("sends message with triggerTurn: true", async () => {
+    mock.api.exec.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "git" && args[0] === "branch") return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
+      return Promise.resolve({ stdout: "", stderr: "", exitCode: 0 });
+    });
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:discover")!;
+    await cmd.handler("", ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-discover",
+        content: expect.stringContaining("Repo Analysis"),
+      }),
+      { triggerTurn: true },
+    );
+  });
+
+  it("includes focus areas when --focus flag is provided", async () => {
+    mock.api.exec.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:discover")!;
+    await cmd.handler("--focus tests,quality", ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.stringContaining("tests, quality"),
+      }),
+      { triggerTurn: true },
+    );
   });
 });
