@@ -4317,18 +4317,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    hlog("session.shutdown", { sessions: sessions.size, loopActive }, "info");
+    await hlog("session.shutdown", { sessions: sessions.size, loopActive }, "info");
     await persistState();
   });
 
   // --- Trace logging hooks ---
 
+  /** Round context usage percent to 1 decimal for cleaner traces. */
+  function usageData(usage: { tokens: number; percent: number } | null | undefined) {
+    if (!usage) return undefined;
+    return { tokens: usage.tokens, percent: Math.round(usage.percent * 10) / 10 };
+  }
+
   pi.on("turn_start", async (_event: unknown, ctx: unknown) => {
     if (!cwd) return;
     try {
       const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
-      const usage = c.getContextUsage?.();
-      hlog("turn.start", usage ? { tokens: usage.tokens, percent: usage.percent } : undefined);
+      hlog("turn.start", usageData(c.getContextUsage?.()));
     } catch {
       hlog("turn.start");
     }
@@ -4345,15 +4350,14 @@ export default function (pi: ExtensionAPI) {
         summary[k] = typeof v === "string" ? v.slice(0, 200) : v;
       }
     }
-    hlog("tool.call", summary);
+    hlog("tool.call", summary, "info");
   });
 
   pi.on("turn_end", async (_event: unknown, ctx: unknown) => {
     if (!cwd) return;
     try {
       const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
-      const usage = c.getContextUsage?.();
-      hlog("turn.end", usage ? { tokens: usage.tokens, percent: usage.percent } : undefined);
+      hlog("turn.end", usageData(c.getContextUsage?.()));
     } catch {
       hlog("turn.end");
     }
@@ -4361,8 +4365,69 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async () => {
     if (!cwd) return;
-    hlog("agent.end");
+    await hlog("agent.end");
   });
+
+  // --- Tool instrumentation ---
+  // Wraps registerTool to add tool.result / tool.error tracing with duration.
+
+  const HARNESS_TOOLS = new Set([
+    "harness_status", "harness_update_goal", "harness_add_task",
+    "harness_ask", "harness_answer", "harness_queue", "harness_send",
+    "harness_inbox", "harness_remember", "harness_recall",
+    "harness_send_message", "harness_read_messages", "harness_rate_template",
+  ]);
+
+  const _origRegisterTool = pi.registerTool.bind(pi);
+  pi.registerTool = (def: any) => {
+    if (HARNESS_TOOLS.has(def.name)) {
+      // Wrap execute for tool.result / tool.error tracing with duration
+      if (def.execute) {
+        const origExecute = def.execute;
+        def.execute = async function (this: any, ...args: any[]) {
+          const start = Date.now();
+          try {
+            const result = await origExecute.apply(this, args);
+            const durationMs = Date.now() - start;
+            if (cwd) {
+              if (result?.isError) {
+                hlog("tool.error", { tool: def.name, durationMs, error: (result.content?.[0] as any)?.text?.slice(0, 200) }, "warn");
+              } else {
+                hlog("tool.result", { tool: def.name, durationMs }, "info");
+              }
+            }
+            return result;
+          } catch (e) {
+            const durationMs = Date.now() - start;
+            if (cwd) {
+              hlog("tool.error", { tool: def.name, durationMs, error: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200) }, "warn");
+            }
+            throw e;
+          }
+        };
+      }
+      // Wrap renderers to catch and trace errors
+      if (def.renderCall) {
+        const origRenderCall = def.renderCall;
+        def.renderCall = function (this: any, ...args: any[]) {
+          try { return origRenderCall.apply(this, args); } catch (e) {
+            if (cwd) hlog("render.error", { tool: def.name, phase: "call", error: String(e).slice(0, 200) }, "warn");
+            return new Text(def.label ?? def.name, 0, 0);
+          }
+        };
+      }
+      if (def.renderResult) {
+        const origRenderResult = def.renderResult;
+        def.renderResult = function (this: any, ...args: any[]) {
+          try { return origRenderResult.apply(this, args); } catch (e) {
+            if (cwd) hlog("render.error", { tool: def.name, phase: "result", error: String(e).slice(0, 200) }, "warn");
+            return new Text("...", 0, 0);
+          }
+        };
+      }
+    }
+    return _origRegisterTool(def);
+  };
 
   // --- Tools ---
 
@@ -4897,6 +4962,7 @@ export default function (pi: ExtensionAPI) {
         return queue.items.length;
       });
       invalidateCache();
+      hlog("queue.add", { id, topic: params.topic, role: params.role, priority: params.priority ?? 10, queueLength }, "info");
 
       // Notify manager of new work
       await sendMailboxMessage(cwd, "manager", "parent", "directive", {
