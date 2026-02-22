@@ -58,6 +58,8 @@ import {
   SCOUT_REPORT_FILE,
   type ScoutAnalysis,
   type AutoModeState,
+  HARNESS_LOG_FILE,
+  type HarnessLogEntry,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 
@@ -3085,10 +3087,14 @@ describe("e2e tmux verification (real tmux sessions)", () => {
     ctx.ui.setStatus.mockClear();
     await mock.emit("turn_end", {}, ctx);
 
-    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
-      "harness",
-      expect.stringContaining("0a/0s/1d"),
+    // Worker may be auto-recovered (Feature 4) or remain dead
+    const statusCall = ctx.ui.setStatus.mock.calls.find(
+      (c: any[]) => c[0] === "harness",
     );
+    expect(statusCall).toBeDefined();
+    const statusStr = statusCall![1] as string;
+    const deadOrRecovered = statusStr.includes("1d") || statusStr.includes("1r");
+    expect(deadOrRecovered).toBe(true);
 
     try {
       git(`worktree remove ${join(repo, WORKTREE_DIR, "liveness-e2e")} --force`, repo);
@@ -3508,10 +3514,11 @@ describe("BMAD e2e: Build → Monitor → Audit → Deploy pipeline", { timeout:
     mock.api.sendMessage.mockClear();
     await mock.emit("turn_end", {}, ctx);
 
-    // Status bar should show goal progress
+    // Status bar should show goal progress (deterministic counting from all goal files:
+    // build-backend 3/3 + build-frontend 2/2 + audit-security 0/3 + deploy-infra 0/2 = 5/10)
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "harness",
-      expect.stringContaining("5/5 goals"),
+      expect.stringContaining("5/10 goals"),
     );
 
     // Non-question inbox message should have been surfaced
@@ -5754,5 +5761,556 @@ describe("/harness:auto integration", () => {
 
     // Clean up
     await autoCmd!.handler("cancel", ctx);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trace logging e2e: real git repos, real events, real log files
+// ---------------------------------------------------------------------------
+
+describe("trace logging e2e", { timeout: 30_000 }, () => {
+  let baseDir: string;
+  let repo: string;
+
+  beforeAll(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "harness-trace-e2e-"));
+    repo = join(baseDir, "project");
+    git(`init ${repo}`, baseDir);
+    execSync(
+      `echo "# Trace E2E" > README.md && git add . && git commit -m "init"`,
+      { cwd: repo, shell: "/bin/bash", encoding: "utf-8" },
+    );
+  });
+
+  afterAll(async () => {
+    // Kill any tmux sessions
+    try {
+      execSync("tmux -L pi-harness kill-server 2>/dev/null", { encoding: "utf-8" });
+    } catch { /* no sessions */ }
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    // Clean up state
+    try { await rm(join(repo, PI_AGENT_DIR), { recursive: true, force: true }); } catch { /* ok */ }
+    try { git("worktree prune", repo); } catch { /* ok */ }
+    try {
+      const branches = git("branch --list 'pi-agent/*'", repo);
+      for (const b of branches.split("\n").map(s => s.trim()).filter(Boolean)) {
+        try { git(`branch -D ${b}`, repo); } catch { /* ok */ }
+      }
+    } catch { /* no branches */ }
+  });
+
+  function freshHarness() {
+    const mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    const ctx = createMockContext(repo);
+    return { mock, ctx };
+  }
+
+  function interceptPiSpawns(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const originalExec = mock.api.exec.getMockImplementation();
+    mock.api.exec.mockImplementation(
+      async (cmd: string, args: string[], opts?: any) => {
+        if (cmd === "pi" || cmd === "tmux") {
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return originalExec!(cmd, args, opts);
+      },
+    );
+    return originalExec;
+  }
+
+  /** Parse NDJSON log file into entries */
+  async function readTraceLog(): Promise<HarnessLogEntry[]> {
+    try {
+      const raw = await readFile(join(repo, HARNESS_LOG_FILE), "utf-8");
+      return raw
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          try { return JSON.parse(line) as HarnessLogEntry; } catch { return null; }
+        })
+        .filter((e): e is HarnessLogEntry => e !== null);
+    } catch {
+      return [];
+    }
+  }
+
+  // ---- Test 1: session lifecycle produces session.start + session.shutdown ----
+
+  it("session_start and session_shutdown produce trace entries", async () => {
+    const { mock, ctx } = freshHarness();
+
+    await mock.emit("session_start", {}, ctx);
+    await mock.emit("session_shutdown", {}, {});
+
+    // Give fire-and-forget appendFile a tick
+    await new Promise((r) => setTimeout(r, 100));
+
+    const entries = await readTraceLog();
+    const sessionStart = entries.find((e) => e.event === "session.start");
+    expect(sessionStart).toBeDefined();
+    expect(sessionStart!.level).toBe("info");
+    expect(sessionStart!.data?.cwd).toBe(repo);
+
+    const sessionShutdown = entries.find((e) => e.event === "session.shutdown");
+    expect(sessionShutdown).toBeDefined();
+    expect(sessionShutdown!.level).toBe("info");
+    expect(sessionShutdown!.data).toHaveProperty("sessions");
+    expect(sessionShutdown!.data).toHaveProperty("loopActive");
+  });
+
+  // ---- Test 2: tool_call event auto-captures tool invocations ----
+
+  it("tool_call event captures tool name and summarized input", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // Simulate a tool call event
+    await mock.emit("tool_call", {
+      toolName: "harness_update_goal",
+      input: { name: "auth-api", action: "complete", goalIndex: 0 },
+    }, ctx);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const entries = await readTraceLog();
+    const toolCall = entries.find((e) => e.event === "tool.call");
+    expect(toolCall).toBeDefined();
+    expect(toolCall!.data?.tool).toBe("harness_update_goal");
+    expect(toolCall!.data?.name).toBe("auth-api");
+    expect(toolCall!.data?.action).toBe("complete");
+  });
+
+  // ---- Test 3: tool_call truncates large string values to 200 chars ----
+
+  it("tool_call truncates large input values", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    const longString = "x".repeat(500);
+    await mock.emit("tool_call", {
+      toolName: "some_tool",
+      input: { bigField: longString },
+    }, ctx);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const entries = await readTraceLog();
+    const toolCall = entries.find((e) => e.event === "tool.call");
+    expect(toolCall).toBeDefined();
+    expect((toolCall!.data?.bigField as string).length).toBe(200);
+  });
+
+  // ---- Test 4: turn_end captures context usage ----
+
+  it("turn_end captures token usage from getContextUsage", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    // turn_end — note there are 2 turn_end handlers: the harness one
+    // (which only runs when loopActive) and our trace one (always runs).
+    await mock.emit("turn_end", {}, ctx);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const entries = await readTraceLog();
+    const turnEnd = entries.find((e) => e.event === "turn.end");
+    expect(turnEnd).toBeDefined();
+    expect(turnEnd!.data?.tokens).toBe(5000);
+    expect(turnEnd!.data?.percent).toBe(5);
+  });
+
+  // ---- Test 5: agent_end event captured ----
+
+  it("agent_end event is logged", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+
+    await mock.emit("agent_end", {}, ctx);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const entries = await readTraceLog();
+    const agentEnd = entries.find((e) => e.event === "agent.end");
+    expect(agentEnd).toBeDefined();
+    expect(agentEnd!.level).toBe("debug");
+  });
+
+  // ---- Test 6: full /harness:add + /harness:launch captures worker traces ----
+
+  it("launch lifecycle produces worker.worktree.created, worker.spawn, state.persist, manager.spawn traces", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Create a task
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("trace-worker Implement trace logging", ctx);
+
+    // Launch
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entries = await readTraceLog();
+    const events = entries.map((e) => e.event);
+
+    // Should have session.start
+    expect(events).toContain("session.start");
+
+    // Should have worker lifecycle traces
+    expect(events).toContain("worker.worktree.created");
+    expect(events).toContain("worker.spawn");
+
+    // Should have manager spawn
+    expect(events).toContain("manager.spawn");
+
+    // Should have state persistence
+    expect(events).toContain("state.persist");
+
+    // Verify worker.worktree.created has name and branch data
+    const worktreeEntry = entries.find((e) => e.event === "worker.worktree.created");
+    expect(worktreeEntry!.data?.name).toBe("trace-worker");
+    expect(worktreeEntry!.data?.branch).toBe("pi-agent/trace-worker");
+
+    // Verify worker.spawn has role and goals count
+    const spawnEntry = entries.find((e) => e.event === "worker.spawn");
+    expect(spawnEntry!.data?.name).toBe("trace-worker");
+    expect(spawnEntry!.data?.role).toBeDefined();
+    expect(spawnEntry!.data?.goals).toBe(1);
+
+    // Verify manager.spawn has workers list
+    const mgrEntry = entries.find((e) => e.event === "manager.spawn");
+    expect(mgrEntry!.data?.workers).toEqual(expect.arrayContaining(["trace-worker"]));
+
+    // Clean up
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+  });
+
+  // ---- Test 7: /harness:auto captures auto.scout.start trace ----
+
+  it("/harness:auto produces auto.scout.start trace", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const autoCmd = mock.getCommand("harness:auto")!;
+    await autoCmd.handler("--max-workers 2 --stagger 100 improve testing", ctx);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entries = await readTraceLog();
+    const scoutStart = entries.find((e) => e.event === "auto.scout.start");
+    expect(scoutStart).toBeDefined();
+    expect(scoutStart!.level).toBe("info");
+    expect(scoutStart!.data?.objective).toBe("improve testing");
+
+    // Clean up
+    await autoCmd.handler("cancel", ctx);
+  });
+
+  // ---- Test 8: auto mode scout complete + execute plan traces ----
+
+  it("auto scout completion produces auto.scout.complete and auto.plan.execute traces", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const autoCmd = mock.getCommand("harness:auto")!;
+    await autoCmd.handler("--max-workers 2 --stagger 0 test coverage", ctx);
+
+    // Simulate scout completion
+    const analysis: ScoutAnalysis = {
+      timestamp: new Date().toISOString(),
+      objective: "test coverage",
+      repoSummary: {
+        name: "test-repo",
+        languages: ["typescript"],
+        hasTests: true,
+        testFramework: "vitest",
+        hasCI: false,
+        recentCommits: 5,
+        openTodoCount: 0,
+      },
+      findings: [
+        {
+          id: "add-tests",
+          category: "tests",
+          severity: "high",
+          title: "Missing tests",
+          description: "No tests for core module",
+          evidence: ["src/core.ts"],
+          suggestedRole: "tester",
+          estimatedGoals: ["Write unit tests"],
+        },
+      ],
+    };
+
+    await writeFile(join(repo, SCOUT_ANALYSIS_FILE), JSON.stringify(analysis));
+    await writeFile(
+      join(repo, PI_AGENT_DIR, "scout.md"),
+      "# scout\npath: .\nrole: researcher\n\n## Goals\n- [x] Evaluate the codebase and produce a scout analysis\n\n## Context\ntest coverage\n",
+    );
+
+    // turn_end detects scout completion
+    await mock.emit("turn_end", {}, ctx);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entries = await readTraceLog();
+    const events = entries.map((e) => e.event);
+
+    expect(events).toContain("auto.scout.complete");
+    expect(events).toContain("auto.plan.execute");
+
+    // Verify auto.scout.complete has findings count
+    const completeEntry = entries.find((e) => e.event === "auto.scout.complete");
+    expect(completeEntry!.data?.findings).toBe(1);
+    expect(completeEntry!.level).toBe("info");
+
+    // Verify auto.plan.execute has ready/queued counts
+    const planEntry = entries.find((e) => e.event === "auto.plan.execute");
+    expect(planEntry!.data).toHaveProperty("ready");
+    expect(planEntry!.data).toHaveProperty("queued");
+    expect(planEntry!.level).toBe("info");
+
+    // Clean up
+    await autoCmd.handler("cancel", ctx);
+  });
+
+  // ---- Test 9: /harness:trace command reads and filters real log ----
+
+  it("/harness:trace reads and filters the real trace log", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Add + launch to generate some traces
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("filter-test Write filter tests", ctx);
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Now use /harness:trace to read the log
+    mock.api.sendMessage.mockClear();
+    const traceCmd = mock.getCommand("harness:trace")!;
+    await traceCmd.handler("", ctx);
+
+    // Should have sent a message with trace content
+    const traceCall = mock.api.sendMessage.mock.calls.find(
+      (c: any[]) => c[0]?.customType === "harness-trace",
+    );
+    expect(traceCall).toBeDefined();
+    expect(traceCall![0].content).toContain("Trace Log");
+    expect(traceCall![0].content).toContain("session.start");
+
+    // Test filtering — filter for worker events only
+    mock.api.sendMessage.mockClear();
+    await traceCmd.handler("--filter worker", ctx);
+    const filteredCall = mock.api.sendMessage.mock.calls.find(
+      (c: any[]) => c[0]?.customType === "harness-trace",
+    );
+    expect(filteredCall).toBeDefined();
+    expect(filteredCall![0].content).toContain("worker.");
+    // Should NOT contain session or manager events in the output
+    // (they may appear in the log, but filtered out)
+    const filteredContent = filteredCall![0].content as string;
+    const filteredLines = filteredContent.split("\n").filter(
+      (line: string) => line.startsWith("[") && line.includes("]"),
+    );
+    for (const line of filteredLines) {
+      expect(line).toContain("worker.");
+    }
+
+    // Test level filter
+    mock.api.sendMessage.mockClear();
+    await traceCmd.handler("--level info", ctx);
+    const levelCall = mock.api.sendMessage.mock.calls.find(
+      (c: any[]) => c[0]?.customType === "harness-trace",
+    );
+    expect(levelCall).toBeDefined();
+    expect(levelCall![0].content).toContain("INFO");
+
+    // Clean up
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+  });
+
+  // ---- Test 10: /harness:cleanup removes trace log file ----
+
+  it("/harness:cleanup removes the trace log file", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Generate some traces
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("cleanup-trace-test Do a thing", ctx);
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Verify log exists
+    const entriesBefore = await readTraceLog();
+    expect(entriesBefore.length).toBeGreaterThan(0);
+
+    // Cleanup
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+
+    // Verify log is gone
+    const entriesAfter = await readTraceLog();
+    expect(entriesAfter.length).toBe(0);
+  });
+
+  // ---- Test 11: all NDJSON entries are well-formed ----
+
+  it("all logged entries are valid NDJSON with required fields", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Generate diverse traces
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("json-test Write valid JSON, Parse data", ctx);
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await mock.emit("tool_call", { toolName: "read_file", input: { path: "/foo" } }, ctx);
+    await mock.emit("turn_end", {}, ctx);
+    await mock.emit("agent_end", {}, ctx);
+    await mock.emit("session_shutdown", {}, {});
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Read raw log — every non-empty line must parse as valid JSON
+    const raw = await readFile(join(repo, HARNESS_LOG_FILE), "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    expect(lines.length).toBeGreaterThan(5); // should have many entries
+
+    for (const line of lines) {
+      const entry = JSON.parse(line); // throws if invalid JSON
+      // Required fields
+      expect(entry).toHaveProperty("ts");
+      expect(entry).toHaveProperty("level");
+      expect(entry).toHaveProperty("event");
+      // ts is ISO-8601
+      expect(new Date(entry.ts).toISOString()).toBe(entry.ts);
+      // level is one of the valid values
+      expect(["debug", "info", "warn", "error"]).toContain(entry.level);
+      // event is a non-empty string
+      expect(typeof entry.event).toBe("string");
+      expect(entry.event.length).toBeGreaterThan(0);
+      // data, if present, is an object
+      if (entry.data !== undefined) {
+        expect(typeof entry.data).toBe("object");
+        expect(entry.data).not.toBeNull();
+      }
+    }
+
+    // Clean up
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+  });
+
+  // ---- Test 12: config.reload trace is produced on config change ----
+
+  it("config.reload trace is produced when runtime config changes", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    // Create task and launch to activate loopActive
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("config-test Run config test", ctx);
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    // Write a runtime config change
+    await writeFile(
+      join(repo, ".pi-agent/.harness-config.json"),
+      JSON.stringify({ maxWorkers: 5, staggerMs: 1000 }),
+    );
+
+    // Write a manager status so turn_end processes fully
+    await writeFile(
+      join(repo, MANAGER_STATUS_FILE),
+      JSON.stringify({
+        status: "running",
+        updatedAt: new Date().toISOString(),
+        submodules: {},
+        stallCount: 0,
+      }),
+    );
+
+    // Trigger turn_end (which calls checkConfigReload)
+    await mock.emit("turn_end", {}, ctx);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entries = await readTraceLog();
+    const configReload = entries.find((e) => e.event === "config.reload");
+    expect(configReload).toBeDefined();
+    expect(configReload!.data?.changes).toBeDefined();
+
+    // Clean up
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
+  });
+
+  // ---- Test 13: /harness:trace --clear works on real log ----
+
+  it("/harness:trace --clear truncates the real log", async () => {
+    const { mock, ctx } = freshHarness();
+    await mock.emit("session_start", {}, ctx);
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Verify log has content
+    const entriesBefore = await readTraceLog();
+    expect(entriesBefore.length).toBeGreaterThan(0);
+
+    // Clear it
+    const traceCmd = mock.getCommand("harness:trace")!;
+    await traceCmd.handler("--clear", ctx);
+
+    // Log should now be empty
+    const content = await readFile(join(repo, HARNESS_LOG_FILE), "utf-8");
+    expect(content).toBe("");
+  });
+
+  // ---- Test 14: chronological ordering ----
+
+  it("trace entries are in chronological order", async () => {
+    const { mock, ctx } = freshHarness();
+    interceptPiSpawns(mock);
+    await mock.emit("session_start", {}, ctx);
+
+    const addCmd = mock.getCommand("harness:add")!;
+    await addCmd.handler("chrono-test A thing", ctx);
+    const launchCmd = mock.getCommand("harness:launch")!;
+    await launchCmd.handler("--stagger 0", ctx);
+
+    await mock.emit("tool_call", { toolName: "test_tool", input: {} }, ctx);
+    await mock.emit("turn_end", {}, ctx);
+    await mock.emit("session_shutdown", {}, {});
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const entries = await readTraceLog();
+    for (let i = 1; i < entries.length; i++) {
+      const prev = new Date(entries[i - 1].ts).getTime();
+      const curr = new Date(entries[i].ts).getTime();
+      expect(curr).toBeGreaterThanOrEqual(prev);
+    }
+
+    // Clean up
+    const cleanupCmd = mock.getCommand("harness:cleanup")!;
+    await cleanupCmd.handler("--force", ctx);
   });
 });

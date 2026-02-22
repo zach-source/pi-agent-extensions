@@ -77,6 +77,7 @@ Your Pi session (parent)
 | `/harness:logs <name\|manager> [lines]` | Show recent tmux output |
 | `/harness:attach <name\|manager>` | Attach to a tmux session |
 | `/harness:inbox` | Read messages in the parent mailbox |
+| `/harness:trace [N] [--filter <sub>] [--level <lvl>] [--clear]` | Show structured trace log (NDJSON) |
 
 ### Recovery
 
@@ -205,7 +206,7 @@ The manager will dispatch queued items to idle workers or spawn new workers as c
 /harness:launch --dashboard
 
 # All flags above also work on /harness:bmad:
-/harness:bmad --max-workers 3 --model-routes ./routes.json --heartbeat 90000 --dashboard
+/harness:bmad --max-workers 3 --stagger 2000 --model-routes ./routes.json --heartbeat 90000 --dashboard
 ```
 
 ## Monitoring Workers
@@ -253,8 +254,11 @@ This creates `bmad/config.yaml` and `docs/bmm-workflow-status.yaml` via an inter
 # Basic
 /harness:bmad --max-workers 3
 
+# Fast spawning (no stagger delay)
+/harness:bmad --max-workers 3 --stagger 0
+
 # With advanced features
-/harness:bmad --max-workers 3 --model-routes ./routes.json --heartbeat 90000 --dashboard
+/harness:bmad --max-workers 3 --stagger 2000 --model-routes ./routes.json --heartbeat 90000 --dashboard
 ```
 
 This command:
@@ -673,6 +677,39 @@ Use `/harness:config` to view current effective values, their sources, and model
 **Focus areas**: tests, quality, features, docs, security, performance
 
 This is the recommended starting point when you're unsure what to work on. After discovery creates your tasks, run `/harness:launch` to start workers.
+
+## Trace Logging
+
+The harness automatically writes structured NDJSON trace entries to `.pi-agent/.harness-log`. Events are captured at two levels:
+
+1. **Auto-captured** via Pi extension events (zero manual instrumentation):
+   - `tool.call` — every tool invocation with summarized input
+   - `turn.start` / `turn.end` — token usage at turn boundaries (enables duration calculation)
+   - `agent.end` — agent lifecycle termination
+   - `session.start` / `session.shutdown` — session lifecycle
+
+2. **Harness-specific** trace points for decisions only the harness knows about:
+
+| Prefix | Events |
+|--------|--------|
+| `worker.*` | `spawn`, `worktree.created`, `activity`, `recover.start/ok/exhausted`, `merge.start/ok/conflict`, `complete` |
+| `manager.*` | `spawn`, `dead`, `recover.start/ok/exhausted` |
+| `auto.*` | `scout.start/complete/dead`, `plan.execute`, `rescout`, `complete` |
+| `queue.*` | `dispatch` |
+| `config.*` | `reload` |
+| `state.*` | `persist` |
+
+### Usage
+
+```
+/harness:trace              # last 50 entries
+/harness:trace 100          # last N entries
+/harness:trace --filter worker  # substring match on event field
+/harness:trace --level warn # filter by level
+/harness:trace --clear      # truncate log file
+```
+
+The log auto-rotates at 5000 lines (keeping the most recent 3000).
 
 ## Tips
 

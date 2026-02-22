@@ -45,7 +45,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import { readFile, writeFile, readdir, mkdir, rm, rename, stat, copyFile } from "fs/promises";
+import { readFile, writeFile, appendFile, readdir, mkdir, rm, rename, stat, copyFile } from "fs/promises";
 import { join, resolve } from "path";
 import {
   loadConfig as loadBmadConfig,
@@ -94,6 +94,13 @@ export interface RepoSnapshot {
   todoCount: number;
   testFramework: string | null;
   branchName: string;
+}
+
+export interface HarnessLogEntry {
+  ts: string;
+  level: "debug" | "info" | "warn" | "error";
+  event: string;
+  data?: Record<string, unknown>;
 }
 
 export interface HarnessRole {
@@ -559,6 +566,12 @@ export const AUTO_MODE_FILE = ".pi-agent/.auto-mode.json";
 export const SCOUT_ANALYSIS_FILE = ".pi-agent/.scout-analysis.json";
 export const SCOUT_REPORT_FILE = ".pi-agent/.scout-report.md";
 
+// --- Trace Logging Constants ---
+export const HARNESS_LOG_FILE = ".pi-agent/.harness-log";
+export const MAX_HARNESS_LOG_LINES = 5000;
+export const HARNESS_LOG_KEEP_LINES = 3000;
+const HARNESS_LOG_ROTATE_INTERVAL = 100;
+
 // --- Live Config Reload ---
 export const HARNESS_CONFIG_FILE = ".pi-agent/.harness-config.json";
 
@@ -925,6 +938,53 @@ async function atomicWriteFile(
   const tmp = filePath + `.tmp.${process.pid}.${++atomicCounter}`;
   await writeFile(tmp, content, "utf-8");
   await rename(tmp, filePath);
+}
+
+// --- Trace Logging ---
+
+let _hlogWriteCount = 0;
+
+export async function harnessLog(
+  baseCwd: string,
+  event: string,
+  data?: Record<string, unknown>,
+  level: HarnessLogEntry["level"] = "debug",
+): Promise<void> {
+  try {
+    const entry: HarnessLogEntry = {
+      ts: new Date().toISOString(),
+      level,
+      event,
+      ...(data !== undefined && { data }),
+    };
+    const logPath = join(baseCwd, HARNESS_LOG_FILE);
+    try {
+      await appendFile(logPath, JSON.stringify(entry) + "\n", "utf-8");
+    } catch {
+      // Directory may not exist yet — create and retry once
+      await mkdir(join(baseCwd, PI_AGENT_DIR), { recursive: true });
+      await appendFile(logPath, JSON.stringify(entry) + "\n", "utf-8");
+    }
+    if (++_hlogWriteCount >= HARNESS_LOG_ROTATE_INTERVAL) {
+      _hlogWriteCount = 0;
+      await rotateHarnessLog(baseCwd);
+    }
+  } catch {
+    /* fire-and-forget */
+  }
+}
+
+async function rotateHarnessLog(baseCwd: string): Promise<void> {
+  try {
+    const logPath = join(baseCwd, HARNESS_LOG_FILE);
+    const content = await readFile(logPath, "utf-8");
+    const lines = content.split("\n").filter(Boolean);
+    if (lines.length > MAX_HARNESS_LOG_LINES) {
+      await atomicWriteFile(logPath, lines.slice(-HARNESS_LOG_KEEP_LINES).join("\n") + "\n");
+    }
+  } catch {
+    /* best effort */
+  }
 }
 
 /**
@@ -2164,6 +2224,10 @@ export default function (pi: ExtensionAPI) {
   const MAX_MANAGER_RECOVERY = 5;
   const mergedWorkers = new Set<string>();
 
+  // Trace logging — binds cwd automatically
+  const hlog = (event: string, data?: Record<string, unknown>, level?: HarnessLogEntry["level"]) =>
+    harnessLog(cwd, event, data, level);
+
   // Last context reference for notifying on background errors
   let lastCtx: { ui: { notify: Function; setStatus: Function } } | null = null;
 
@@ -2252,6 +2316,7 @@ export default function (pi: ExtensionAPI) {
     } catch { /* ignore */ }
 
     if (changes.length > 0) {
+      hlog("config.reload", { changes });
       pi.sendMessage(
         {
           customType: "harness-config-reload",
@@ -2516,13 +2581,18 @@ export default function (pi: ExtensionAPI) {
     const attempts = state?.recoveryAttempts ?? 0;
     const maxRecoveries = state?.maxRecoveries ?? MAX_WORKER_RECOVERIES;
 
-    if (attempts >= maxRecoveries) return false;
+    if (attempts >= maxRecoveries) {
+      hlog("worker.recover.exhausted", { name, attempts }, "warn");
+      return false;
+    }
 
     // Check cooldown
     if (state?.lastRecoveryAt) {
       const elapsed = Date.now() - new Date(state.lastRecoveryAt).getTime();
       if (elapsed < WORKER_RECOVERY_COOLDOWN_MS) return false;
     }
+
+    hlog("worker.recover.start", { name, attempt: attempts + 1 });
 
     // Kill dead tmux session
     if (session.tmuxSession) {
@@ -2540,6 +2610,7 @@ export default function (pi: ExtensionAPI) {
 
     // Respawn
     await spawnSession(session, config);
+    hlog("worker.recover.ok", { name, attempt: attempts + 1 });
 
     // Update state
     await writeWorkerState(name, {
@@ -2667,6 +2738,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function persistState(): Promise<void> {
+    hlog("state.persist", { sessions: sessions.size });
     const state: LaunchState = {
       active: loopActive,
       sessions: {},
@@ -2790,6 +2862,8 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
     }
+
+    hlog("worker.worktree.created", { name, branch });
 
     const session: SubmoduleSession = {
       name,
@@ -2971,6 +3045,7 @@ export default function (pi: ExtensionAPI) {
     session.tmuxSession = tmuxName;
     session.spawned = true;
     session.spawnedAt = new Date();
+    hlog("worker.spawn", { name: config.name, role: config.role, goals: config.goals.filter(g => !g.completed).length });
 
     // Write initial sidecar state
     await writeWorkerState(config.name, {
@@ -3004,6 +3079,8 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
+    hlog("worker.merge.start", { name: config.name, branch: session.branch });
+
     // Merge from the parent repo (where the worktree branch was created),
     // not from config.path which may be a submodule with separate refs.
     const mergeCwd = cwd;
@@ -3020,6 +3097,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (mergeResult.exitCode === 0) {
+      hlog("worker.merge.ok", { name: config.name, branch: session.branch });
       // Update sidecar: merged
       await writeWorkerState(config.name, {
         name: config.name,
@@ -3041,6 +3119,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Merge failed — abort to clean up conflict state
+    hlog("worker.merge.conflict", { name: config.name, branch: session.branch }, "warn");
     const errorMsg = mergeResult.stderr || `git merge exited with code ${mergeResult.exitCode}`;
     try {
       await pi.exec("git", ["merge", "--abort"], { cwd: mergeCwd });
@@ -3171,6 +3250,7 @@ export default function (pi: ExtensionAPI) {
       analysis,
       autoConfig.maxWorkers,
     );
+    hlog("auto.plan.execute", { ready: ready.length, queued: queued.length }, "info");
 
     // Write goal files for all configs
     for (const config of allConfigs) {
@@ -3283,6 +3363,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function spawnManager(configs: SubmoduleConfig[], bmadMode?: BmadModeConfig): Promise<void> {
+    hlog("manager.spawn", { workers: configs.map(c => c.name) });
     const mgrDir = managerDirPath();
     await mkdir(mgrDir, { recursive: true });
 
@@ -3499,6 +3580,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
     lastCtx = ctx;
+    hlog("session.start", { cwd: ctx.cwd }, "info");
     await restoreState();
 
     // Verify tmux sessions still exist after restore
@@ -3675,6 +3757,7 @@ export default function (pi: ExtensionAPI) {
             await writeAutoModeState(autoState);
 
             // Execute immediately (full autonomy)
+            hlog("auto.scout.complete", { findings: analysis.findings.length }, "info");
             await executeAutoModePlan(analysis, autoState.config);
             ctx.ui.setStatus("harness", "harness: auto executing");
             return;
@@ -3703,6 +3786,7 @@ export default function (pi: ExtensionAPI) {
           `harness: auto ${autoState.phase} (scout ${alive ? "running" : "dead"})`,
         );
         if (!alive) {
+          hlog("auto.scout.dead", {}, "warn");
           pi.sendMessage(
             {
               customType: "harness-auto-scout-dead",
@@ -3740,10 +3824,12 @@ export default function (pi: ExtensionAPI) {
     // Shared auto-recovery logic for dead/stale manager
     async function attemptAutoRecovery(reason: string): Promise<"recovered" | "exhausted" | "waiting"> {
       managerStaleCount++;
+      hlog("manager.dead", { reason }, "warn");
       const requiredStaleCount = RECOVERY_BACKOFF[Math.min(managerRecoveryAttempts, RECOVERY_BACKOFF.length - 1)];
       if (managerStaleCount >= requiredStaleCount && managerRecoveryAttempts < MAX_MANAGER_RECOVERY) {
         managerRecoveryAttempts++;
         managerStaleCount = 0;
+        hlog("manager.recover.start", { attempt: managerRecoveryAttempts });
         pi.sendMessage(
           {
             customType: "harness-auto-recover",
@@ -3773,8 +3859,10 @@ export default function (pi: ExtensionAPI) {
           await spawnManager(configs);
           await persistState();
         }
+        hlog("manager.recover.ok", { attempt: managerRecoveryAttempts });
         return "recovered";
       } else if (managerRecoveryAttempts >= MAX_MANAGER_RECOVERY) {
+        hlog("manager.recover.exhausted", { attempts: managerRecoveryAttempts }, "warn");
         pi.sendMessage(
           {
             customType: "harness-recovery-failed",
@@ -3896,6 +3984,7 @@ export default function (pi: ExtensionAPI) {
         }
         const result = await mergeWorktree(session, config);
         if (result.ok) {
+          hlog("worker.complete", { name: config.name, goals: config.goals.length });
           sessions.delete(config.name);
           pi.sendMessage(
             {
@@ -3986,6 +4075,7 @@ export default function (pi: ExtensionAPI) {
               }
               const session = await createWorktree(config);
               await spawnSession(session, config);
+              hlog("queue.dispatch", { topic: item.topic, role: item.role });
               item.status = "dispatched";
               dispatched++;
               // Notify manager
@@ -4083,6 +4173,7 @@ export default function (pi: ExtensionAPI) {
       if (session.tmuxSession) {
         const activity = await checkWorkerActivity(session);
         if (activity === "dead") {
+          hlog("worker.activity", { name, status: "dead" }, "warn");
           // Feature 4: Attempt auto-recovery for dead workers with incomplete goals
           const recovered = await recoverWorker(name, session);
           if (recovered) {
@@ -4102,6 +4193,7 @@ export default function (pi: ExtensionAPI) {
             deadWorkerCount++;
           }
         } else if (activity === "stalled") {
+          hlog("worker.activity", { name, status: "stalled" }, "warn");
           stalledWorkerCount++;
         } else {
           activeWorkerCount++;
@@ -4175,6 +4267,7 @@ export default function (pi: ExtensionAPI) {
           autoState.planApproved = false;
           await writeAutoModeState(autoState);
 
+          hlog("auto.rescout", { iteration: autoState.iteration + 1 }, "info");
           await spawnScout(autoState.config);
           await persistState();
 
@@ -4190,6 +4283,7 @@ export default function (pi: ExtensionAPI) {
           return;
         } else {
           // Final iteration — deactivate auto mode
+          hlog("auto.complete", { iterations: autoState.config.maxIterations }, "info");
           autoState.enabled = false;
           autoState.phase = "idle";
           await writeAutoModeState(autoState);
@@ -4222,7 +4316,51 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    hlog("session.shutdown", { sessions: sessions.size, loopActive }, "info");
     await persistState();
+  });
+
+  // --- Trace logging hooks ---
+
+  pi.on("turn_start", async (_event: unknown, ctx: unknown) => {
+    if (!cwd) return;
+    try {
+      const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
+      const usage = c.getContextUsage?.();
+      hlog("turn.start", usage ? { tokens: usage.tokens, percent: usage.percent } : undefined);
+    } catch {
+      hlog("turn.start");
+    }
+  });
+
+  pi.on("tool_call", async (event: unknown) => {
+    if (!cwd) return;
+    const ev = event as Record<string, unknown>;
+    const toolName = (ev.toolName ?? "unknown").toString();
+    const input = ev.input as Record<string, unknown> | undefined;
+    const summary: Record<string, unknown> = { tool: toolName };
+    if (input) {
+      for (const [k, v] of Object.entries(input)) {
+        summary[k] = typeof v === "string" ? v.slice(0, 200) : v;
+      }
+    }
+    hlog("tool.call", summary);
+  });
+
+  pi.on("turn_end", async (_event: unknown, ctx: unknown) => {
+    if (!cwd) return;
+    try {
+      const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
+      const usage = c.getContextUsage?.();
+      hlog("turn.end", usage ? { tokens: usage.tokens, percent: usage.percent } : undefined);
+    } catch {
+      hlog("turn.end");
+    }
+  });
+
+  pi.on("agent_end", async () => {
+    if (!cwd) return;
+    hlog("agent.end");
   });
 
   // --- Tools ---
@@ -5771,6 +5909,9 @@ export default function (pi: ExtensionAPI) {
         STOP_SIGNAL_FILE,
         MANAGER_STATUS_FILE,
         SUMMARY_FILE,
+        HARNESS_LOG_FILE,
+        HARNESS_CONFIG_FILE,
+        HEARTBEAT_CONFIG_FILE,
       ];
       for (const file of stateFiles) {
         try {
@@ -5787,9 +5928,14 @@ export default function (pi: ExtensionAPI) {
         // May not exist
       }
 
-      // Remove BMAD pre-generated prompts and mode file
+      // Remove BMAD pre-generated prompts, mode file, and manager directory
       try {
         await rm(join(cwd, PI_AGENT_DIR, ".prompts"), { recursive: true, force: true });
+      } catch {
+        // May not exist
+      }
+      try {
+        await rm(join(cwd, MANAGER_DIR), { recursive: true, force: true });
       } catch {
         // May not exist
       }
@@ -6048,6 +6194,93 @@ export default function (pi: ExtensionAPI) {
         {
           customType: "harness-inbox",
           content: lines.join("\n"),
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    },
+  });
+
+  pi.registerCommand("harness:trace", {
+    description:
+      "Show harness trace log. Usage: /harness:trace [N] [--filter <substr>] [--level <level>] [--clear]",
+    handler: async (args, ctx) => {
+      cwd = ctx.cwd;
+      lastCtx = ctx;
+      const remaining = (args ?? "").trim();
+
+      if (remaining === "--clear") {
+        try {
+          await writeFile(join(cwd, HARNESS_LOG_FILE), "", "utf-8");
+          ctx.ui.notify("Trace log cleared", "info");
+        } catch {
+          ctx.ui.notify("No trace log to clear", "info");
+        }
+        return;
+      }
+
+      const logPath = join(cwd, HARNESS_LOG_FILE);
+      let raw: string;
+      try {
+        raw = await readFile(logPath, "utf-8");
+      } catch {
+        pi.sendMessage(
+          {
+            customType: "harness-trace",
+            content: "No trace log found. Trace logging begins automatically when the harness runs.",
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+        return;
+      }
+
+      let entries = raw
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line) as HarnessLogEntry;
+          } catch {
+            return null;
+          }
+        })
+        .filter((e): e is HarnessLogEntry => e !== null);
+
+      // Parse flags
+      const filterMatch = remaining.match(/--filter\s+(\S+)/);
+      if (filterMatch) {
+        const substr = filterMatch[1];
+        entries = entries.filter((e) => e.event.includes(substr));
+      }
+
+      const levelMatch = remaining.match(/--level\s+(\S+)/);
+      if (levelMatch) {
+        const lvl = levelMatch[1];
+        entries = entries.filter((e) => e.level === lvl);
+      }
+
+      // Parse count (bare number)
+      const countStr = remaining
+        .replace(/--filter\s+\S+/g, "")
+        .replace(/--level\s+\S+/g, "")
+        .trim();
+      const count = countStr ? parseInt(countStr, 10) : 50;
+      const shown = entries.slice(-(isNaN(count) ? 50 : count));
+
+      const lines = shown.map((e) => {
+        const time = e.ts.replace(/T/, " ").replace(/\.\d+Z$/, "Z");
+        const lvl = e.level.toUpperCase().padEnd(5);
+        const data = e.data ? " " + JSON.stringify(e.data) : "";
+        return `[${time}] [${lvl}] ${e.event}${data}`;
+      });
+
+      pi.sendMessage(
+        {
+          customType: "harness-trace",
+          content: lines.length > 0
+            ? `## Trace Log (${lines.length}/${entries.length} entries)\n\n\`\`\`\n${lines.join("\n")}\n\`\`\``
+            : "No matching trace entries.",
           display: true,
         },
         { triggerTurn: false },
@@ -6471,7 +6704,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("harness:bmad", {
     description:
-      "Run full BMAD methodology via harness workers. Supports --max-workers N, --init, --model-routes, --heartbeat, --dashboard.",
+      "Run full BMAD methodology via harness workers. Supports --max-workers N, --stagger MS, --init, --level N, --model-routes, --heartbeat, --dashboard.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -6492,9 +6725,16 @@ export default function (pi: ExtensionAPI) {
         maxWorkers = parseInt(maxFlag[1], 10);
       }
 
+      // Parse --stagger flag (default: 5000ms)
+      let staggerMs = 5000;
+      const staggerFlag = remaining.match(/--stagger\s+(\d+)/);
+      if (staggerFlag) {
+        staggerMs = parseInt(staggerFlag[1], 10);
+      }
+
       // Initialize live-reloadable effective values from CLI flags
       effectiveMaxWorkers = maxWorkers;
-      effectiveStaggerMs = 5000;
+      effectiveStaggerMs = staggerMs;
 
       const hasInitFlag = /--init\b/.test(remaining);
 
@@ -6738,6 +6978,8 @@ export default function (pi: ExtensionAPI) {
         session.tmuxSession = tmuxName;
         session.spawned = true;
         session.spawnedAt = new Date();
+
+        hlog("worker.spawn", { name: config.name, role: config.role, goals: config.goals.filter((g) => !g.completed).length });
 
         await writeWorkerState(config.name, {
           name: config.name,
@@ -7069,6 +7311,7 @@ export default function (pi: ExtensionAPI) {
       await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
       await writeAutoModeState(autoState);
 
+      hlog("auto.scout.start", { objective: autoConfig.objective, focus: autoConfig.focus }, "info");
       await spawnScout(autoConfig);
       loopActive = true;
       await persistState();

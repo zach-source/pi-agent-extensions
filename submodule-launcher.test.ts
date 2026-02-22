@@ -107,6 +107,11 @@ import {
   type ScheduledRun,
   type SandboxConfig,
   type TriggerEvent,
+  harnessLog,
+  HARNESS_LOG_FILE,
+  MAX_HARNESS_LOG_LINES,
+  HARNESS_LOG_KEEP_LINES,
+  type HarnessLogEntry,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 import { WORKFLOW_DEFS } from "./bmad.js";
@@ -675,6 +680,7 @@ describe("extension registration", () => {
       "harness:add",
       "harness:merge",
       "harness:recover",
+      "harness:trace",
     ]) {
       expect(mock.getCommand(cmd), `missing command ${cmd}`).toBeDefined();
     }
@@ -8342,5 +8348,244 @@ describe("/harness:discover command", () => {
       }),
       { triggerTurn: true },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// harnessLog() unit tests
+// ---------------------------------------------------------------------------
+
+describe("harnessLog", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "hlog-"));
+    await mkdir(join(tmpDir, ".pi-agent"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("appends a JSON entry with correct fields", async () => {
+    await harnessLog(tmpDir, "test.event", { key: "value" });
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const entry = JSON.parse(raw.trim()) as HarnessLogEntry;
+    expect(entry.event).toBe("test.event");
+    expect(entry.level).toBe("debug");
+    expect(entry.data).toEqual({ key: "value" });
+    expect(entry.ts).toBeTruthy();
+  });
+
+  it("defaults to debug level", async () => {
+    await harnessLog(tmpDir, "test.default");
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const entry = JSON.parse(raw.trim()) as HarnessLogEntry;
+    expect(entry.level).toBe("debug");
+  });
+
+  it("supports custom levels", async () => {
+    await harnessLog(tmpDir, "test.warn", undefined, "warn");
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const entry = JSON.parse(raw.trim()) as HarnessLogEntry;
+    expect(entry.level).toBe("warn");
+  });
+
+  it("writes multiple entries as separate lines", async () => {
+    await harnessLog(tmpDir, "first");
+    await harnessLog(tmpDir, "second");
+    await harnessLog(tmpDir, "third");
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    expect(lines.length).toBe(3);
+    expect(JSON.parse(lines[0]).event).toBe("first");
+    expect(JSON.parse(lines[2]).event).toBe("third");
+  });
+
+  it("never throws on invalid baseCwd", async () => {
+    await expect(
+      harnessLog("/nonexistent/path/that/does/not/exist", "test.nothrow"),
+    ).resolves.toBeUndefined();
+  });
+
+  it("omits data field when undefined", async () => {
+    await harnessLog(tmpDir, "no.data");
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const entry = JSON.parse(raw.trim());
+    expect(entry).not.toHaveProperty("data");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Event auto-logging tests
+// ---------------------------------------------------------------------------
+
+describe("event auto-logging", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "hlog-event-"));
+    await mkdir(join(tmpDir, ".pi-agent"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("tool_call event triggers log entry with tool name and input", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    // session_start sets cwd
+    await mock.emit("session_start", {}, ctx);
+
+    // Emit a tool_call event
+    await mock.emit("tool_call", { toolName: "harness_status", input: { foo: "bar" } }, ctx);
+
+    // Give fire-and-forget a tick
+    await new Promise((r) => setTimeout(r, 50));
+
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    const toolEntry = lines
+      .map((l) => JSON.parse(l) as HarnessLogEntry)
+      .find((e) => e.event === "tool.call");
+    expect(toolEntry).toBeDefined();
+    expect(toolEntry!.data).toMatchObject({ tool: "harness_status", foo: "bar" });
+  });
+
+  it("turn_start event logs turn.start entry with token usage", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    await mock.emit("turn_start", {}, ctx);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    const turnStart = lines
+      .map((l) => JSON.parse(l) as HarnessLogEntry)
+      .find((e) => e.event === "turn.start");
+    expect(turnStart).toBeDefined();
+    expect(turnStart!.level).toBe("debug");
+    expect(turnStart!.data).toMatchObject({ tokens: expect.any(Number), percent: expect.any(Number) });
+  });
+
+  it("session_start logs session.start entry", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const raw = await readFile(join(tmpDir, HARNESS_LOG_FILE), "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    const sessionEntry = lines
+      .map((l) => JSON.parse(l) as HarnessLogEntry)
+      .find((e) => e.event === "session.start");
+    expect(sessionEntry).toBeDefined();
+    expect(sessionEntry!.level).toBe("info");
+    expect(sessionEntry!.data).toMatchObject({ cwd: tmpDir });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /harness:trace command tests
+// ---------------------------------------------------------------------------
+
+describe("/harness:trace command", () => {
+  let mock: ReturnType<typeof createMockExtensionAPI>;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    mock = createMockExtensionAPI();
+    initExtension(mock.api as any);
+    tmpDir = await mkdtemp(join(tmpdir(), "hlog-trace-"));
+    await mkdir(join(tmpDir, ".pi-agent"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("shows 'No log found' when file is missing", async () => {
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    // Remove the log file that session_start created
+    try { await rm(join(tmpDir, HARNESS_LOG_FILE)); } catch { /* may not exist */ }
+
+    const cmd = mock.getCommand("harness:trace")!;
+    await cmd.handler("", ctx);
+
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "harness-trace",
+        content: expect.stringContaining("No trace log found"),
+      }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("displays last N entries", async () => {
+    const logPath = join(tmpDir, HARNESS_LOG_FILE);
+    const entries = Array.from({ length: 10 }, (_, i) =>
+      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: `evt.${i}` }),
+    );
+    await writeFile(logPath, entries.join("\n") + "\n", "utf-8");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    mock.api.sendMessage.mockClear();
+    const cmd = mock.getCommand("harness:trace")!;
+    await cmd.handler("3", ctx);
+
+    const call = mock.api.sendMessage.mock.calls.find(
+      (c: any[]) => c[0]?.customType === "harness-trace",
+    );
+    expect(call).toBeDefined();
+    // Should show 3 entries out of 10+1 (session.start adds one)
+    expect(call![0].content).toContain("Trace Log");
+  });
+
+  it("filters by event name", async () => {
+    const logPath = join(tmpDir, HARNESS_LOG_FILE);
+    const entries = [
+      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: "worker.spawn" }),
+      JSON.stringify({ ts: new Date().toISOString(), level: "info", event: "manager.spawn" }),
+      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: "worker.merge.ok" }),
+    ];
+    await writeFile(logPath, entries.join("\n") + "\n", "utf-8");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    mock.api.sendMessage.mockClear();
+    const cmd = mock.getCommand("harness:trace")!;
+    await cmd.handler("--filter worker", ctx);
+
+    const call = mock.api.sendMessage.mock.calls.find(
+      (c: any[]) => c[0]?.customType === "harness-trace",
+    );
+    expect(call).toBeDefined();
+    expect(call![0].content).toContain("worker.spawn");
+    expect(call![0].content).toContain("worker.merge.ok");
+    expect(call![0].content).not.toContain("manager.spawn");
+  });
+
+  it("--clear truncates the log file", async () => {
+    const logPath = join(tmpDir, HARNESS_LOG_FILE);
+    await writeFile(logPath, '{"ts":"x","level":"debug","event":"test"}\n', "utf-8");
+
+    const ctx = createMockContext({ cwd: tmpDir });
+    await mock.emit("session_start", {}, ctx);
+
+    const cmd = mock.getCommand("harness:trace")!;
+    await cmd.handler("--clear", ctx);
+
+    const content = await readFile(logPath, "utf-8");
+    expect(content).toBe("");
   });
 });
