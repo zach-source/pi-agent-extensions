@@ -46,7 +46,18 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import { readFile, writeFile, appendFile, readdir, mkdir, rm, rename, stat, copyFile } from "fs/promises";
+import {
+  readFile,
+  writeFile,
+  appendFile,
+  readdir,
+  mkdir,
+  rm,
+  rename,
+  stat,
+  copyFile,
+} from "fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "path";
 import {
   loadConfig as loadBmadConfig,
@@ -322,7 +333,13 @@ function getWorkflowsForLevel(level: number): string[] {
     level === 0
       ? ["tech-spec", "sprint-planning", "create-story", "dev-story"]
       : level === 1
-        ? ["product-brief", "tech-spec", "sprint-planning", "create-story", "dev-story"]
+        ? [
+            "product-brief",
+            "tech-spec",
+            "sprint-planning",
+            "create-story",
+            "dev-story",
+          ]
         : [
             "product-brief",
             "prd",
@@ -366,9 +383,7 @@ export function buildBmadWorkflowDag(
 
   // Build a lookup of completed workflows (single source of truth: isBmadCompleted)
   const completedSet = new Set(
-    currentStatus
-      .filter((e) => isBmadCompleted(e.status))
-      .map((e) => e.name),
+    currentStatus.filter((e) => isBmadCompleted(e.status)).map((e) => e.name),
   );
 
   const specs: BmadGoalSpec[] = [];
@@ -461,6 +476,9 @@ export interface LaunchState {
   managerCwd: string;
   managerSpawnedAt: string | null;
   managerTmuxSession: string | null;
+  backend?: SessionBackend;
+  claudeConfig?: ClaudeBackendConfig;
+  accountAssignments?: Record<string, { accountNumber: number; email: string }>;
 }
 
 export interface RunSummary {
@@ -576,30 +594,338 @@ const HARNESS_LOG_ROTATE_INTERVAL = 100;
 // --- Live Config Reload ---
 export const HARNESS_CONFIG_FILE = ".pi-agent/.harness-config.json";
 
-export interface HarnessRuntimeConfig {
-  maxWorkers?: number;   // 1-50, default: Infinity (no limit)
-  staggerMs?: number;    // 0-60000, default: 5000
+// --- Account Rotation ---
+export const USAGE_TRACKING_FILE = ".pi-agent/.usage-tracking.json";
+export type AccountRotationStrategy = "round-robin";
+
+export interface AccountRotationConfig {
+  enabled: boolean;
+  strategy: AccountRotationStrategy;
+  usageThresholdUsd?: number;
+  ccswitchPath?: string;
+  sequenceFilePath?: string; // override ~/.claude-switch-backup/sequence.json
 }
 
-export function validateRuntimeConfig(raw: unknown): HarnessRuntimeConfig | null {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+export interface CcswitchAccount {
+  number: number;
+  email: string;
+  uuid: string;
+}
+
+export interface CcswitchSequence {
+  activeAccountNumber: number;
+  lastUpdated: string;
+  sequence: number[];
+  accounts: Record<string, { email: string; uuid: string; added: string }>;
+}
+
+export interface AccountUsageEntry {
+  accountNumber: number;
+  email: string;
+  totalCostUsd: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  sessionCount: number;
+  lastUsedAt: string;
+  sessions: AccountSessionUsage[];
+}
+
+export interface AccountSessionUsage {
+  workerName: string;
+  startedAt: string;
+  completedAt: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface UsageTrackingStore {
+  version: 1;
+  accounts: AccountUsageEntry[];
+  updatedAt: string;
+}
+
+// --- Session Backend Types ---
+export type SessionBackend = "pi" | "claude";
+
+export interface ClaudeBackendConfig {
+  model?: string; // e.g. "claude-sonnet-4-5-20250514", overrides model routes
+  permissionMode?: string; // "plan" | "default" | "bypassPermissions" etc.
+  maxBudgetUsd?: number; // --max-budget-usd per session
+  outputFormat?: string; // "text" | "json" | "stream-json" (default: "text")
+  systemPrompt?: string; // extra --system-prompt to prepend
+  allowedTools?: string[]; // --allowedTools whitelist
+  claudePath?: string; // custom path to claude binary (default: "claude")
+  mcpServers?: string[]; // names of MCP servers to include (from ~/.claude/mcp_servers.json)
+  // default: ["context7", "graphiti"] — auth-free servers only
+  mcpConfigPath?: string; // path to custom MCP config JSON file (used with --mcp-config)
+  accountRotation?: AccountRotationConfig;
+}
+
+export interface HarnessRuntimeConfig {
+  maxWorkers?: number; // 1-50, default: Infinity (no limit)
+  staggerMs?: number; // 0-60000, default: 5000
+  backend?: SessionBackend;
+  claudeConfig?: ClaudeBackendConfig;
+}
+
+export function validateRuntimeConfig(
+  raw: unknown,
+): HarnessRuntimeConfig | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+    return null;
   const obj = raw as Record<string, unknown>;
   const result: HarnessRuntimeConfig = {};
 
   if ("maxWorkers" in obj) {
     const v = obj.maxWorkers;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 50) return null;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 50)
+      return null;
     result.maxWorkers = v;
   }
   if ("staggerMs" in obj) {
     const v = obj.staggerMs;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 60000) return null;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 60000)
+      return null;
     result.staggerMs = v;
+  }
+  if ("backend" in obj) {
+    const v = obj.backend;
+    if (v !== "pi" && v !== "claude") return null;
+    result.backend = v;
+  }
+  if ("claudeConfig" in obj) {
+    const v = obj.claudeConfig;
+    if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+    const cc = v as Record<string, unknown>;
+    const cfg: ClaudeBackendConfig = {};
+    if ("model" in cc) {
+      if (typeof cc.model !== "string") return null;
+      cfg.model = cc.model;
+    }
+    if ("permissionMode" in cc) {
+      if (typeof cc.permissionMode !== "string") return null;
+      cfg.permissionMode = cc.permissionMode;
+    }
+    if ("maxBudgetUsd" in cc) {
+      if (typeof cc.maxBudgetUsd !== "number" || cc.maxBudgetUsd <= 0)
+        return null;
+      cfg.maxBudgetUsd = cc.maxBudgetUsd;
+    }
+    if ("outputFormat" in cc) {
+      if (typeof cc.outputFormat !== "string") return null;
+      cfg.outputFormat = cc.outputFormat;
+    }
+    if ("systemPrompt" in cc) {
+      if (typeof cc.systemPrompt !== "string") return null;
+      cfg.systemPrompt = cc.systemPrompt;
+    }
+    if ("allowedTools" in cc) {
+      if (
+        !Array.isArray(cc.allowedTools) ||
+        !cc.allowedTools.every((t: unknown) => typeof t === "string")
+      )
+        return null;
+      cfg.allowedTools = cc.allowedTools as string[];
+    }
+    if ("claudePath" in cc) {
+      if (typeof cc.claudePath !== "string") return null;
+      cfg.claudePath = cc.claudePath;
+    }
+    if ("mcpServers" in cc) {
+      if (
+        !Array.isArray(cc.mcpServers) ||
+        !cc.mcpServers.every((s: unknown) => typeof s === "string")
+      )
+        return null;
+      cfg.mcpServers = cc.mcpServers as string[];
+    }
+    if ("mcpConfigPath" in cc) {
+      if (typeof cc.mcpConfigPath !== "string") return null;
+      cfg.mcpConfigPath = cc.mcpConfigPath;
+    }
+    if ("accountRotation" in cc) {
+      const ar = cc.accountRotation;
+      if (typeof ar !== "object" || ar === null || Array.isArray(ar))
+        return null;
+      const arObj = ar as Record<string, unknown>;
+      if (typeof arObj.enabled !== "boolean") return null;
+      if (arObj.strategy !== "round-robin") return null;
+      const arCfg: AccountRotationConfig = {
+        enabled: arObj.enabled,
+        strategy: arObj.strategy,
+      };
+      if ("usageThresholdUsd" in arObj) {
+        if (
+          typeof arObj.usageThresholdUsd !== "number" ||
+          arObj.usageThresholdUsd <= 0
+        )
+          return null;
+        arCfg.usageThresholdUsd = arObj.usageThresholdUsd;
+      }
+      if ("ccswitchPath" in arObj) {
+        if (typeof arObj.ccswitchPath !== "string") return null;
+        arCfg.ccswitchPath = arObj.ccswitchPath;
+      }
+      if ("sequenceFilePath" in arObj) {
+        if (typeof arObj.sequenceFilePath !== "string") return null;
+        arCfg.sequenceFilePath = arObj.sequenceFilePath;
+      }
+      cfg.accountRotation = arCfg;
+    }
+    result.claudeConfig = cfg;
   }
   return result;
 }
 
-export type ScoutCategory = "tests" | "quality" | "features" | "docs" | "security" | "performance" | "cleanup" | "bugs";
+// --- Session Backend: Pure Command Builders ---
+
+export const DEFAULT_CLAUDE_MCP_SERVERS = ["context7", "graphiti"];
+
+/**
+ * Build a filtered MCP config for a worker. Returns the path to the config file,
+ * or null if no MCP config is available. Caller must git-exclude the written
+ * file via addToWorktreeExclude(worktreePath, ".claude-mcp-config.json").
+ */
+export async function buildMcpConfigForWorker(
+  worktreePath: string,
+  allowedServers?: string[],
+  mcpConfigPath?: string,
+): Promise<string | null> {
+  // If user provided a custom MCP config file, use it directly
+  if (mcpConfigPath) return mcpConfigPath;
+
+  // Read user's MCP server config
+  const userMcpPath = join(homedir(), ".claude", "mcp_servers.json");
+  let allServers: Record<string, unknown>;
+  try {
+    allServers = JSON.parse(await readFile(userMcpPath, "utf-8"));
+  } catch {
+    return null; // No MCP config available
+  }
+
+  // Filter to allowed servers only
+  const allowed = new Set(allowedServers ?? DEFAULT_CLAUDE_MCP_SERVERS);
+  const filtered: Record<string, unknown> = {};
+  for (const [name, config] of Object.entries(allServers)) {
+    if (allowed.has(name)) {
+      filtered[name] = config;
+    }
+  }
+
+  if (Object.keys(filtered).length === 0) return null;
+
+  // Write filtered config to worktree
+  const mcpFile = join(worktreePath, ".claude-mcp-config.json");
+  await atomicWriteFile(
+    mcpFile,
+    JSON.stringify({ mcpServers: filtered }, null, 2) + "\n",
+  );
+  return mcpFile;
+}
+
+export function buildWorkerCommand(
+  backend: SessionBackend,
+  piModelFlag: string,
+  claudeConfig?: ClaudeBackendConfig,
+  claudeModel?: string,
+  mcpConfigFile?: string | null,
+): string {
+  if (backend === "claude") {
+    const bin = claudeConfig?.claudePath ?? "claude";
+    const parts: string[] = [bin, "-p", '"$(cat .pi-agent-prompt.md)"'];
+    const model = claudeModel ?? claudeConfig?.model;
+    if (model) parts.push("--model", model);
+    if (claudeConfig?.permissionMode)
+      parts.push("--permission-mode", claudeConfig.permissionMode);
+    if (claudeConfig?.maxBudgetUsd)
+      parts.push("--max-budget-usd", String(claudeConfig.maxBudgetUsd));
+    if (claudeConfig?.outputFormat)
+      parts.push("--output-format", claudeConfig.outputFormat);
+    if (claudeConfig?.systemPrompt)
+      parts.push("--system-prompt", `"${claudeConfig.systemPrompt}"`);
+    if (claudeConfig?.allowedTools?.length) {
+      for (const tool of claudeConfig.allowedTools) {
+        parts.push("--allowedTools", tool);
+      }
+    }
+    // MCP server filtering: use --mcp-config to specify servers
+    if (mcpConfigFile) {
+      parts.push("--mcp-config", mcpConfigFile);
+    }
+    return parts.join(" ");
+  }
+  // Default: Pi backend
+  return `pi${piModelFlag} -p "$(cat .pi-agent-prompt.md)"`;
+}
+
+export function buildManagerLoopCommand(
+  backend: SessionBackend,
+  stopSignalPath: string,
+  statusFilePath: string,
+  errorLogPath: string,
+  successSleepSec: number,
+  failureSleepSec: number,
+  maxConsecutiveFailures: number,
+  activeHoursCheck: string,
+  claudeConfig?: ClaudeBackendConfig,
+  mcpConfigFile?: string | null,
+): string {
+  const bin =
+    backend === "claude" ? (claudeConfig?.claudePath ?? "claude") : "pi";
+  const stopEsc = shellEscape(stopSignalPath);
+  const statusEsc = shellEscape(statusFilePath);
+  const errorEsc = shellEscape(errorLogPath);
+
+  // Build the inner prompt command
+  let innerCmd: string;
+  if (backend === "claude") {
+    const parts: string[] = [bin, "-p", '"$(cat .pi-agent-prompt.md)"'];
+    if (claudeConfig?.model) parts.push("--model", claudeConfig.model);
+    if (claudeConfig?.permissionMode)
+      parts.push("--permission-mode", claudeConfig.permissionMode);
+    if (claudeConfig?.maxBudgetUsd)
+      parts.push("--max-budget-usd", String(claudeConfig.maxBudgetUsd));
+    if (mcpConfigFile) {
+      parts.push("--mcp-config", mcpConfigFile);
+    }
+    innerCmd = parts.join(" ");
+  } else {
+    innerCmd = 'pi -p "$(cat .pi-agent-prompt.md)"';
+  }
+
+  return [
+    "consecutive_failures=0;",
+    "while true; do",
+    `if [ -f ${stopEsc} ]; then echo "Stop signal detected"; exit 0; fi;`,
+    activeHoursCheck,
+    `${innerCmd};`,
+    "exit_code=$?;",
+    "if [ $exit_code -ne 0 ]; then",
+    "consecutive_failures=$((consecutive_failures + 1));",
+    `echo "[$(date -u +%FT%TZ)] ${bin} exited with code $exit_code (failure $consecutive_failures/${maxConsecutiveFailures})" >> ${errorEsc};`,
+    `if [ $consecutive_failures -ge ${maxConsecutiveFailures} ]; then`,
+    `echo '{"status":"error","message":"Manager crashed ${maxConsecutiveFailures} times consecutively","updatedAt":"'$(date -u +%FT%TZ)'","submodules":{},"stallCount":0}' > ${statusEsc};`,
+    "exit 1;",
+    "fi;",
+    `sleep ${failureSleepSec};`,
+    "else",
+    "consecutive_failures=0;",
+    `sleep ${successSleepSec};`,
+    "fi;",
+    "done",
+  ].join(" ");
+}
+
+export type ScoutCategory =
+  | "tests"
+  | "quality"
+  | "features"
+  | "docs"
+  | "security"
+  | "performance"
+  | "cleanup"
+  | "bugs";
 
 export interface ScoutFinding {
   id: string;
@@ -642,7 +968,13 @@ export interface AutoModeConfig {
 export interface AutoModeState {
   enabled: boolean;
   config: AutoModeConfig;
-  phase: "scouting" | "planning" | "check-in" | "executing" | "re-scouting" | "idle";
+  phase:
+    | "scouting"
+    | "planning"
+    | "check-in"
+    | "executing"
+    | "re-scouting"
+    | "idle";
   iteration: number;
   scoutAnalysis?: ScoutAnalysis;
   planApproved: boolean;
@@ -661,6 +993,8 @@ export interface WorkerState {
   recoveryAttempts?: number;
   maxRecoveries?: number;
   lastRecoveryAt?: string;
+  accountNumber?: number;
+  accountEmail?: string;
 }
 
 // --- Feature 1: Multi-Model Worker Routing ---
@@ -751,12 +1085,22 @@ export interface TriggerEvent {
 
 const WorkerStateSchema = Type.Object({
   name: Type.String(),
-  status: Type.Union([Type.Literal("active"), Type.Literal("stalled"), Type.Literal("completed"), Type.Literal("error")]),
+  status: Type.Union([
+    Type.Literal("active"),
+    Type.Literal("stalled"),
+    Type.Literal("completed"),
+    Type.Literal("error"),
+  ]),
   goalsCompleted: Type.Number(),
   goalsTotal: Type.Number(),
   lastActivity: Type.String(),
   errors: Type.Array(Type.String()),
-  mergeStatus: Type.Union([Type.Literal("pending"), Type.Literal("merged"), Type.Literal("conflict"), Type.Null()]),
+  mergeStatus: Type.Union([
+    Type.Literal("pending"),
+    Type.Literal("merged"),
+    Type.Literal("conflict"),
+    Type.Null(),
+  ]),
   dependsOn: Type.Array(Type.String()),
   dependenciesMet: Type.Boolean(),
 });
@@ -777,6 +1121,10 @@ const LaunchStateSchema = Type.Object({
   managerCwd: Type.String(),
   managerSpawnedAt: Type.Union([Type.String(), Type.Null()]),
   managerTmuxSession: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  backend: Type.Optional(
+    Type.Union([Type.Literal("pi"), Type.Literal("claude")]),
+  ),
+  claudeConfig: Type.Optional(Type.Unknown()),
 });
 
 const ManagerStatusSchema = Type.Object({
@@ -981,7 +1329,10 @@ async function rotateHarnessLog(baseCwd: string): Promise<void> {
     const content = await readFile(logPath, "utf-8");
     const lines = content.split("\n").filter(Boolean);
     if (lines.length > MAX_HARNESS_LOG_LINES) {
-      await atomicWriteFile(logPath, lines.slice(-HARNESS_LOG_KEEP_LINES).join("\n") + "\n");
+      await atomicWriteFile(
+        logPath,
+        lines.slice(-HARNESS_LOG_KEEP_LINES).join("\n") + "\n",
+      );
     }
   } catch {
     /* best effort */
@@ -1061,7 +1412,10 @@ export async function sendMailboxMessage(
   const dir = mailboxPath(baseCwd, to);
   await mkdir(dir, { recursive: true });
   const filename = `${id}.json`;
-  await atomicWriteFile(join(dir, filename), JSON.stringify(msg, null, 2) + "\n");
+  await atomicWriteFile(
+    join(dir, filename),
+    JSON.stringify(msg, null, 2) + "\n",
+  );
   return id;
 }
 
@@ -1107,7 +1461,10 @@ export async function deleteMessage(
 }
 
 /** Advisory file lock for queue read-modify-write sequences. */
-export async function withQueueLock<T>(baseCwd: string, fn: () => Promise<T>): Promise<T> {
+export async function withQueueLock<T>(
+  baseCwd: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   const lockPath = join(baseCwd, QUEUE_FILE + ".lock");
   for (let i = 0; i < 5; i++) {
     try {
@@ -1118,7 +1475,7 @@ export async function withQueueLock<T>(baseCwd: string, fn: () => Promise<T>): P
         await rm(lockPath).catch(() => {});
       }
     } catch {
-      await new Promise(r => setTimeout(r, 50 * (i + 1)));
+      await new Promise((r) => setTimeout(r, 50 * (i + 1)));
     }
   }
   // Fallback: proceed without lock rather than blocking forever
@@ -1274,7 +1631,10 @@ export function parseGoalFile(
   let dependsOn: string[] | undefined;
   const dependsMatch = content.match(/^depends_on:\s*(.+)$/m);
   if (dependsMatch) {
-    dependsOn = dependsMatch[1].split(",").map(s => s.trim()).filter(Boolean);
+    dependsOn = dependsMatch[1]
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
   }
 
   // Extract context from ## Context section
@@ -1296,7 +1656,16 @@ export function parseGoalFile(
   }
   context = contextLines.join("\n").trim();
 
-  return { name, path, role, goals, questions, context, rawContent: content, dependsOn };
+  return {
+    name,
+    path,
+    role,
+    goals,
+    questions,
+    context,
+    rawContent: content,
+    dependsOn,
+  };
 }
 
 export function serializeGoalFile(config: SubmoduleConfig): string {
@@ -1535,11 +1904,16 @@ export function buildScoutPrompt(
 export function buildPlanFromAnalysis(
   analysis: ScoutAnalysis,
   maxWorkers: number,
-): { configs: SubmoduleConfig[]; ready: SubmoduleConfig[]; queued: SubmoduleConfig[] } {
+): {
+  configs: SubmoduleConfig[];
+  ready: SubmoduleConfig[];
+  queued: SubmoduleConfig[];
+} {
   // Sort findings by severity: high → medium → low
   const severityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
   const sorted = [...analysis.findings].sort(
-    (a, b) => (severityOrder[a.severity] ?? 2) - (severityOrder[b.severity] ?? 2),
+    (a, b) =>
+      (severityOrder[a.severity] ?? 2) - (severityOrder[b.severity] ?? 2),
   );
 
   const configs: SubmoduleConfig[] = sorted.map((finding) => ({
@@ -1580,29 +1954,56 @@ export function buildPlanFromAnalysis(
  */
 export async function buildRepoSnapshot(
   baseCwd: string,
-  pi: { exec: (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<{ stdout: string; stderr: string; exitCode: number }> },
+  pi: {
+    exec: (
+      cmd: string,
+      args: string[],
+      opts?: { cwd?: string },
+    ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  },
 ): Promise<RepoSnapshot> {
   // File tree — top 2 levels (excluding node_modules, .git, etc.)
   let fileTree = "";
   try {
-    const result = await pi.exec("find", [
-      ".", "-maxdepth", "2",
-      "-not", "-path", "*/node_modules/*",
-      "-not", "-path", "*/.git/*",
-      "-not", "-path", "*/dist/*",
-      "-not", "-path", "*/.pi-agent/worktrees/*",
-    ], { cwd: baseCwd });
+    const result = await pi.exec(
+      "find",
+      [
+        ".",
+        "-maxdepth",
+        "2",
+        "-not",
+        "-path",
+        "*/node_modules/*",
+        "-not",
+        "-path",
+        "*/.git/*",
+        "-not",
+        "-path",
+        "*/dist/*",
+        "-not",
+        "-path",
+        "*/.pi-agent/worktrees/*",
+      ],
+      { cwd: baseCwd },
+    );
     fileTree = result.stdout.trim();
-  } catch { /* no find */ }
+  } catch {
+    /* no find */
+  }
 
   // Languages & frameworks from manifest files
   const languages: string[] = [];
   const frameworks: string[] = [];
   let testFramework: string | null = null;
 
-  const manifestChecks: Array<{ file: string; lang: string; parse: (content: string) => void }> = [
+  const manifestChecks: Array<{
+    file: string;
+    lang: string;
+    parse: (content: string) => void;
+  }> = [
     {
-      file: "package.json", lang: "TypeScript/JavaScript",
+      file: "package.json",
+      lang: "TypeScript/JavaScript",
       parse: (content: string) => {
         try {
           const pkg = JSON.parse(content);
@@ -1612,18 +2013,68 @@ export async function buildRepoSnapshot(
           if (allDeps.express) frameworks.push("express");
           if (allDeps.vue) frameworks.push("vue");
           if (allDeps.svelte) frameworks.push("svelte");
-          if (allDeps.vitest) { frameworks.push("vitest"); testFramework = "vitest"; }
-          if (allDeps.jest) { frameworks.push("jest"); testFramework = testFramework ?? "jest"; }
-          if (allDeps.mocha) { frameworks.push("mocha"); testFramework = testFramework ?? "mocha"; }
+          if (allDeps.vitest) {
+            frameworks.push("vitest");
+            testFramework = "vitest";
+          }
+          if (allDeps.jest) {
+            frameworks.push("jest");
+            testFramework = testFramework ?? "jest";
+          }
+          if (allDeps.mocha) {
+            frameworks.push("mocha");
+            testFramework = testFramework ?? "mocha";
+          }
           if (allDeps.typescript) languages.push("TypeScript");
-        } catch { /* malformed JSON */ }
+        } catch {
+          /* malformed JSON */
+        }
       },
     },
-    { file: "go.mod", lang: "Go", parse: () => { testFramework = testFramework ?? "go test"; } },
-    { file: "Cargo.toml", lang: "Rust", parse: () => { testFramework = testFramework ?? "cargo test"; } },
-    { file: "pyproject.toml", lang: "Python", parse: (c) => { if (c.includes("pytest")) { frameworks.push("pytest"); testFramework = testFramework ?? "pytest"; } } },
-    { file: "requirements.txt", lang: "Python", parse: (c) => { if (c.includes("pytest")) { frameworks.push("pytest"); testFramework = testFramework ?? "pytest"; } } },
-    { file: "Gemfile", lang: "Ruby", parse: (c) => { if (c.includes("rspec")) { frameworks.push("rspec"); testFramework = testFramework ?? "rspec"; } } },
+    {
+      file: "go.mod",
+      lang: "Go",
+      parse: () => {
+        testFramework = testFramework ?? "go test";
+      },
+    },
+    {
+      file: "Cargo.toml",
+      lang: "Rust",
+      parse: () => {
+        testFramework = testFramework ?? "cargo test";
+      },
+    },
+    {
+      file: "pyproject.toml",
+      lang: "Python",
+      parse: (c) => {
+        if (c.includes("pytest")) {
+          frameworks.push("pytest");
+          testFramework = testFramework ?? "pytest";
+        }
+      },
+    },
+    {
+      file: "requirements.txt",
+      lang: "Python",
+      parse: (c) => {
+        if (c.includes("pytest")) {
+          frameworks.push("pytest");
+          testFramework = testFramework ?? "pytest";
+        }
+      },
+    },
+    {
+      file: "Gemfile",
+      lang: "Ruby",
+      parse: (c) => {
+        if (c.includes("rspec")) {
+          frameworks.push("rspec");
+          testFramework = testFramework ?? "rspec";
+        }
+      },
+    },
   ];
 
   for (const check of manifestChecks) {
@@ -1631,22 +2082,32 @@ export async function buildRepoSnapshot(
       const content = await readFile(join(baseCwd, check.file), "utf-8");
       if (!languages.includes(check.lang)) languages.push(check.lang);
       check.parse(content);
-    } catch { /* file doesn't exist */ }
+    } catch {
+      /* file doesn't exist */
+    }
   }
 
   // Recent git commits
   let recentCommits: string[] = [];
   try {
-    const result = await pi.exec("git", ["log", "--oneline", "-15"], { cwd: baseCwd });
+    const result = await pi.exec("git", ["log", "--oneline", "-15"], {
+      cwd: baseCwd,
+    });
     recentCommits = result.stdout.trim().split("\n").filter(Boolean);
-  } catch { /* not a git repo */ }
+  } catch {
+    /* not a git repo */
+  }
 
   // Branch name
   let branchName = "unknown";
   try {
-    const result = await pi.exec("git", ["branch", "--show-current"], { cwd: baseCwd });
+    const result = await pi.exec("git", ["branch", "--show-current"], {
+      cwd: baseCwd,
+    });
     branchName = result.stdout.trim() || "HEAD (detached)";
-  } catch { /* not a git repo */ }
+  } catch {
+    /* not a git repo */
+  }
 
   // Existing harness tasks
   const existingTasks: string[] = [];
@@ -1657,17 +2118,37 @@ export async function buildRepoSnapshot(
         existingTasks.push(file.replace(/\.md$/, ""));
       }
     }
-  } catch { /* directory doesn't exist */ }
+  } catch {
+    /* directory doesn't exist */
+  }
 
   // TODO/FIXME/HACK count
   let todoCount = 0;
   try {
-    const result = await pi.exec("grep", ["-r", "-c", "-E", "TODO|FIXME|HACK", "--include=*.ts", "--include=*.js", "--include=*.py", "--include=*.go", "--include=*.rs", "--include=*.rb", "."], { cwd: baseCwd });
+    const result = await pi.exec(
+      "grep",
+      [
+        "-r",
+        "-c",
+        "-E",
+        "TODO|FIXME|HACK",
+        "--include=*.ts",
+        "--include=*.js",
+        "--include=*.py",
+        "--include=*.go",
+        "--include=*.rs",
+        "--include=*.rb",
+        ".",
+      ],
+      { cwd: baseCwd },
+    );
     for (const line of result.stdout.trim().split("\n")) {
       const match = line.match(/:(\d+)$/);
       if (match) todoCount += parseInt(match[1], 10);
     }
-  } catch { /* grep returns non-zero if no matches */ }
+  } catch {
+    /* grep returns non-zero if no matches */
+  }
 
   return {
     fileTree,
@@ -1776,9 +2257,9 @@ export function buildManagerInstructions(
     "",
     "## Work Queue",
     `On each heartbeat cycle, read \`${resolve(baseCwd, QUEUE_FILE)}\` for pending work items.`,
-    "For each item with status \"pending\":",
+    'For each item with status "pending":',
     "- Match the item's role (if any) against available workers, or pick a worker with capacity",
-    "- Update the item's status to \"dispatched\" and set assignedTo to the worker name",
+    '- Update the item\'s status to "dispatched" and set assignedTo to the worker name',
     "- Add the item's goals to the worker's goal file",
     "- Send a work_dispatch message to the worker's mailbox at `.pi-agent/.mailboxes/{worker}/`",
     "- Write the updated queue back to the file",
@@ -1793,10 +2274,10 @@ export function buildManagerInstructions(
     "- **ack**: Note acknowledgment",
     "After processing each message, delete the file (deletion = acknowledgment).",
     "To send a message, write a JSON file to `.pi-agent/.mailboxes/{recipient}/` with this schema:",
-    '```json',
+    "```json",
     '{ "id": "<timestamp>-<4chars>", "from": "manager", "to": "<recipient>",',
     '  "type": "<message_type>", "timestamp": "<ISO 8601>", "payload": { ... } }',
-    '```',
+    "```",
     "",
     "## Worker Registry",
     `Maintain \`${resolve(baseCwd, REGISTRY_FILE)}\` with worker status on each heartbeat.`,
@@ -1814,7 +2295,7 @@ export function buildManagerInstructions(
           "After auto-merging any `bmad-*` worker:",
           `1. Read \`${resolve(baseCwd, PI_AGENT_DIR, ".bmad-mode.json")}\` and mark the merged workflow's status as \`"completed"\``,
           "2. Check for newly-unblocked workflows: a workflow is unblocked when **every** entry in its `dependsOn`",
-          "   array has status `\"completed\"` in the `.bmad-mode.json` workflows list.",
+          '   array has status `"completed"` in the `.bmad-mode.json` workflows list.',
           "   NOTE: A dependency that is NOT listed in `.bmad-mode.json` at all is considered satisfied",
           "   (it was either completed before launch or not part of this project level).",
           `3. Count currently active workers (status \`"active"\` in .bmad-mode.json). Only spawn new workers if below the max.`,
@@ -1947,6 +2428,93 @@ export function resolveModelForWorker(
   return null;
 }
 
+// --- Account Rotation (Pure Functions) ---
+
+const CCSWITCH_SEQUENCE_PATH = join(
+  homedir(),
+  ".claude-switch-backup",
+  "sequence.json",
+);
+
+/** Read and validate ccswitch sequence file. */
+export async function readCcswitchSequence(
+  sequencePath?: string,
+): Promise<CcswitchSequence | null> {
+  try {
+    const content = await readFile(
+      sequencePath ?? CCSWITCH_SEQUENCE_PATH,
+      "utf-8",
+    );
+    const parsed = JSON.parse(content);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !Array.isArray(parsed.sequence) ||
+      typeof parsed.accounts !== "object" ||
+      parsed.accounts === null ||
+      typeof parsed.activeAccountNumber !== "number"
+    ) {
+      return null;
+    }
+    return parsed as CcswitchSequence;
+  } catch {
+    return null;
+  }
+}
+
+/** Extract ordered CcswitchAccount[] from a sequence file. */
+export function getAvailableAccounts(
+  sequence: CcswitchSequence,
+): CcswitchAccount[] {
+  const accounts: CcswitchAccount[] = [];
+  for (const num of sequence.sequence) {
+    const key = String(num);
+    const entry = sequence.accounts[key];
+    if (entry) {
+      accounts.push({ number: num, email: entry.email, uuid: entry.uuid });
+    }
+  }
+  return accounts;
+}
+
+/**
+ * Core round-robin rotation logic.
+ * Filters accounts below threshold; falls back to all if none remain.
+ * Returns accounts[spawnIndex % eligible.length].
+ */
+export function resolveAccountForWorker(
+  accounts: CcswitchAccount[],
+  spawnIndex: number,
+  usage?: UsageTrackingStore | null,
+  thresholdUsd?: number,
+): CcswitchAccount | null {
+  if (accounts.length === 0) return null;
+
+  let eligible = accounts;
+  if (thresholdUsd !== undefined && thresholdUsd > 0 && usage) {
+    const below = accounts.filter((a) => {
+      const entry = usage.accounts.find((u) => u.accountNumber === a.number);
+      return !entry || entry.totalCostUsd < thresholdUsd;
+    });
+    if (below.length > 0) eligible = below;
+    // If all over threshold → use all (don't block work)
+  }
+
+  return eligible[spawnIndex % eligible.length];
+}
+
+/** Format usage tracking store into a report string for harness_status. */
+export function buildUsageReport(usage: UsageTrackingStore): string {
+  if (usage.accounts.length === 0) return "No account usage data yet.";
+  const lines = ["### Account Usage"];
+  for (const entry of usage.accounts) {
+    lines.push(
+      `- Account ${entry.accountNumber} (${entry.email}): $${entry.totalCostUsd.toFixed(2)} across ${entry.sessionCount} session(s)`,
+    );
+  }
+  return lines.join("\n");
+}
+
 // --- Feature 2: Memory/Context Persistence (Pure Functions) ---
 
 /** Tokenize text into lowercase terms, splitting on whitespace and punctuation. */
@@ -1987,7 +2555,8 @@ export function computeBM25(
       if (termDf === 0) continue;
       const idf = Math.log((N - termDf + 0.5) / (termDf + 0.5) + 1);
       const tf = doc.filter((t) => t === term).length;
-      const tfComponent = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / (avgdl || 1))));
+      const tfComponent =
+        (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / (avgdl || 1))));
       score += idf * tfComponent;
     }
     return score;
@@ -2021,7 +2590,11 @@ export function searchMemories(
       if (queryTerms.some((qt) => catTokens.includes(qt))) {
         matchScore += 0.2;
       }
-      return { memory: m, matchScore, totalScore: matchScore + m.relevance * 0.01 };
+      return {
+        memory: m,
+        matchScore,
+        totalScore: matchScore + m.relevance * 0.01,
+      };
     })
     .filter((s) => s.matchScore > 0.01)
     .sort((a, b) => b.totalScore - a.totalScore)
@@ -2043,7 +2616,8 @@ export function getTemplateOverrides(
   // Compute from ratings: if average rating for role < 3, apply adjustments
   const roleRatings = store.ratings.filter((r) => r.role === role);
   if (roleRatings.length === 0) return [];
-  const avg = roleRatings.reduce((sum, r) => sum + r.rating, 0) / roleRatings.length;
+  const avg =
+    roleRatings.reduce((sum, r) => sum + r.rating, 0) / roleRatings.length;
   if (avg >= 3) return [];
   // Collect unique adjustments from low-rated entries
   const adjustments = new Set<string>();
@@ -2064,11 +2638,17 @@ export function buildDockerCmd(
   piCmd: string,
 ): string {
   const parts = [
-    "docker", "run", "--rm",
-    "-v", `${worktreePath}:/workspace`,
-    "-w", "/workspace",
-    "--network", sandboxConfig.networkMode,
-    "--memory", sandboxConfig.memoryLimit,
+    "docker",
+    "run",
+    "--rm",
+    "-v",
+    `${worktreePath}:/workspace`,
+    "-w",
+    "/workspace",
+    "--network",
+    sandboxConfig.networkMode,
+    "--memory",
+    sandboxConfig.memoryLimit,
   ];
   for (const mount of sandboxConfig.mountPaths) {
     parts.push("-v", `${mount}:${mount}`);
@@ -2102,7 +2682,8 @@ export function isScheduleDue(schedule: ScheduledRun, now: Date): boolean {
     const targetTotalMin = targetHour * 60 + targetMin;
     // Within 5-minute window and not already run today
     const inWindow = Math.abs(nowMin - targetTotalMin) <= 5;
-    const notRunToday = !lastRun || lastRun.toDateString() !== now.toDateString();
+    const notRunToday =
+      !lastRun || lastRun.toDateString() !== now.toDateString();
     return inWindow && notRunToday;
   }
   return false;
@@ -2190,7 +2771,8 @@ type QueueToolInput = Static<typeof QueueToolParams>;
 
 const SendToolParams = Type.Object({
   to: Type.String({
-    description: 'Recipient actor name (e.g., "manager", "parent", or worker name)',
+    description:
+      'Recipient actor name (e.g., "manager", "parent", or worker name)',
   }),
   type: Type.Union(
     [
@@ -2226,8 +2808,11 @@ export default function (pi: ExtensionAPI) {
   const mergedWorkers = new Set<string>();
 
   // Trace logging — binds cwd automatically
-  const hlog = (event: string, data?: Record<string, unknown>, level?: HarnessLogEntry["level"]) =>
-    harnessLog(cwd, event, data, level);
+  const hlog = (
+    event: string,
+    data?: Record<string, unknown>,
+    level?: HarnessLogEntry["level"],
+  ) => harnessLog(cwd, event, data, level);
 
   // Last context reference for notifying on background errors
   let lastCtx: { ui: { notify: Function; setStatus: Function } } | null = null;
@@ -2255,11 +2840,23 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Live config reload state
-  let cachedRuntimeConfig: { data: HarnessRuntimeConfig; mtime: number } | null = null;
+  let cachedRuntimeConfig: {
+    data: HarnessRuntimeConfig;
+    mtime: number;
+  } | null = null;
   let cachedModelRoutesMtime: number = 0;
   let cachedHeartbeatConfigMtime: number = 0;
   let effectiveMaxWorkers: number = Infinity;
   let effectiveStaggerMs: number = 5000;
+  let effectiveBackend: SessionBackend = "pi";
+  let effectiveClaudeConfig: ClaudeBackendConfig | undefined;
+
+  // Account rotation state
+  let accountSpawnIndex = 0;
+  let accountAssignments: Map<
+    string,
+    { accountNumber: number; email: string }
+  > = new Map();
 
   function invalidateCache(): void {
     cachedManagerStatus = null;
@@ -2271,50 +2868,87 @@ export default function (pi: ExtensionAPI) {
 
   // --- Live Config Reload ---
 
-  async function checkConfigReload(ctx: { ui: { notify: Function; setStatus: Function } }): Promise<void> {
+  async function checkConfigReload(ctx: {
+    ui: { notify: Function; setStatus: Function };
+  }): Promise<void> {
     const changes: string[] = [];
 
     // 1. Check .harness-config.json
     try {
       const configPath = join(cwd, HARNESS_CONFIG_FILE);
       const mtime = await getFileMtime(configPath);
-      if (mtime > 0 && (!cachedRuntimeConfig || mtime !== cachedRuntimeConfig.mtime)) {
+      if (
+        mtime > 0 &&
+        (!cachedRuntimeConfig || mtime !== cachedRuntimeConfig.mtime)
+      ) {
         const raw = JSON.parse(await readFile(configPath, "utf-8"));
         const validated = validateRuntimeConfig(raw);
         if (validated) {
           cachedRuntimeConfig = { data: validated, mtime };
-          if (validated.maxWorkers !== undefined && validated.maxWorkers !== effectiveMaxWorkers) {
-            changes.push(`maxWorkers: ${effectiveMaxWorkers} → ${validated.maxWorkers}`);
+          if (
+            validated.maxWorkers !== undefined &&
+            validated.maxWorkers !== effectiveMaxWorkers
+          ) {
+            changes.push(
+              `maxWorkers: ${effectiveMaxWorkers} → ${validated.maxWorkers}`,
+            );
             effectiveMaxWorkers = validated.maxWorkers;
           }
-          if (validated.staggerMs !== undefined && validated.staggerMs !== effectiveStaggerMs) {
-            changes.push(`staggerMs: ${effectiveStaggerMs} → ${validated.staggerMs}`);
+          if (
+            validated.staggerMs !== undefined &&
+            validated.staggerMs !== effectiveStaggerMs
+          ) {
+            changes.push(
+              `staggerMs: ${effectiveStaggerMs} → ${validated.staggerMs}`,
+            );
             effectiveStaggerMs = validated.staggerMs;
           }
+          if (
+            validated.backend !== undefined &&
+            validated.backend !== effectiveBackend
+          ) {
+            changes.push(`backend: ${effectiveBackend} → ${validated.backend}`);
+            effectiveBackend = validated.backend;
+          }
+          if (validated.claudeConfig !== undefined) {
+            changes.push("claudeConfig updated");
+            effectiveClaudeConfig = validated.claudeConfig;
+          }
         } else {
-          ctx.ui.notify("Invalid .harness-config.json — keeping previous values", "warning");
+          ctx.ui.notify(
+            "Invalid .harness-config.json — keeping previous values",
+            "warning",
+          );
           cachedRuntimeConfig = { data: {}, mtime }; // prevent re-reading until next change
         }
       }
-    } catch { /* file doesn't exist or parse error — ignore */ }
+    } catch {
+      /* file doesn't exist or parse error — ignore */
+    }
 
     // 2. Check .model-routes.json
     try {
       const mtime = await getFileMtime(join(cwd, MODEL_ROUTES_FILE));
       if (mtime > 0 && mtime !== cachedModelRoutesMtime) {
-        if (cachedModelRoutesMtime > 0) changes.push("model routes updated (applied on next spawn)");
+        if (cachedModelRoutesMtime > 0)
+          changes.push("model routes updated (applied on next spawn)");
         cachedModelRoutesMtime = mtime;
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
 
     // 3. Check .heartbeat-config.json
     try {
       const mtime = await getFileMtime(join(cwd, HEARTBEAT_CONFIG_FILE));
       if (mtime > 0 && mtime !== cachedHeartbeatConfigMtime) {
-        if (cachedHeartbeatConfigMtime > 0) changes.push("heartbeat config updated");
+        if (cachedHeartbeatConfigMtime > 0)
+          changes.push("heartbeat config updated");
         cachedHeartbeatConfigMtime = mtime;
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
 
     if (changes.length > 0) {
       hlog("config.reload", { changes });
@@ -2331,13 +2965,37 @@ export default function (pi: ExtensionAPI) {
 
   // --- tmux helpers ---
 
-  async function tmuxNewSession(name: string, cmd: string, cwdPath: string): Promise<void> {
-    await pi.exec("tmux", ["-L", TMUX_SERVER, "new-session", "-d", "-s", name, "-c", cwdPath, "bash", "-c", cmd], { cwd: cwdPath });
+  async function tmuxNewSession(
+    name: string,
+    cmd: string,
+    cwdPath: string,
+  ): Promise<void> {
+    await pi.exec(
+      "tmux",
+      [
+        "-L",
+        TMUX_SERVER,
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        cwdPath,
+        "bash",
+        "-c",
+        cmd,
+      ],
+      { cwd: cwdPath },
+    );
   }
 
   async function tmuxHasSession(name: string): Promise<boolean> {
     try {
-      const result = await pi.exec("tmux", ["-L", TMUX_SERVER, "has-session", "-t", name], { cwd });
+      const result = await pi.exec(
+        "tmux",
+        ["-L", TMUX_SERVER, "has-session", "-t", name],
+        { cwd },
+      );
       return result?.exitCode === 0;
     } catch {
       return false;
@@ -2346,13 +3004,30 @@ export default function (pi: ExtensionAPI) {
 
   async function tmuxKillSession(name: string): Promise<void> {
     try {
-      await pi.exec("tmux", ["-L", TMUX_SERVER, "kill-session", "-t", name], { cwd });
-    } catch { /* session may not exist */ }
+      await pi.exec("tmux", ["-L", TMUX_SERVER, "kill-session", "-t", name], {
+        cwd,
+      });
+    } catch {
+      /* session may not exist */
+    }
   }
 
   async function tmuxCapture(name: string, lines = 200): Promise<string> {
     try {
-      const result = await pi.exec("tmux", ["-L", TMUX_SERVER, "capture-pane", "-t", name, "-p", "-S", `-${lines}`], { cwd });
+      const result = await pi.exec(
+        "tmux",
+        [
+          "-L",
+          TMUX_SERVER,
+          "capture-pane",
+          "-t",
+          name,
+          "-p",
+          "-S",
+          `-${lines}`,
+        ],
+        { cwd },
+      );
       if (result?.exitCode !== 0) return "";
       return result.stdout ?? "";
     } catch {
@@ -2362,7 +3037,11 @@ export default function (pi: ExtensionAPI) {
 
   async function tmuxListSessions(): Promise<string[]> {
     try {
-      const result = await pi.exec("tmux", ["-L", TMUX_SERVER, "list-sessions", "-F", "#{session_name}"], { cwd });
+      const result = await pi.exec(
+        "tmux",
+        ["-L", TMUX_SERVER, "list-sessions", "-F", "#{session_name}"],
+        { cwd },
+      );
       if (result?.exitCode !== 0) return [];
       return (result.stdout ?? "").trim().split("\n").filter(Boolean);
     } catch {
@@ -2373,7 +3052,9 @@ export default function (pi: ExtensionAPI) {
   async function tmuxKillServer(): Promise<void> {
     try {
       await pi.exec("tmux", ["-L", TMUX_SERVER, "kill-server"], { cwd });
-    } catch { /* server may not exist */ }
+    } catch {
+      /* server may not exist */
+    }
   }
 
   // --- Helpers ---
@@ -2381,22 +3062,26 @@ export default function (pi: ExtensionAPI) {
   /** Normalize tmux capture: strip ANSI codes, spinners, timestamps for stable comparison */
   function normalizeCapture(raw: string): string {
     return raw
-      .replace(/\x1b\[[0-9;]*m/g, "")           // ANSI color codes
-      .replace(/\x1b\[\d*[A-Ha-h]/g, "")         // ANSI cursor movement
-      .replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "")           // spinner characters
-      .replace(/\d{2}:\d{2}:\d{2}/g, "")          // HH:MM:SS timestamps
-      .replace(/\s+/g, " ")                       // normalize whitespace
+      .replace(/\x1b\[[0-9;]*m/g, "") // ANSI color codes
+      .replace(/\x1b\[\d*[A-Ha-h]/g, "") // ANSI cursor movement
+      .replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "") // spinner characters
+      .replace(/\d{2}:\d{2}:\d{2}/g, "") // HH:MM:SS timestamps
+      .replace(/\s+/g, " ") // normalize whitespace
       .trim();
   }
 
   /** Check worker activity: active, stalled, or dead */
-  async function checkWorkerActivity(session: SubmoduleSession): Promise<"active" | "stalled" | "dead"> {
+  async function checkWorkerActivity(
+    session: SubmoduleSession,
+  ): Promise<"active" | "stalled" | "dead"> {
     if (!session.tmuxSession) return "dead";
     const alive = await tmuxHasSession(session.tmuxSession);
     if (!alive) return "dead";
 
     // Capture last 5 lines of output for change detection
-    const recent = normalizeCapture(await tmuxCapture(session.tmuxSession, 5) ?? "");
+    const recent = normalizeCapture(
+      (await tmuxCapture(session.tmuxSession, 5)) ?? "",
+    );
     if (recent === session._lastCapture) {
       session._stalledSince ??= Date.now();
       const stalledMs = Date.now() - session._stalledSince;
@@ -2408,18 +3093,24 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Read-only activity check for dashboard (does NOT mutate session state) */
-  async function peekWorkerActivity(session: SubmoduleSession): Promise<"active" | "stalled" | "dead"> {
+  async function peekWorkerActivity(
+    session: SubmoduleSession,
+  ): Promise<"active" | "stalled" | "dead"> {
     if (!session.tmuxSession) return "dead";
     const alive = await tmuxHasSession(session.tmuxSession);
     if (!alive) return "dead";
     if (session._stalledSince) {
-      return (Date.now() - session._stalledSince) > WORKER_STALL_THRESHOLD_MS ? "stalled" : "active";
+      return Date.now() - session._stalledSince > WORKER_STALL_THRESHOLD_MS
+        ? "stalled"
+        : "active";
     }
     return "active";
   }
 
   /** Read optional .harness-heartbeat file mtime from worker's worktree */
-  async function getWorkerHeartbeat(session: SubmoduleSession): Promise<Date | null> {
+  async function getWorkerHeartbeat(
+    session: SubmoduleSession,
+  ): Promise<Date | null> {
     try {
       const st = await stat(join(session.worktreePath, ".harness-heartbeat"));
       return st.mtime;
@@ -2429,7 +3120,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Write worker state sidecar file */
-  async function writeWorkerState(name: string, state: WorkerState): Promise<void> {
+  async function writeWorkerState(
+    name: string,
+    state: WorkerState,
+  ): Promise<void> {
     try {
       await mkdir(piAgentDir(), { recursive: true });
       await atomicWriteFile(
@@ -2444,12 +3138,176 @@ export default function (pi: ExtensionAPI) {
   /** Read worker state sidecar file */
   async function readWorkerState(name: string): Promise<WorkerState | null> {
     try {
-      const content = await readFile(join(piAgentDir(), `${name}.state.json`), "utf-8");
+      const content = await readFile(
+        join(piAgentDir(), `${name}.state.json`),
+        "utf-8",
+      );
       const parsed = JSON.parse(content);
       if (!Value.Check(WorkerStateSchema, parsed)) return null;
       return parsed as WorkerState;
     } catch {
       return null;
+    }
+  }
+
+  // --- Account Rotation Helpers ---
+
+  async function readUsageTracking(): Promise<UsageTrackingStore> {
+    try {
+      const content = await readFile(join(cwd, USAGE_TRACKING_FILE), "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed?.version === 1 && Array.isArray(parsed.accounts)) {
+        return parsed as UsageTrackingStore;
+      }
+    } catch {
+      // Missing or malformed — return empty
+    }
+    return { version: 1, accounts: [], updatedAt: new Date().toISOString() };
+  }
+
+  async function writeUsageTracking(store: UsageTrackingStore): Promise<void> {
+    store.updatedAt = new Date().toISOString();
+    await mkdir(piAgentDir(), { recursive: true });
+    await atomicWriteFile(
+      join(cwd, USAGE_TRACKING_FILE),
+      JSON.stringify(store, null, 2) + "\n",
+    );
+  }
+
+  async function switchAccount(
+    accountNumber: number,
+    ccswitchPath?: string,
+  ): Promise<boolean> {
+    try {
+      const bin = ccswitchPath ?? "ccswitch";
+      const result = await pi.exec(
+        bin,
+        ["--switch-to", String(accountNumber)],
+        {
+          cwd,
+        },
+      );
+      const ok = result.exitCode === 0;
+      hlog("account.switch", {
+        accountNumber,
+        ok,
+        stdout: (result.stdout ?? "").slice(0, 200),
+      });
+      return ok;
+    } catch (e) {
+      hlog(
+        "account.switch",
+        {
+          accountNumber,
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        },
+        "warn",
+      );
+      return false;
+    }
+  }
+
+  async function switchAccountBeforeSpawn(
+    workerName: string,
+  ): Promise<{ accountNumber: number; email: string } | null> {
+    if (effectiveBackend !== "claude") return null;
+    const rotationCfg = effectiveClaudeConfig?.accountRotation;
+    if (!rotationCfg?.enabled) return null;
+
+    const sequence = await readCcswitchSequence(rotationCfg.sequenceFilePath);
+    if (!sequence) {
+      hlog("account.rotation.skip", { reason: "no sequence file" }, "warn");
+      return null;
+    }
+
+    const accounts = getAvailableAccounts(sequence);
+    if (accounts.length === 0) {
+      hlog("account.rotation.skip", { reason: "no accounts" }, "warn");
+      return null;
+    }
+
+    let usage: UsageTrackingStore | null = null;
+    if (rotationCfg.usageThresholdUsd) {
+      usage = await readUsageTracking();
+    }
+
+    const account = resolveAccountForWorker(
+      accounts,
+      accountSpawnIndex++,
+      usage,
+      rotationCfg.usageThresholdUsd,
+    );
+    if (!account) return null;
+
+    const ok = await switchAccount(account.number, rotationCfg.ccswitchPath);
+    if (!ok) {
+      hlog(
+        "account.rotation.fail",
+        { workerName, accountNumber: account.number },
+        "warn",
+      );
+      return null;
+    }
+
+    const assignment = { accountNumber: account.number, email: account.email };
+    accountAssignments.set(workerName, assignment);
+    hlog("account.rotation.assign", {
+      workerName,
+      accountNumber: account.number,
+      email: account.email,
+    });
+    return assignment;
+  }
+
+  async function recordWorkerUsage(
+    workerName: string,
+    accountNumber: number,
+    email: string,
+    costUsd: number = 0,
+    inputTokens: number = 0,
+    outputTokens: number = 0,
+  ): Promise<void> {
+    try {
+      const store = await readUsageTracking();
+      let entry = store.accounts.find((a) => a.accountNumber === accountNumber);
+      if (!entry) {
+        entry = {
+          accountNumber,
+          email,
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 0,
+          lastUsedAt: new Date().toISOString(),
+          sessions: [],
+        };
+        store.accounts.push(entry);
+      }
+      entry.totalCostUsd += costUsd;
+      entry.totalInputTokens += inputTokens;
+      entry.totalOutputTokens += outputTokens;
+      entry.sessionCount++;
+      entry.lastUsedAt = new Date().toISOString();
+      entry.sessions.push({
+        workerName,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        costUsd,
+        inputTokens,
+        outputTokens,
+      });
+      // Keep last 50 sessions per account
+      if (entry.sessions.length > 50) {
+        entry.sessions = entry.sessions.slice(-50);
+      }
+      await writeUsageTracking(store);
+    } catch (e) {
+      hlog(
+        "account.usage.error",
+        { workerName, error: e instanceof Error ? e.message : String(e) },
+        "warn",
+      );
     }
   }
 
@@ -2475,7 +3333,10 @@ export default function (pi: ExtensionAPI) {
       store.memories = store.memories.slice(0, MAX_MEMORIES);
     }
     await mkdir(piAgentDir(), { recursive: true });
-    await atomicWriteFile(join(cwd, MEMORY_FILE), JSON.stringify(store, null, 2) + "\n");
+    await atomicWriteFile(
+      join(cwd, MEMORY_FILE),
+      JSON.stringify(store, null, 2) + "\n",
+    );
   }
 
   async function addMemory(
@@ -2514,7 +3375,10 @@ export default function (pi: ExtensionAPI) {
 
   async function writeTemplateStore(store: TemplateStore): Promise<void> {
     await mkdir(piAgentDir(), { recursive: true });
-    await atomicWriteFile(join(cwd, TEMPLATE_STORE_FILE), JSON.stringify(store, null, 2) + "\n");
+    await atomicWriteFile(
+      join(cwd, TEMPLATE_STORE_FILE),
+      JSON.stringify(store, null, 2) + "\n",
+    );
   }
 
   // --- Feature 7: Schedule Helpers ---
@@ -2532,7 +3396,10 @@ export default function (pi: ExtensionAPI) {
 
   async function writeSchedule(schedules: ScheduledRun[]): Promise<void> {
     await mkdir(piAgentDir(), { recursive: true });
-    await atomicWriteFile(join(cwd, SCHEDULE_FILE), JSON.stringify(schedules, null, 2) + "\n");
+    await atomicWriteFile(
+      join(cwd, SCHEDULE_FILE),
+      JSON.stringify(schedules, null, 2) + "\n",
+    );
   }
 
   // --- Feature 10: Dashboard Server ---
@@ -2577,7 +3444,10 @@ export default function (pi: ExtensionAPI) {
 
   // --- Feature 4: Worker Recovery ---
 
-  async function recoverWorker(name: string, session: SubmoduleSession): Promise<boolean> {
+  async function recoverWorker(
+    name: string,
+    session: SubmoduleSession,
+  ): Promise<boolean> {
     const state = await readWorkerState(name);
     const attempts = state?.recoveryAttempts ?? 0;
     const maxRecoveries = state?.maxRecoveries ?? MAX_WORKER_RECOVERIES;
@@ -2632,12 +3502,19 @@ export default function (pi: ExtensionAPI) {
     });
 
     // Notify manager
-    await sendMailboxMessage(cwd, "manager", "system", "status_report", {
-      event: "worker_recovered",
-      worker: name,
-      attempt: attempts + 1,
-      maxRecoveries,
-    }, { system: true });
+    await sendMailboxMessage(
+      cwd,
+      "manager",
+      "system",
+      "status_report",
+      {
+        event: "worker_recovered",
+        worker: name,
+        attempt: attempts + 1,
+        maxRecoveries,
+      },
+      { system: true },
+    );
 
     return true;
   }
@@ -2655,13 +3532,18 @@ export default function (pi: ExtensionAPI) {
         if (url === "/status") {
           const managerStatus = await readManagerStatus(cwd);
           const configs = await readGoalFiles();
-          res.end(JSON.stringify({
-            active: loopActive,
-            manager: managerStatus,
-            workerCount: sessions.size,
-            totalGoals: configs.reduce((s, c) => s + c.goals.length, 0),
-            completedGoals: configs.reduce((s, c) => s + c.goals.filter((g) => g.completed).length, 0),
-          }));
+          res.end(
+            JSON.stringify({
+              active: loopActive,
+              manager: managerStatus,
+              workerCount: sessions.size,
+              totalGoals: configs.reduce((s, c) => s + c.goals.length, 0),
+              completedGoals: configs.reduce(
+                (s, c) => s + c.goals.filter((g) => g.completed).length,
+                0,
+              ),
+            }),
+          );
         } else if (url === "/workers") {
           const workers: Record<string, unknown> = {};
           for (const [name] of sessions) {
@@ -2677,7 +3559,8 @@ export default function (pi: ExtensionAPI) {
         } else if (url.startsWith("/logs/")) {
           const name = url.slice(6);
           const session = sessions.get(name);
-          const tmuxSess = name === "manager" ? managerTmuxSession : session?.tmuxSession;
+          const tmuxSess =
+            name === "manager" ? managerTmuxSession : session?.tmuxSession;
           if (tmuxSess) {
             const output = await tmuxCapture(tmuxSess, 100);
             res.end(JSON.stringify({ name, output }));
@@ -2687,11 +3570,24 @@ export default function (pi: ExtensionAPI) {
           }
         } else {
           res.statusCode = 404;
-          res.end(JSON.stringify({ error: "Not found", endpoints: ["/status", "/workers", "/queue", "/memory", "/logs/<name>"] }));
+          res.end(
+            JSON.stringify({
+              error: "Not found",
+              endpoints: [
+                "/status",
+                "/workers",
+                "/queue",
+                "/memory",
+                "/logs/<name>",
+              ],
+            }),
+          );
         }
       } catch (e) {
         res.statusCode = 500;
-        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+        res.end(
+          JSON.stringify({ error: e instanceof Error ? e.message : String(e) }),
+        );
       }
     });
     dashboardServer.listen(port);
@@ -2747,6 +3643,11 @@ export default function (pi: ExtensionAPI) {
       managerCwd: managerDirPath(),
       managerSpawnedAt: managerSpawnedAt?.toISOString() ?? null,
       managerTmuxSession,
+      backend: effectiveBackend,
+      claudeConfig: effectiveClaudeConfig,
+      ...(accountAssignments.size > 0 && {
+        accountAssignments: Object.fromEntries(accountAssignments),
+      }),
     };
     for (const [name, session] of sessions) {
       state.sessions[name] = {
@@ -2759,10 +3660,7 @@ export default function (pi: ExtensionAPI) {
     }
     try {
       await mkdir(piAgentDir(), { recursive: true });
-      await atomicWriteFile(
-        statePath(),
-        JSON.stringify(state, null, 2) + "\n",
-      );
+      await atomicWriteFile(statePath(), JSON.stringify(state, null, 2) + "\n");
     } catch (e) {
       lastCtx?.ui.notify(
         `Harness state save failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -2789,6 +3687,12 @@ export default function (pi: ExtensionAPI) {
         ? new Date(state.managerSpawnedAt)
         : null;
       managerTmuxSession = state.managerTmuxSession ?? null;
+      if (state.backend) effectiveBackend = state.backend;
+      if (state.claudeConfig) effectiveClaudeConfig = state.claudeConfig;
+      // Restore account assignments
+      if (state.accountAssignments) {
+        accountAssignments = new Map(Object.entries(state.accountAssignments));
+      }
       sessions = new Map();
       for (const [name, s] of Object.entries(state.sessions)) {
         sessions.set(name, {
@@ -2806,12 +3710,17 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Add a filename to the per-worktree git exclude file (never committed). */
-  async function addToWorktreeExclude(wtPath: string, filename: string): Promise<void> {
+  async function addToWorktreeExclude(
+    wtPath: string,
+    filename: string,
+  ): Promise<void> {
     let excludeDir: string;
     try {
       const gitFileContent = await readFile(join(wtPath, ".git"), "utf-8");
       const gitDirMatch = gitFileContent.match(/^gitdir:\s*(.+)$/m);
-      excludeDir = gitDirMatch ? resolve(wtPath, gitDirMatch[1].trim()) : join(wtPath, ".git");
+      excludeDir = gitDirMatch
+        ? resolve(wtPath, gitDirMatch[1].trim())
+        : join(wtPath, ".git");
     } catch {
       excludeDir = join(wtPath, ".git");
     }
@@ -2820,10 +3729,16 @@ export default function (pi: ExtensionAPI) {
     let existing = "";
     try {
       existing = await readFile(excludeFile, "utf-8");
-    } catch { /* no exclude file yet */ }
+    } catch {
+      /* no exclude file yet */
+    }
     if (!existing.includes(filename)) {
       const separator = existing && !existing.endsWith("\n") ? "\n" : "";
-      await writeFile(excludeFile, existing + separator + filename + "\n", "utf-8");
+      await writeFile(
+        excludeFile,
+        existing + separator + filename + "\n",
+        "utf-8",
+      );
     }
   }
 
@@ -2907,7 +3822,10 @@ export default function (pi: ExtensionAPI) {
     // Feature 6: Self-improving template overrides
     let templateOverrideSection = "";
     try {
-      const storeContent = await readFile(join(cwd, TEMPLATE_STORE_FILE), "utf-8");
+      const storeContent = await readFile(
+        join(cwd, TEMPLATE_STORE_FILE),
+        "utf-8",
+      );
       const store = JSON.parse(storeContent) as TemplateStore;
       const overrides = getTemplateOverrides(store, config.role);
       if (overrides.length > 0) {
@@ -2981,7 +3899,9 @@ export default function (pi: ExtensionAPI) {
       "- NEVER modify heartbeat.md or .pi-agent-prompt.md — they are managed by the harness",
       "- Commit your work frequently, but do NOT commit or stage heartbeat.md or .pi-agent-prompt.md",
       "- Do not switch branches",
-      "- Before marking your final goal complete, rate this prompt template: write a JSON file to `.pi-agent/.template-ratings/` with `{ \"role\": \"" + config.role + "\", \"rating\": 1-5, \"feedback\": \"...\", \"adjustments\": [...] }`",
+      '- Before marking your final goal complete, rate this prompt template: write a JSON file to `.pi-agent/.template-ratings/` with `{ "role": "' +
+        config.role +
+        '", "rating": 1-5, "feedback": "...", "adjustments": [...] }`',
       "",
       "## Asking Questions",
       `If you need a decision or clarification from the user, write your question to the goal file at \`${goalFilePath}\`.`,
@@ -3000,7 +3920,9 @@ export default function (pi: ExtensionAPI) {
       "- **ack**: Note acknowledgment",
       "After processing each message, delete the file.",
       "To send a message to another actor, write a JSON file to `.pi-agent/.mailboxes/{recipient}/` with:",
-      '`{ "id": "<timestamp>-<4chars>", "from": "' + config.name + '", "to": "<recipient>",',
+      '`{ "id": "<timestamp>-<4chars>", "from": "' +
+        config.name +
+        '", "to": "<recipient>",',
       '  "type": "<type>", "timestamp": "<ISO 8601>", "payload": { ... } }`',
       "",
       activeWorkerNames.length > 0
@@ -3019,7 +3941,10 @@ export default function (pi: ExtensionAPI) {
     // Feature 1: Resolve model for this worker
     let modelRoutes = DEFAULT_MODEL_ROUTES;
     try {
-      const routesContent = await readFile(join(cwd, MODEL_ROUTES_FILE), "utf-8");
+      const routesContent = await readFile(
+        join(cwd, MODEL_ROUTES_FILE),
+        "utf-8",
+      );
       modelRoutes = JSON.parse(routesContent) as ModelRoute[];
     } catch {
       // Use defaults
@@ -3037,28 +3962,70 @@ export default function (pi: ExtensionAPI) {
     }
 
     const tmuxName = `worker-${sanitizeTmuxName(config.name)}`;
-    const piCmd = `pi${modelFlag} -p "$(cat .pi-agent-prompt.md)"`;
+
+    // Build MCP config for Claude backend
+    let mcpConfigFile: string | null = null;
+    if (effectiveBackend === "claude") {
+      mcpConfigFile = await buildMcpConfigForWorker(
+        session.worktreePath,
+        effectiveClaudeConfig?.mcpServers,
+        effectiveClaudeConfig?.mcpConfigPath,
+      );
+      if (mcpConfigFile && !effectiveClaudeConfig?.mcpConfigPath) {
+        await addToWorktreeExclude(
+          session.worktreePath,
+          ".claude-mcp-config.json",
+        );
+      }
+    }
+    // For Claude backend: CLI --claude-model (in claudeConfig.model) takes priority;
+    // fall back to model routes only if no explicit claude model was specified.
+    const claudeModel =
+      effectiveBackend === "claude"
+        ? (effectiveClaudeConfig?.model ?? model ?? undefined)
+        : undefined;
+    const baseCmd = buildWorkerCommand(
+      effectiveBackend,
+      modelFlag,
+      effectiveClaudeConfig,
+      claudeModel,
+      mcpConfigFile,
+    );
     const cmd = sandboxConfig?.enabled
-      ? buildDockerCmd(sandboxConfig, session.worktreePath, piCmd)
-      : piCmd;
+      ? buildDockerCmd(sandboxConfig, session.worktreePath, baseCmd)
+      : baseCmd;
+
+    // Account rotation: switch before spawn
+    const acctAssignment = await switchAccountBeforeSpawn(config.name);
+
     await tmuxNewSession(tmuxName, cmd, session.worktreePath);
 
     session.tmuxSession = tmuxName;
     session.spawned = true;
     session.spawnedAt = new Date();
-    hlog("worker.spawn", { name: config.name, role: config.role, goals: config.goals.filter(g => !g.completed).length });
+    hlog("worker.spawn", {
+      name: config.name,
+      role: config.role,
+      goals: config.goals.filter((g) => !g.completed).length,
+      backend: effectiveBackend,
+      ...(acctAssignment && { accountNumber: acctAssignment.accountNumber }),
+    });
 
     // Write initial sidecar state
     await writeWorkerState(config.name, {
       name: config.name,
       status: "active",
-      goalsCompleted: config.goals.filter(g => g.completed).length,
+      goalsCompleted: config.goals.filter((g) => g.completed).length,
       goalsTotal: config.goals.length,
       lastActivity: new Date().toISOString(),
       errors: [],
       mergeStatus: "pending",
       dependsOn: config.dependsOn ?? [],
       dependenciesMet: true,
+      ...(acctAssignment && {
+        accountNumber: acctAssignment.accountNumber,
+        accountEmail: acctAssignment.email,
+      }),
     });
   }
 
@@ -3071,8 +4038,7 @@ export default function (pi: ExtensionAPI) {
       return { ok: true, message: `${config.name} already merged` };
     }
     // Block merge if unanswered questions exist
-    const unanswered =
-      config.questions?.filter((q) => !q.answered).length ?? 0;
+    const unanswered = config.questions?.filter((q) => !q.answered).length ?? 0;
     if (unanswered > 0) {
       return {
         ok: false,
@@ -3089,12 +4055,19 @@ export default function (pi: ExtensionAPI) {
     // throwing, so try/catch alone is insufficient for conflict detection.
     let mergeResult: { stdout?: string; stderr?: string; exitCode?: number };
     try {
-      mergeResult = await pi.exec("git", ["merge", session.branch, "--no-edit"], {
-        cwd: mergeCwd,
-      });
+      mergeResult = await pi.exec(
+        "git",
+        ["merge", session.branch, "--no-edit"],
+        {
+          cwd: mergeCwd,
+        },
+      );
     } catch (e) {
       // pi.exec threw — treat as merge failure
-      mergeResult = { exitCode: 1, stderr: e instanceof Error ? e.message : String(e) };
+      mergeResult = {
+        exitCode: 1,
+        stderr: e instanceof Error ? e.message : String(e),
+      };
     }
 
     if (mergeResult.exitCode === 0) {
@@ -3103,7 +4076,7 @@ export default function (pi: ExtensionAPI) {
       await writeWorkerState(config.name, {
         name: config.name,
         status: "completed",
-        goalsCompleted: config.goals.filter(g => g.completed).length,
+        goalsCompleted: config.goals.filter((g) => g.completed).length,
         goalsTotal: config.goals.length,
         lastActivity: new Date().toISOString(),
         errors: [],
@@ -3116,12 +4089,21 @@ export default function (pi: ExtensionAPI) {
       // no longer needed and may contain excluded files (heartbeat.md,
       // .pi-agent-prompt.md) that block non-force removal.
       await removeWorktree(session, true);
-      return { ok: true, message: `Merged ${session.branch} into ${config.path}` };
+      return {
+        ok: true,
+        message: `Merged ${session.branch} into ${config.path}`,
+      };
     }
 
     // Merge failed — abort to clean up conflict state
-    hlog("worker.merge.conflict", { name: config.name, branch: session.branch }, "warn");
-    const errorMsg = mergeResult.stderr || `git merge exited with code ${mergeResult.exitCode}`;
+    hlog(
+      "worker.merge.conflict",
+      { name: config.name, branch: session.branch },
+      "warn",
+    );
+    const errorMsg =
+      mergeResult.stderr ||
+      `git merge exited with code ${mergeResult.exitCode}`;
     try {
       await pi.exec("git", ["merge", "--abort"], { cwd: mergeCwd });
     } catch {
@@ -3132,7 +4114,7 @@ export default function (pi: ExtensionAPI) {
     await writeWorkerState(config.name, {
       name: config.name,
       status: "error",
-      goalsCompleted: config.goals.filter(g => g.completed).length,
+      goalsCompleted: config.goals.filter((g) => g.completed).length,
       goalsTotal: config.goals.length,
       lastActivity: new Date().toISOString(),
       errors: [errorMsg],
@@ -3142,12 +4124,19 @@ export default function (pi: ExtensionAPI) {
     });
 
     // Notify via mailbox so manager knows about the conflict
-    await sendMailboxMessage(cwd, "parent", "system", "status_report", {
-      event: "merge_conflict",
-      submodule: config.name,
-      branch: session.branch,
-      error: errorMsg,
-    }, { system: true });
+    await sendMailboxMessage(
+      cwd,
+      "parent",
+      "system",
+      "status_report",
+      {
+        event: "merge_conflict",
+        submodule: config.name,
+        branch: session.branch,
+        error: errorMsg,
+      },
+      { system: true },
+    );
 
     return {
       ok: false,
@@ -3168,7 +4157,9 @@ export default function (pi: ExtensionAPI) {
     if (force) args.push("--force");
     await pi.exec("git", args, { cwd });
     try {
-      await pi.exec("git", ["branch", force ? "-D" : "-d", session.branch], { cwd });
+      await pi.exec("git", ["branch", force ? "-D" : "-d", session.branch], {
+        cwd,
+      });
     } catch {
       // Branch may already be deleted or need force — don't block worktree removal
     }
@@ -3192,7 +4183,11 @@ export default function (pi: ExtensionAPI) {
     try {
       const content = await readFile(join(cwd, AUTO_MODE_FILE), "utf-8");
       const parsed = JSON.parse(content);
-      if (parsed && typeof parsed === "object" && parsed.enabled !== undefined) {
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.enabled !== undefined
+      ) {
         return parsed as AutoModeState;
       }
     } catch {
@@ -3214,26 +4209,67 @@ export default function (pi: ExtensionAPI) {
       name: "scout",
       path: ".",
       role: "researcher",
-      goals: [{ text: "Evaluate the codebase and produce a scout analysis", completed: false }],
+      goals: [
+        {
+          text: "Evaluate the codebase and produce a scout analysis",
+          completed: false,
+        },
+      ],
       questions: [],
-      context: autoConfig.objective ?? "Identify the highest-impact improvements for this codebase",
+      context:
+        autoConfig.objective ??
+        "Identify the highest-impact improvements for this codebase",
       rawContent: "",
     };
 
     // Write goal file
     const goalContent = serializeGoalFile(scoutConfig);
     await mkdir(piAgentDir(), { recursive: true });
-    await atomicWriteFile(join(piAgentDir(), goalFileName("scout")), goalContent);
+    await atomicWriteFile(
+      join(piAgentDir(), goalFileName("scout")),
+      goalContent,
+    );
 
     // Create worktree and write prompt
     const session = await createWorktree(scoutConfig);
-    const prompt = buildScoutPrompt(cwd, autoConfig.objective, autoConfig.focus);
-    await atomicWriteFile(join(session.worktreePath, ".pi-agent-prompt.md"), prompt);
+    const prompt = buildScoutPrompt(
+      cwd,
+      autoConfig.objective,
+      autoConfig.focus,
+    );
+    await atomicWriteFile(
+      join(session.worktreePath, ".pi-agent-prompt.md"),
+      prompt,
+    );
     await addToWorktreeExclude(session.worktreePath, ".pi-agent-prompt.md");
 
     // Spawn tmux session
     const tmuxName = `worker-scout`;
-    const cmd = `pi -p "$(cat .pi-agent-prompt.md)"`;
+    let mcpConfigFile: string | null = null;
+    if (effectiveBackend === "claude") {
+      mcpConfigFile = await buildMcpConfigForWorker(
+        session.worktreePath,
+        effectiveClaudeConfig?.mcpServers,
+        effectiveClaudeConfig?.mcpConfigPath,
+      );
+      if (mcpConfigFile && !effectiveClaudeConfig?.mcpConfigPath) {
+        await addToWorktreeExclude(
+          session.worktreePath,
+          ".claude-mcp-config.json",
+        );
+      }
+    }
+    const cmd = buildWorkerCommand(
+      effectiveBackend,
+      "",
+      effectiveClaudeConfig,
+      undefined,
+      mcpConfigFile,
+    );
+
+    // Account rotation: switch before spawn
+    await switchAccountBeforeSpawn("scout");
+
     await tmuxNewSession(tmuxName, cmd, session.worktreePath);
 
     session.tmuxSession = tmuxName;
@@ -3247,16 +4283,24 @@ export default function (pi: ExtensionAPI) {
     analysis: ScoutAnalysis,
     autoConfig: AutoModeConfig,
   ): Promise<void> {
-    const { configs: allConfigs, ready, queued } = buildPlanFromAnalysis(
-      analysis,
-      autoConfig.maxWorkers,
+    const {
+      configs: allConfigs,
+      ready,
+      queued,
+    } = buildPlanFromAnalysis(analysis, autoConfig.maxWorkers);
+    hlog(
+      "auto.plan.execute",
+      { ready: ready.length, queued: queued.length },
+      "info",
     );
-    hlog("auto.plan.execute", { ready: ready.length, queued: queued.length }, "info");
 
     // Write goal files for all configs
     for (const config of allConfigs) {
       const goalContent = serializeGoalFile(config);
-      await atomicWriteFile(join(piAgentDir(), goalFileName(config.name)), goalContent);
+      await atomicWriteFile(
+        join(piAgentDir(), goalFileName(config.name)),
+        goalContent,
+      );
     }
 
     // Spawn ready workers with stagger
@@ -3363,8 +4407,11 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  async function spawnManager(configs: SubmoduleConfig[], bmadMode?: BmadModeConfig): Promise<void> {
-    hlog("manager.spawn", { workers: configs.map(c => c.name) });
+  async function spawnManager(
+    configs: SubmoduleConfig[],
+    bmadMode?: BmadModeConfig,
+  ): Promise<void> {
+    hlog("manager.spawn", { workers: configs.map((c) => c.name) });
     const mgrDir = managerDirPath();
     await mkdir(mgrDir, { recursive: true });
 
@@ -3381,8 +4428,14 @@ export default function (pi: ExtensionAPI) {
     // Feature 3: Read heartbeat config for manager timing
     let heartbeatConfig = DEFAULT_HEARTBEAT_CONFIG;
     try {
-      const hbContent = await readFile(join(cwd, HEARTBEAT_CONFIG_FILE), "utf-8");
-      heartbeatConfig = { ...DEFAULT_HEARTBEAT_CONFIG, ...JSON.parse(hbContent) };
+      const hbContent = await readFile(
+        join(cwd, HEARTBEAT_CONFIG_FILE),
+        "utf-8",
+      );
+      heartbeatConfig = {
+        ...DEFAULT_HEARTBEAT_CONFIG,
+        ...JSON.parse(hbContent),
+      };
     } catch {
       // Use defaults
     }
@@ -3392,41 +4445,48 @@ export default function (pi: ExtensionAPI) {
       JSON.stringify(heartbeatConfig, null, 2) + "\n",
     );
 
-    const successSleepSec = Math.max(1, Math.round(heartbeatConfig.intervalMs / 1000));
-    const failureSleepSec = Math.max(1, Math.round(heartbeatConfig.intervalMs / 2000));
+    const successSleepSec = Math.max(
+      1,
+      Math.round(heartbeatConfig.intervalMs / 1000),
+    );
+    const failureSleepSec = Math.max(
+      1,
+      Math.round(heartbeatConfig.intervalMs / 2000),
+    );
 
     const tmuxName = "harness-manager";
-    const stopSignalPathEsc = shellEscape(join(cwd, STOP_SIGNAL_FILE));
-    const statusFilePathEsc = shellEscape(join(cwd, MANAGER_STATUS_FILE));
-    const errorLogPathEsc = shellEscape(join(mgrDir, ".pi-agent-errors.log"));
 
     // Active-hours check (Feature 3)
     const activeHoursCheck = heartbeatConfig.activeHoursOnly
       ? `HOUR=$(date +%H); if [ "$HOUR" -lt ${heartbeatConfig.activeHoursStart} ] || [ "$HOUR" -ge ${heartbeatConfig.activeHoursEnd} ]; then sleep ${successSleepSec}; continue; fi;`
       : "";
 
-    // Exit-code-aware loop: track consecutive failures, log errors, bail after MAX_CONSECUTIVE_FAILURES
-    const loopCmd = [
-      "consecutive_failures=0;",
-      "while true; do",
-      `if [ -f ${stopSignalPathEsc} ]; then echo "Stop signal detected"; exit 0; fi;`,
+    // Build MCP config for manager (Claude backend)
+    let mcpConfigFile: string | null = null;
+    if (effectiveBackend === "claude") {
+      mcpConfigFile = await buildMcpConfigForWorker(
+        mgrDir,
+        effectiveClaudeConfig?.mcpServers,
+        effectiveClaudeConfig?.mcpConfigPath,
+      );
+    }
+
+    const loopCmd = buildManagerLoopCommand(
+      effectiveBackend,
+      join(cwd, STOP_SIGNAL_FILE),
+      join(cwd, MANAGER_STATUS_FILE),
+      join(mgrDir, ".pi-agent-errors.log"),
+      successSleepSec,
+      failureSleepSec,
+      MAX_CONSECUTIVE_FAILURES,
       activeHoursCheck,
-      'pi -p "$(cat .pi-agent-prompt.md)";',
-      "exit_code=$?;",
-      "if [ $exit_code -ne 0 ]; then",
-      "consecutive_failures=$((consecutive_failures + 1));",
-      `echo "[$(date -u +%FT%TZ)] pi exited with code $exit_code (failure $consecutive_failures/${MAX_CONSECUTIVE_FAILURES})" >> ${errorLogPathEsc};`,
-      `if [ $consecutive_failures -ge ${MAX_CONSECUTIVE_FAILURES} ]; then`,
-      `echo '{"status":"error","message":"Manager crashed ${MAX_CONSECUTIVE_FAILURES} times consecutively","updatedAt":"'$(date -u +%FT%TZ)'","submodules":{},"stallCount":0}' > ${statusFilePathEsc};`,
-      "exit 1;",
-      "fi;",
-      `sleep ${failureSleepSec};`,
-      "else",
-      "consecutive_failures=0;",
-      `sleep ${successSleepSec};`,
-      "fi;",
-      "done",
-    ].join(" ");
+      effectiveClaudeConfig,
+      mcpConfigFile,
+    );
+
+    // Account rotation: switch before spawn
+    await switchAccountBeforeSpawn("manager");
+
     await tmuxNewSession(tmuxName, loopCmd, mgrDir);
 
     managerTmuxSession = tmuxName;
@@ -3449,10 +4509,16 @@ export default function (pi: ExtensionAPI) {
     // Detect default branch (main, master, etc.)
     let baseBranch = "main";
     try {
-      const ref = await pi.exec("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], { cwd });
+      const ref = await pi.exec(
+        "git",
+        ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+        { cwd },
+      );
       const parsed = (ref.stdout ?? "").trim().replace(/^origin\//, "");
       if (parsed) baseBranch = parsed;
-    } catch { /* fallback to main */ }
+    } catch {
+      /* fallback to main */
+    }
 
     for (const config of configs) {
       const session = sessions.get(config.name);
@@ -3467,7 +4533,10 @@ export default function (pi: ExtensionAPI) {
             { cwd },
           );
           commits = logResult.stdout
-            ? logResult.stdout.trim().split("\n").filter((l: string) => l.length > 0).length
+            ? logResult.stdout
+                .trim()
+                .split("\n")
+                .filter((l: string) => l.length > 0).length
             : 0;
         } catch {
           // Branch may not exist
@@ -3499,6 +4568,18 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
+    // Record account usage for completed workers
+    for (const config of configs) {
+      const assignment = accountAssignments.get(config.name);
+      if (assignment) {
+        await recordWorkerUsage(
+          config.name,
+          assignment.accountNumber,
+          assignment.email,
+        );
+      }
+    }
+
     // Count unprocessed mailbox messages
     let mailboxUnprocessed = 0;
     try {
@@ -3513,7 +4594,9 @@ export default function (pi: ExtensionAPI) {
     let queueItemsPending = 0;
     try {
       const queue = await readQueue(cwd);
-      queueItemsPending = queue.items.filter((i) => i.status === "pending").length;
+      queueItemsPending = queue.items.filter(
+        (i) => i.status === "pending",
+      ).length;
     } catch {
       // ignore
     }
@@ -3539,9 +4622,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Build human-readable summary message
-    const totalGoals = Object.values(workers).reduce((s, w) => s + w.goalsTotal, 0);
-    const totalDone = Object.values(workers).reduce((s, w) => s + w.goalsCompleted, 0);
-    const totalCommits = Object.values(workers).reduce((s, w) => s + w.commits, 0);
+    const totalGoals = Object.values(workers).reduce(
+      (s, w) => s + w.goalsTotal,
+      0,
+    );
+    const totalDone = Object.values(workers).reduce(
+      (s, w) => s + w.goalsCompleted,
+      0,
+    );
+    const totalCommits = Object.values(workers).reduce(
+      (s, w) => s + w.commits,
+      0,
+    );
     const workerLines = Object.entries(workers).map(
       ([name, w]) =>
         `- **${name}** [${w.role}]: ${w.goalsCompleted}/${w.goalsTotal} goals, ${w.commits} commits, ${w.filesChanged} files${w.merged ? " (merged)" : ""}`,
@@ -3686,7 +4778,9 @@ export default function (pi: ExtensionAPI) {
       const configs = await readGoalFiles();
       if (configs.length > 0) {
         // Check actual liveness — managerSpawned only means "was spawned before"
-        const managerAlive = managerTmuxSession ? await tmuxHasSession(managerTmuxSession) : false;
+        const managerAlive = managerTmuxSession
+          ? await tmuxHasSession(managerTmuxSession)
+          : false;
         pi.sendMessage(
           {
             customType: "harness-restored",
@@ -3713,7 +4807,10 @@ export default function (pi: ExtensionAPI) {
         loopActive = false;
         await persistState();
         ctx.ui.setStatus("harness", "harness: context-full");
-        ctx.ui.notify("Harness deactivated — context window nearly full", "warning");
+        ctx.ui.notify(
+          "Harness deactivated — context window nearly full",
+          "warning",
+        );
         return;
       }
     } catch {
@@ -3722,19 +4819,27 @@ export default function (pi: ExtensionAPI) {
 
     // --- Auto mode: scout completion detection ---
     const autoState = await readAutoModeState();
-    if (autoState?.enabled && (autoState.phase === "scouting" || autoState.phase === "re-scouting")) {
+    if (
+      autoState?.enabled &&
+      (autoState.phase === "scouting" || autoState.phase === "re-scouting")
+    ) {
       // Check if scout goal file has goal completed
       try {
         const scoutGoalPath = join(piAgentDir(), goalFileName("scout"));
         const scoutGoalContent = await readFile(scoutGoalPath, "utf-8");
         const scoutConfig = parseGoalFile(scoutGoalContent, "scout.md");
-        const allGoalsDone = scoutConfig.goals.length > 0 && scoutConfig.goals.every((g) => g.completed);
+        const allGoalsDone =
+          scoutConfig.goals.length > 0 &&
+          scoutConfig.goals.every((g) => g.completed);
 
         if (allGoalsDone) {
           // Read the scout analysis
           let analysis: ScoutAnalysis | null = null;
           try {
-            const analysisContent = await readFile(join(cwd, SCOUT_ANALYSIS_FILE), "utf-8");
+            const analysisContent = await readFile(
+              join(cwd, SCOUT_ANALYSIS_FILE),
+              "utf-8",
+            );
             analysis = JSON.parse(analysisContent) as ScoutAnalysis;
           } catch {
             // Analysis file not written or malformed
@@ -3746,10 +4851,16 @@ export default function (pi: ExtensionAPI) {
             if (scoutSession) {
               try {
                 await removeWorktree(scoutSession, true);
-              } catch { /* best effort */ }
+              } catch {
+                /* best effort */
+              }
               sessions.delete("scout");
             }
-            try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* best effort */ }
+            try {
+              await rm(join(piAgentDir(), goalFileName("scout")));
+            } catch {
+              /* best effort */
+            }
 
             // Update auto state with analysis
             autoState.scoutAnalysis = analysis;
@@ -3758,7 +4869,11 @@ export default function (pi: ExtensionAPI) {
             await writeAutoModeState(autoState);
 
             // Execute immediately (full autonomy)
-            hlog("auto.scout.complete", { findings: analysis.findings.length }, "info");
+            hlog(
+              "auto.scout.complete",
+              { findings: analysis.findings.length },
+              "info",
+            );
             await executeAutoModePlan(analysis, autoState.config);
             ctx.ui.setStatus("harness", "harness: auto executing");
             return;
@@ -3767,7 +4882,8 @@ export default function (pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "harness-auto-scout-failed",
-                content: "Scout completed but produced no valid analysis. Run `/harness:auto cancel` and try again.",
+                content:
+                  "Scout completed but produced no valid analysis. Run `/harness:auto cancel` and try again.",
                 display: true,
               },
               { triggerTurn: false },
@@ -3791,7 +4907,8 @@ export default function (pi: ExtensionAPI) {
           pi.sendMessage(
             {
               customType: "harness-auto-scout-dead",
-              content: "Scout worker died unexpectedly. Run `/harness:auto cancel` and try again.",
+              content:
+                "Scout worker died unexpectedly. Run `/harness:auto cancel` and try again.",
               display: true,
             },
             { triggerTurn: false },
@@ -3815,7 +4932,11 @@ export default function (pi: ExtensionAPI) {
     const now = Date.now();
     let status: ManagerStatusFile | null;
     const statusMtime = await getFileMtime(join(cwd, MANAGER_STATUS_FILE));
-    if (cachedManagerStatus && cachedManagerStatus.mtime === statusMtime && statusMtime > 0) {
+    if (
+      cachedManagerStatus &&
+      cachedManagerStatus.mtime === statusMtime &&
+      statusMtime > 0
+    ) {
       status = cachedManagerStatus.data;
     } else {
       status = await readManagerStatus(cwd);
@@ -3823,11 +4944,19 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Shared auto-recovery logic for dead/stale manager
-    async function attemptAutoRecovery(reason: string): Promise<"recovered" | "exhausted" | "waiting"> {
+    async function attemptAutoRecovery(
+      reason: string,
+    ): Promise<"recovered" | "exhausted" | "waiting"> {
       managerStaleCount++;
       hlog("manager.dead", { reason }, "warn");
-      const requiredStaleCount = RECOVERY_BACKOFF[Math.min(managerRecoveryAttempts, RECOVERY_BACKOFF.length - 1)];
-      if (managerStaleCount >= requiredStaleCount && managerRecoveryAttempts < MAX_MANAGER_RECOVERY) {
+      const requiredStaleCount =
+        RECOVERY_BACKOFF[
+          Math.min(managerRecoveryAttempts, RECOVERY_BACKOFF.length - 1)
+        ];
+      if (
+        managerStaleCount >= requiredStaleCount &&
+        managerRecoveryAttempts < MAX_MANAGER_RECOVERY
+      ) {
         managerRecoveryAttempts++;
         managerStaleCount = 0;
         hlog("manager.recover.start", { attempt: managerRecoveryAttempts });
@@ -3848,13 +4977,19 @@ export default function (pi: ExtensionAPI) {
           const errorLogPath = join(managerDirPath(), ".pi-agent-errors.log");
           const prevPath = join(cwd, ".pi-agent-errors.log.prev");
           await copyFile(errorLogPath, prevPath);
-        } catch { /* no error log to preserve */ }
+        } catch {
+          /* no error log to preserve */
+        }
         try {
           await rm(managerDirPath(), { recursive: true, force: true });
-        } catch { /* may not exist */ }
+        } catch {
+          /* may not exist */
+        }
         try {
           await rm(join(cwd, STOP_SIGNAL_FILE));
-        } catch { /* may not exist */ }
+        } catch {
+          /* may not exist */
+        }
         const configs = await readGoalFiles();
         if (configs.length > 0) {
           await spawnManager(configs);
@@ -3863,7 +4998,11 @@ export default function (pi: ExtensionAPI) {
         hlog("manager.recover.ok", { attempt: managerRecoveryAttempts });
         return "recovered";
       } else if (managerRecoveryAttempts >= MAX_MANAGER_RECOVERY) {
-        hlog("manager.recover.exhausted", { attempts: managerRecoveryAttempts }, "warn");
+        hlog(
+          "manager.recover.exhausted",
+          { attempts: managerRecoveryAttempts },
+          "warn",
+        );
         pi.sendMessage(
           {
             customType: "harness-recovery-failed",
@@ -3883,7 +5022,10 @@ export default function (pi: ExtensionAPI) {
         if (result === "recovered") {
           ctx.ui.setStatus("harness", "harness: manager recovering");
         } else if (result === "exhausted") {
-          ctx.ui.setStatus("harness", "harness: manager failed — run /harness:recover --force");
+          ctx.ui.setStatus(
+            "harness",
+            "harness: manager failed — run /harness:recover --force",
+          );
         } else {
           ctx.ui.setStatus("harness", "harness: manager stale");
         }
@@ -3894,11 +5036,16 @@ export default function (pi: ExtensionAPI) {
     // Check liveness
     const age = now - new Date(status.updatedAt).getTime();
     if (age > MANAGER_STALE_THRESHOLD_MS) {
-      const result = await attemptAutoRecovery(`Manager stale for ${Math.round(age / 60000)}m`);
+      const result = await attemptAutoRecovery(
+        `Manager stale for ${Math.round(age / 60000)}m`,
+      );
       if (result === "recovered") {
         ctx.ui.setStatus("harness", "harness: manager recovering");
       } else if (result === "exhausted") {
-        ctx.ui.setStatus("harness", "harness: manager failed — run /harness:recover --force");
+        ctx.ui.setStatus(
+          "harness",
+          "harness: manager failed — run /harness:recover --force",
+        );
       } else {
         ctx.ui.setStatus("harness", "harness: manager stale");
       }
@@ -3920,7 +5067,9 @@ export default function (pi: ExtensionAPI) {
         goalCacheValid = true;
         try {
           const files = await readdir(piAgentDir());
-          const mdFiles = files.filter(f => f.endsWith(".md") && !f.startsWith("."));
+          const mdFiles = files.filter(
+            (f) => f.endsWith(".md") && !f.startsWith("."),
+          );
           if (mdFiles.length !== cachedGoalConfigs.mtimes.size) {
             goalCacheValid = false;
           } else {
@@ -3943,10 +5092,14 @@ export default function (pi: ExtensionAPI) {
         const mtimes = new Map<string, number>();
         try {
           const files = await readdir(piAgentDir());
-          for (const file of files.filter(f => f.endsWith(".md") && !f.startsWith("."))) {
+          for (const file of files.filter(
+            (f) => f.endsWith(".md") && !f.startsWith("."),
+          )) {
             mtimes.set(file, await getFileMtime(join(piAgentDir(), file)));
           }
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
         cachedGoalConfigs = { data: configs, mtimes };
       }
       for (const c of configs) {
@@ -3959,13 +5112,25 @@ export default function (pi: ExtensionAPI) {
       }
       // Fall back to manager status when goal files are empty/unavailable
       if (configs.length === 0 && status.submodules) {
-        totalGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.total, 0);
-        doneGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.completed, 0);
+        totalGoals = Object.values(status.submodules).reduce(
+          (sum, s) => sum + s.total,
+          0,
+        );
+        doneGoals = Object.values(status.submodules).reduce(
+          (sum, s) => sum + s.completed,
+          0,
+        );
       }
     } catch {
       // Fall back to manager status counts
-      totalGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.total, 0);
-      doneGoals = Object.values(status.submodules).reduce((sum, s) => sum + s.completed, 0);
+      totalGoals = Object.values(status.submodules).reduce(
+        (sum, s) => sum + s.total,
+        0,
+      );
+      doneGoals = Object.values(status.submodules).reduce(
+        (sum, s) => sum + s.completed,
+        0,
+      );
     }
 
     // --- Deterministic auto-merge ---
@@ -3974,18 +5139,24 @@ export default function (pi: ExtensionAPI) {
         if (mergedWorkers.has(config.name)) continue;
         if (config.goals.length === 0) continue;
         if (!config.goals.every((g) => g.completed)) continue;
-        if ((config.questions?.filter((q) => !q.answered).length ?? 0) > 0) continue;
+        if ((config.questions?.filter((q) => !q.answered).length ?? 0) > 0)
+          continue;
         const session = sessions.get(config.name);
         if (!session) continue;
         // Verify branch still exists
         try {
-          await pi.exec("git", ["rev-parse", "--verify", session.branch], { cwd });
+          await pi.exec("git", ["rev-parse", "--verify", session.branch], {
+            cwd,
+          });
         } catch {
           continue; // Branch gone — skip
         }
         const result = await mergeWorktree(session, config);
         if (result.ok) {
-          hlog("worker.complete", { name: config.name, goals: config.goals.length });
+          hlog("worker.complete", {
+            name: config.name,
+            goals: config.goals.length,
+          });
           sessions.delete(config.name);
           pi.sendMessage(
             {
@@ -4005,7 +5176,9 @@ export default function (pi: ExtensionAPI) {
               timestamp: new Date().toISOString(),
               payload: { action: "auto-merged", worker: config.name },
             });
-          } catch { /* best effort */ }
+          } catch {
+            /* best effort */
+          }
           // Update registry
           try {
             const registry = await readRegistry(cwd);
@@ -4015,7 +5188,9 @@ export default function (pi: ExtensionAPI) {
               entry.mergedAt = new Date().toISOString();
               await writeRegistry(cwd, registry);
             }
-          } catch { /* best effort */ }
+          } catch {
+            /* best effort */
+          }
         }
       }
     } catch {
@@ -4025,13 +5200,18 @@ export default function (pi: ExtensionAPI) {
     // --- Deterministic queue dispatch ---
     try {
       const queue = await readQueue(cwd);
-      const pendingItems = queue.items.filter((item) => item.status === "pending");
+      const pendingItems = queue.items.filter(
+        (item) => item.status === "pending",
+      );
       if (pendingItems.length > 0) {
         // Determine max workers from live config + auto mode ceiling
         let maxWorkersLimit = effectiveMaxWorkers;
         const autoState2 = await readAutoModeState();
         if (autoState2?.enabled && autoState2.config?.maxWorkers) {
-          maxWorkersLimit = Math.min(maxWorkersLimit, autoState2.config.maxWorkers);
+          maxWorkersLimit = Math.min(
+            maxWorkersLimit,
+            autoState2.config.maxWorkers,
+          );
         }
         const activeCount = Array.from(sessions.values()).filter(
           (s) => s.spawned && s.tmuxSession,
@@ -4058,7 +5238,9 @@ export default function (pi: ExtensionAPI) {
                   "path: .",
                   "",
                   "## Goals",
-                  ...(item.goals ?? [item.description]).map((g) => `- [ ] ${g}`),
+                  ...(item.goals ?? [item.description]).map(
+                    (g) => `- [ ] ${g}`,
+                  ),
                 ]
                   .filter(Boolean)
                   .join("\n");
@@ -4089,7 +5271,9 @@ export default function (pi: ExtensionAPI) {
                   timestamp: new Date().toISOString(),
                   payload: { action: "queue-dispatched", topic: item.topic },
                 });
-              } catch { /* best effort */ }
+              } catch {
+                /* best effort */
+              }
             } catch {
               // Skip this item on error — manager can retry
             }
@@ -4145,7 +5329,10 @@ export default function (pi: ExtensionAPI) {
       if (errorLines.length > 0) {
         // Rotate: keep last 100 lines
         if (errorLines.length > 100) {
-          await atomicWriteFile(errorLogPath, errorLines.slice(-100).join("\n") + "\n");
+          await atomicWriteFile(
+            errorLogPath,
+            errorLines.slice(-100).join("\n") + "\n",
+          );
         }
         const lastErrors = errorLines.slice(-5).join("\n");
         // Only surface if content changed since last notification
@@ -4217,10 +5404,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
-    const recoverySuffix = recoveredWorkerCount > 0 ? `/${recoveredWorkerCount}r` : "";
-    const workerSuffix = sessions.size > 0
-      ? `, ${activeWorkerCount}a/${stalledWorkerCount}s/${deadWorkerCount}d${recoverySuffix}`
-      : "";
+    const recoverySuffix =
+      recoveredWorkerCount > 0 ? `/${recoveredWorkerCount}r` : "";
+    const workerSuffix =
+      sessions.size > 0
+        ? `, ${activeWorkerCount}a/${stalledWorkerCount}s/${deadWorkerCount}d${recoverySuffix}`
+        : "";
 
     ctx.ui.setStatus(
       "harness",
@@ -4234,8 +5423,13 @@ export default function (pi: ExtensionAPI) {
       status.status === "stalled"
     ) {
       // Auto mode re-scout on all_complete
-      if (status.status === "all_complete" && autoState?.enabled && autoState.phase === "executing") {
-        const canRescout = autoState.config.iteration < autoState.config.maxIterations - 1;
+      if (
+        status.status === "all_complete" &&
+        autoState?.enabled &&
+        autoState.phase === "executing"
+      ) {
+        const canRescout =
+          autoState.config.iteration < autoState.config.maxIterations - 1;
         if (canRescout) {
           await writeRunSummary("all_complete");
 
@@ -4252,9 +5446,21 @@ export default function (pi: ExtensionAPI) {
             managerTmuxSession = null;
           }
           // Clean up manager dir and status
-          try { await rm(managerDirPath(), { recursive: true, force: true }); } catch { /* best effort */ }
-          try { await rm(join(cwd, MANAGER_STATUS_FILE)); } catch { /* best effort */ }
-          try { await rm(join(cwd, STOP_SIGNAL_FILE)); } catch { /* best effort */ }
+          try {
+            await rm(managerDirPath(), { recursive: true, force: true });
+          } catch {
+            /* best effort */
+          }
+          try {
+            await rm(join(cwd, MANAGER_STATUS_FILE));
+          } catch {
+            /* best effort */
+          }
+          try {
+            await rm(join(cwd, STOP_SIGNAL_FILE));
+          } catch {
+            /* best effort */
+          }
 
           sessions.clear();
           managerSpawned = false;
@@ -4272,7 +5478,10 @@ export default function (pi: ExtensionAPI) {
           await spawnScout(autoState.config);
           await persistState();
 
-          ctx.ui.setStatus("harness", `harness: auto re-scouting (iteration ${autoState.iteration + 1}/${autoState.config.maxIterations})`);
+          ctx.ui.setStatus(
+            "harness",
+            `harness: auto re-scouting (iteration ${autoState.iteration + 1}/${autoState.config.maxIterations})`,
+          );
           pi.sendMessage(
             {
               customType: "harness-auto-rescout",
@@ -4284,7 +5493,11 @@ export default function (pi: ExtensionAPI) {
           return;
         } else {
           // Final iteration — deactivate auto mode
-          hlog("auto.complete", { iterations: autoState.config.maxIterations }, "info");
+          hlog(
+            "auto.complete",
+            { iterations: autoState.config.maxIterations },
+            "info",
+          );
           autoState.enabled = false;
           autoState.phase = "idle";
           await writeAutoModeState(autoState);
@@ -4308,7 +5521,8 @@ export default function (pi: ExtensionAPI) {
       await writeRunSummary(reason);
       loopActive = false;
       await persistState();
-      const terminalLabel = status.status === "all_complete" ? "done" : status.status;
+      const terminalLabel =
+        status.status === "all_complete" ? "done" : status.status;
       ctx.ui.setStatus(
         "harness",
         `harness: ${doneGoals}/${totalGoals} goals, ${terminalLabel}`,
@@ -4317,22 +5531,33 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    await hlog("session.shutdown", { sessions: sessions.size, loopActive }, "info");
+    await hlog(
+      "session.shutdown",
+      { sessions: sessions.size, loopActive },
+      "info",
+    );
     await persistState();
   });
 
   // --- Trace logging hooks ---
 
   /** Round context usage percent to 1 decimal for cleaner traces. */
-  function usageData(usage: { tokens: number; percent: number } | null | undefined) {
+  function usageData(
+    usage: { tokens: number; percent: number } | null | undefined,
+  ) {
     if (!usage) return undefined;
-    return { tokens: usage.tokens, percent: Math.round(usage.percent * 10) / 10 };
+    return {
+      tokens: usage.tokens,
+      percent: Math.round(usage.percent * 10) / 10,
+    };
   }
 
   pi.on("turn_start", async (_event: unknown, ctx: unknown) => {
     if (!cwd) return;
     try {
-      const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
+      const c = ctx as {
+        getContextUsage?: () => { tokens: number; percent: number } | null;
+      };
       hlog("turn.start", usageData(c.getContextUsage?.()));
     } catch {
       hlog("turn.start");
@@ -4356,7 +5581,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (_event: unknown, ctx: unknown) => {
     if (!cwd) return;
     try {
-      const c = ctx as { getContextUsage?: () => { tokens: number; percent: number } | null };
+      const c = ctx as {
+        getContextUsage?: () => { tokens: number; percent: number } | null;
+      };
       hlog("turn.end", usageData(c.getContextUsage?.()));
     } catch {
       hlog("turn.end");
@@ -4372,10 +5599,19 @@ export default function (pi: ExtensionAPI) {
   // Wraps registerTool to add tool.result / tool.error tracing with duration.
 
   const HARNESS_TOOLS = new Set([
-    "harness_status", "harness_update_goal", "harness_add_task",
-    "harness_ask", "harness_answer", "harness_queue", "harness_send",
-    "harness_inbox", "harness_remember", "harness_recall",
-    "harness_send_message", "harness_read_messages", "harness_rate_template",
+    "harness_status",
+    "harness_update_goal",
+    "harness_add_task",
+    "harness_ask",
+    "harness_answer",
+    "harness_queue",
+    "harness_send",
+    "harness_inbox",
+    "harness_remember",
+    "harness_recall",
+    "harness_send_message",
+    "harness_read_messages",
+    "harness_rate_template",
   ]);
 
   const _origRegisterTool = pi.registerTool.bind(pi);
@@ -4391,7 +5627,15 @@ export default function (pi: ExtensionAPI) {
             const durationMs = Date.now() - start;
             if (cwd) {
               if (result?.isError) {
-                hlog("tool.error", { tool: def.name, durationMs, error: (result.content?.[0] as any)?.text?.slice(0, 200) }, "warn");
+                hlog(
+                  "tool.error",
+                  {
+                    tool: def.name,
+                    durationMs,
+                    error: (result.content?.[0] as any)?.text?.slice(0, 200),
+                  },
+                  "warn",
+                );
               } else {
                 hlog("tool.result", { tool: def.name, durationMs }, "info");
               }
@@ -4400,7 +5644,18 @@ export default function (pi: ExtensionAPI) {
           } catch (e) {
             const durationMs = Date.now() - start;
             if (cwd) {
-              hlog("tool.error", { tool: def.name, durationMs, error: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200) }, "warn");
+              hlog(
+                "tool.error",
+                {
+                  tool: def.name,
+                  durationMs,
+                  error:
+                    e instanceof Error
+                      ? e.message.slice(0, 200)
+                      : String(e).slice(0, 200),
+                },
+                "warn",
+              );
             }
             throw e;
           }
@@ -4410,8 +5665,19 @@ export default function (pi: ExtensionAPI) {
       if (def.renderCall) {
         const origRenderCall = def.renderCall;
         def.renderCall = function (this: any, ...args: any[]) {
-          try { return origRenderCall.apply(this, args); } catch (e) {
-            if (cwd) hlog("render.error", { tool: def.name, phase: "call", error: String(e).slice(0, 200) }, "warn");
+          try {
+            return origRenderCall.apply(this, args);
+          } catch (e) {
+            if (cwd)
+              hlog(
+                "render.error",
+                {
+                  tool: def.name,
+                  phase: "call",
+                  error: String(e).slice(0, 200),
+                },
+                "warn",
+              );
             return new Text(def.label ?? def.name, 0, 0);
           }
         };
@@ -4419,8 +5685,19 @@ export default function (pi: ExtensionAPI) {
       if (def.renderResult) {
         const origRenderResult = def.renderResult;
         def.renderResult = function (this: any, ...args: any[]) {
-          try { return origRenderResult.apply(this, args); } catch (e) {
-            if (cwd) hlog("render.error", { tool: def.name, phase: "result", error: String(e).slice(0, 200) }, "warn");
+          try {
+            return origRenderResult.apply(this, args);
+          } catch (e) {
+            if (cwd)
+              hlog(
+                "render.error",
+                {
+                  tool: def.name,
+                  phase: "result",
+                  error: String(e).slice(0, 200),
+                },
+                "warn",
+              );
             return new Text("...", 0, 0);
           }
         };
@@ -4440,13 +5717,23 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
 
     renderCall(_args: Record<string, never>, theme: any) {
-      return new Text(theme.fg("toolTitle", theme.bold("harness ")) + theme.fg("accent", "status"), 0, 0);
+      return new Text(
+        theme.fg("toolTitle", theme.bold("harness ")) +
+          theme.fg("accent", "status"),
+        0,
+        0,
+      );
     },
     renderResult(result: any, { expanded, isPartial }: any, theme: any) {
-      if (isPartial) return new Text(theme.fg("warning", "Loading status..."), 0, 0);
+      if (isPartial)
+        return new Text(theme.fg("warning", "Loading status..."), 0, 0);
       const d = result.details as Record<string, unknown>;
-      if (!d.totalGoals) return new Text(theme.fg("muted", "No active sessions"), 0, 0);
-      let text = theme.fg("success", `${d.completedGoals}/${d.totalGoals} goals`);
+      if (!d.totalGoals)
+        return new Text(theme.fg("muted", "No active sessions"), 0, 0);
+      let text = theme.fg(
+        "success",
+        `${d.completedGoals}/${d.totalGoals} goals`,
+      );
       text += theme.fg("dim", ` across ${d.submodules} worker(s)`);
       if ((d.unansweredQuestions as number) > 0) {
         text += theme.fg("warning", ` [${d.unansweredQuestions} ?]`);
@@ -4480,8 +5767,26 @@ export default function (pi: ExtensionAPI) {
         0,
       );
 
+      // Account rotation status
+      let fullSummary = summary;
+      const rotationEnabled =
+        effectiveClaudeConfig?.accountRotation?.enabled ?? false;
+      const acctDetails: Record<string, unknown> = {};
+      if (rotationEnabled) {
+        const usage = await readUsageTracking();
+        fullSummary += "\n\n" + buildUsageReport(usage);
+        if (accountAssignments.size > 0) {
+          fullSummary += "\n\n### Worker → Account Mapping";
+          for (const [worker, acct] of accountAssignments) {
+            fullSummary += `\n- ${worker} → Account ${acct.accountNumber} (${acct.email})`;
+          }
+        }
+        acctDetails.accountRotation = true;
+        acctDetails.accountAssignments = Object.fromEntries(accountAssignments);
+      }
+
       return {
-        content: [{ type: "text", text: summary }],
+        content: [{ type: "text", text: fullSummary }],
         details: {
           submodules: configs.length,
           totalGoals,
@@ -4489,6 +5794,8 @@ export default function (pi: ExtensionAPI) {
           totalQuestions,
           unansweredQuestions,
           loopActive,
+          backend: effectiveBackend,
+          ...acctDetails,
         },
       };
     },
@@ -4505,16 +5812,28 @@ export default function (pi: ExtensionAPI) {
     renderCall(args: any, theme: any) {
       let text = theme.fg("toolTitle", theme.bold("goal "));
       text += theme.fg("accent", args.action);
-      text += theme.fg("dim", ` ${args.submodule}: "${args.goal.slice(0, 60)}"`);
+      text += theme.fg(
+        "dim",
+        ` ${args.submodule}: "${args.goal.slice(0, 60)}"`,
+      );
       return new Text(text, 0, 0);
     },
     renderResult(result: any, { isPartial }: any, theme: any) {
       if (isPartial) return new Text(theme.fg("warning", "Updating..."), 0, 0);
       const d = result.details as Record<string, unknown>;
       const goals = d.goals as Array<{ completed: boolean }> | undefined;
-      if (!goals) return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
-      const done = goals.filter(g => g.completed).length;
-      return new Text(theme.fg("success", `${done}/${goals.length} complete`), 0, 0);
+      if (!goals)
+        return new Text(
+          theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""),
+          0,
+          0,
+        );
+      const done = goals.filter((g) => g.completed).length;
+      return new Text(
+        theme.fg("success", `${done}/${goals.length} complete`),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: UpdateGoalInput) {
@@ -4653,8 +5972,18 @@ export default function (pi: ExtensionAPI) {
     renderResult(result: any, { isPartial }: any, theme: any) {
       if (isPartial) return new Text(theme.fg("warning", "Creating..."), 0, 0);
       const d = result.details as Record<string, unknown>;
-      if (!d.name) return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
-      return new Text(theme.fg("success", `Created "${d.name}"`) + theme.fg("dim", ` at .pi-agent/${d.name}.md`), 0, 0);
+      if (!d.name)
+        return new Text(
+          theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""),
+          0,
+          0,
+        );
+      return new Text(
+        theme.fg("success", `Created "${d.name}"`) +
+          theme.fg("dim", ` at .pi-agent/${d.name}.md`),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: AddTaskInput) {
@@ -4749,9 +6078,17 @@ export default function (pi: ExtensionAPI) {
       if (isPartial) return new Text(theme.fg("warning", "Staging..."), 0, 0);
       const d = result.details as Record<string, unknown>;
       if (typeof d.unanswered === "number") {
-        return new Text(theme.fg("warning", `${d.unanswered} unanswered`), 0, 0);
+        return new Text(
+          theme.fg("warning", `${d.unanswered} unanswered`),
+          0,
+          0,
+        );
       }
-      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+      return new Text(
+        theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: AskInput) {
@@ -4818,7 +6155,10 @@ export default function (pi: ExtensionAPI) {
     renderCall(args: any, theme: any) {
       let text = theme.fg("toolTitle", theme.bold("! "));
       text += theme.fg("accent", args.submodule);
-      text += theme.fg("dim", ` "${args.question.slice(0, 40)}" → "${args.answer.slice(0, 40)}"`);
+      text += theme.fg(
+        "dim",
+        ` "${args.question.slice(0, 40)}" → "${args.answer.slice(0, 40)}"`,
+      );
       return new Text(text, 0, 0);
     },
     renderResult(result: any, { isPartial }: any, theme: any) {
@@ -4828,7 +6168,11 @@ export default function (pi: ExtensionAPI) {
         const color = d.remaining === 0 ? "success" : "warning";
         return new Text(theme.fg(color, `${d.remaining} remaining`), 0, 0);
       }
-      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+      return new Text(
+        theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: AnswerInput) {
@@ -4925,22 +6269,37 @@ export default function (pi: ExtensionAPI) {
       let text = theme.fg("toolTitle", theme.bold("queue+ "));
       text += theme.fg("accent", args.topic);
       if (args.role) text += theme.fg("muted", ` [${args.role}]`);
-      if (args.priority && args.priority !== 10) text += theme.fg("dim", ` p=${args.priority}`);
+      if (args.priority && args.priority !== 10)
+        text += theme.fg("dim", ` p=${args.priority}`);
       return new Text(text, 0, 0);
     },
     renderResult(result: any, { isPartial }: any, theme: any) {
       if (isPartial) return new Text(theme.fg("warning", "Queuing..."), 0, 0);
       const d = result.details as Record<string, unknown>;
       if (d.queueLength) {
-        return new Text(theme.fg("success", "Queued") + theme.fg("dim", ` (${d.queueLength} pending)`), 0, 0);
+        return new Text(
+          theme.fg("success", "Queued") +
+            theme.fg("dim", ` (${d.queueLength} pending)`),
+          0,
+          0,
+        );
       }
-      return new Text(theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""), 0, 0);
+      return new Text(
+        theme.fg("dim", (result.content[0] as { text: string })?.text ?? ""),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: QueueToolInput) {
       if (!loopActive) {
         return {
-          content: [{ type: "text" as const, text: "Harness is not active. Start with /harness:launch first." }],
+          content: [
+            {
+              type: "text" as const,
+              text: "Harness is not active. Start with /harness:launch first.",
+            },
+          ],
           isError: true,
         };
       }
@@ -4962,7 +6321,17 @@ export default function (pi: ExtensionAPI) {
         return queue.items.length;
       });
       invalidateCache();
-      hlog("queue.add", { id, topic: params.topic, role: params.role, priority: params.priority ?? 10, queueLength }, "info");
+      hlog(
+        "queue.add",
+        {
+          id,
+          topic: params.topic,
+          role: params.role,
+          priority: params.priority ?? 10,
+          queueLength,
+        },
+        "info",
+      );
 
       // Notify manager of new work
       await sendMailboxMessage(cwd, "manager", "parent", "directive", {
@@ -4998,7 +6367,12 @@ export default function (pi: ExtensionAPI) {
     renderResult(result: any, { isPartial }: any, theme: any) {
       if (isPartial) return new Text(theme.fg("warning", "Sending..."), 0, 0);
       const d = result.details as Record<string, unknown>;
-      return new Text(theme.fg("success", `Sent to ${d.to}`) + theme.fg("dim", ` [${d.type}]`), 0, 0);
+      return new Text(
+        theme.fg("success", `Sent to ${d.to}`) +
+          theme.fg("dim", ` [${d.type}]`),
+        0,
+        0,
+      );
     },
 
     async execute(_toolCallId, params: SendToolInput) {
@@ -5033,13 +6407,16 @@ export default function (pi: ExtensionAPI) {
       return new Text(theme.fg("toolTitle", theme.bold("inbox")), 0, 0);
     },
     renderResult(result: any, { expanded, isPartial }: any, theme: any) {
-      if (isPartial) return new Text(theme.fg("warning", "Reading inbox..."), 0, 0);
+      if (isPartial)
+        return new Text(theme.fg("warning", "Reading inbox..."), 0, 0);
       const d = result.details as Record<string, unknown>;
       const count = (d.count as number) ?? 0;
       if (count === 0) return new Text(theme.fg("muted", "Empty inbox"), 0, 0);
       let text = theme.fg("success", `${count} message(s)`);
       if (expanded) {
-        const msgs = d.messages as Array<{ type: string; from: string }> | undefined;
+        const msgs = d.messages as
+          | Array<{ type: string; from: string }>
+          | undefined;
         if (msgs) {
           for (const m of msgs.slice(0, 20)) {
             text += "\n" + theme.fg("dim", `  [${m.type}] from ${m.from}`);
@@ -5059,7 +6436,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const lines: string[] = [`## Parent Inbox (${messages.length} message(s))`, ""];
+      const lines: string[] = [
+        `## Parent Inbox (${messages.length} message(s))`,
+        "",
+      ];
       for (const { message, filename } of messages) {
         lines.push(
           `**[${message.type}]** from ${message.from} at ${message.timestamp}`,
@@ -5091,10 +6471,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       content: Type.String({ description: "What to remember" }),
       category: Type.Union(
-        [Type.Literal("decision"), Type.Literal("pattern"), Type.Literal("error"), Type.Literal("insight")],
+        [
+          Type.Literal("decision"),
+          Type.Literal("pattern"),
+          Type.Literal("error"),
+          Type.Literal("insight"),
+        ],
         { description: "Category of the memory" },
       ),
-      tags: Type.Array(Type.String(), { description: "Tags for searchability" }),
+      tags: Type.Array(Type.String(), {
+        description: "Tags for searchability",
+      }),
     }),
     renderCall(args: any, theme: any) {
       let text = theme.fg("toolTitle", theme.bold("remember "));
@@ -5103,14 +6490,36 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
     renderResult(result: any, { isPartial }: any, theme: any) {
-      if (isPartial) return new Text(theme.fg("warning", "Remembering..."), 0, 0);
+      if (isPartial)
+        return new Text(theme.fg("warning", "Remembering..."), 0, 0);
       const d = result.details as Record<string, unknown>;
-      return new Text(theme.fg("success", "Stored") + theme.fg("dim", ` (id: ${d.id})`), 0, 0);
+      return new Text(
+        theme.fg("success", "Stored") + theme.fg("dim", ` (id: ${d.id})`),
+        0,
+        0,
+      );
     },
-    async execute(_toolCallId, params: { content: string; category: HarnessMemory["category"]; tags: string[] }) {
-      const memory = await addMemory("parent", params.category, params.content, params.tags);
+    async execute(
+      _toolCallId,
+      params: {
+        content: string;
+        category: HarnessMemory["category"];
+        tags: string[];
+      },
+    ) {
+      const memory = await addMemory(
+        "parent",
+        params.category,
+        params.content,
+        params.tags,
+      );
       return {
-        content: [{ type: "text", text: `Remembered: "${params.content}" [${params.category}] (id: ${memory.id})` }],
+        content: [
+          {
+            type: "text",
+            text: `Remembered: "${params.content}" [${params.category}] (id: ${memory.id})`,
+          },
+        ],
         details: { id: memory.id },
       };
     },
@@ -5123,7 +6532,9 @@ export default function (pi: ExtensionAPI) {
       "Search the harness memory store for relevant learnings from prior runs.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
+      limit: Type.Optional(
+        Type.Number({ description: "Max results (default 10)" }),
+      ),
     }),
     renderCall(args: any, theme: any) {
       let text = theme.fg("toolTitle", theme.bold("recall "));
@@ -5136,12 +6547,19 @@ export default function (pi: ExtensionAPI) {
       const d = result.details as Record<string, unknown>;
       const count = (d.count as number) ?? 0;
       if (count === 0) return new Text(theme.fg("muted", "No matches"), 0, 0);
-      let text = theme.fg("success", `${count} memor${count === 1 ? "y" : "ies"}`);
+      let text = theme.fg(
+        "success",
+        `${count} memor${count === 1 ? "y" : "ies"}`,
+      );
       if (expanded) {
-        const memories = d.memories as Array<{ category: string; content: string }> | undefined;
+        const memories = d.memories as
+          | Array<{ category: string; content: string }>
+          | undefined;
         if (memories) {
           for (const m of memories.slice(0, 10)) {
-            text += "\n" + theme.fg("dim", `  [${m.category}] ${m.content.slice(0, 80)}`);
+            text +=
+              "\n" +
+              theme.fg("dim", `  [${m.category}] ${m.content.slice(0, 80)}`);
           }
         }
       }
@@ -5149,7 +6567,11 @@ export default function (pi: ExtensionAPI) {
     },
     async execute(_toolCallId, params: { query: string; limit?: number }) {
       const store = await readMemoryStore();
-      const results = searchMemories(store.memories, params.query, params.limit ?? 10);
+      const results = searchMemories(
+        store.memories,
+        params.query,
+        params.limit ?? 10,
+      );
       if (results.length === 0) {
         return {
           content: [{ type: "text", text: "No matching memories found." }],
@@ -5157,10 +6579,16 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const lines = results.map(
-        (m) => `- **[${m.category}]** (${m.source}, ${m.timestamp}): ${m.content} [${m.tags.join(", ")}]`,
+        (m) =>
+          `- **[${m.category}]** (${m.source}, ${m.timestamp}): ${m.content} [${m.tags.join(", ")}]`,
       );
       return {
-        content: [{ type: "text", text: `## Memories (${results.length})\n\n${lines.join("\n")}` }],
+        content: [
+          {
+            type: "text",
+            text: `## Memories (${results.length})\n\n${lines.join("\n")}`,
+          },
+        ],
         details: { count: results.length, memories: results },
       };
     },
@@ -5175,12 +6603,23 @@ export default function (pi: ExtensionAPI) {
       "Send a message directly to another worker, the manager, or parent. " +
       "Enables peer-to-peer coordination between workers.",
     parameters: Type.Object({
-      to: Type.String({ description: "Target worker name, 'manager', or 'parent'" }),
+      to: Type.String({
+        description: "Target worker name, 'manager', or 'parent'",
+      }),
       message: Type.String({ description: "Message content" }),
       type: Type.Optional(
         Type.Union(
-          [Type.Literal("directive"), Type.Literal("question"), Type.Literal("answer"), Type.Literal("status_report"), Type.Literal("ack")],
-          { description: "Message type (default: directive). Use 'question' for requests, 'answer' for responses." },
+          [
+            Type.Literal("directive"),
+            Type.Literal("question"),
+            Type.Literal("answer"),
+            Type.Literal("status_report"),
+            Type.Literal("ack"),
+          ],
+          {
+            description:
+              "Message type (default: directive). Use 'question' for requests, 'answer' for responses.",
+          },
         ),
       ),
     }),
@@ -5196,19 +6635,31 @@ export default function (pi: ExtensionAPI) {
       const d = result.details as Record<string, unknown>;
       return new Text(theme.fg("success", `Sent to ${d.to}`), 0, 0);
     },
-    async execute(_toolCallId, params: { to: string; message: string; type?: MailboxMessage["type"] }) {
+    async execute(
+      _toolCallId,
+      params: { to: string; message: string; type?: MailboxMessage["type"] },
+    ) {
       // Validate target exists
       const validTargets = new Set([...sessions.keys(), "manager", "parent"]);
       if (!validTargets.has(params.to)) {
         return {
-          content: [{ type: "text", text: `Unknown target "${params.to}". Available: ${Array.from(validTargets).join(", ")}` }],
+          content: [
+            {
+              type: "text",
+              text: `Unknown target "${params.to}". Available: ${Array.from(validTargets).join(", ")}`,
+            },
+          ],
           isError: true,
         };
       }
       const msgType = params.type ?? "directive";
-      const id = await sendMailboxMessage(cwd, params.to, "parent", msgType, { text: params.message });
+      const id = await sendMailboxMessage(cwd, params.to, "parent", msgType, {
+        text: params.message,
+      });
       return {
-        content: [{ type: "text", text: `Message sent to ${params.to} (id: ${id})` }],
+        content: [
+          { type: "text", text: `Message sent to ${params.to} (id: ${id})` },
+        ],
         details: { id, to: params.to },
       };
     },
@@ -5217,11 +6668,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "harness_read_messages",
     label: "Read Worker Messages",
-    description:
-      "Read messages from a worker's or parent's mailbox.",
+    description: "Read messages from a worker's or parent's mailbox.",
     parameters: Type.Object({
-      actor: Type.Optional(Type.String({ description: "Actor name (default: parent)" })),
-      limit: Type.Optional(Type.Number({ description: "Max messages to read (default: all)" })),
+      actor: Type.Optional(
+        Type.String({ description: "Actor name (default: parent)" }),
+      ),
+      limit: Type.Optional(
+        Type.Number({ description: "Max messages to read (default: all)" }),
+      ),
     }),
     renderCall(args: any, theme: any) {
       let text = theme.fg("toolTitle", theme.bold("messages "));
@@ -5243,7 +6697,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params: { actor?: string; limit?: number }) {
       const actor = params.actor ?? "parent";
       const messages = await readMailbox(cwd, actor);
-      const toReturn = params.limit ? messages.slice(0, params.limit) : messages;
+      const toReturn = params.limit
+        ? messages.slice(0, params.limit)
+        : messages;
       if (toReturn.length === 0) {
         return {
           content: [{ type: "text", text: `No messages in ${actor}'s inbox.` }],
@@ -5251,14 +6707,20 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const lines = toReturn.map(
-        ({ message }) => `- **[${message.type}]** from ${message.from}: ${JSON.stringify(message.payload)}`,
+        ({ message }) =>
+          `- **[${message.type}]** from ${message.from}: ${JSON.stringify(message.payload)}`,
       );
       // Delete read messages
       for (const { filename } of toReturn) {
         await deleteMessage(cwd, actor, filename);
       }
       return {
-        content: [{ type: "text", text: `## Messages (${toReturn.length})\n\n${lines.join("\n")}` }],
+        content: [
+          {
+            type: "text",
+            text: `## Messages (${toReturn.length})\n\n${lines.join("\n")}`,
+          },
+        ],
         details: { count: toReturn.length },
       };
     },
@@ -5275,9 +6737,19 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       rating: Type.Number({ description: "Quality rating 1-5" }),
       feedback: Type.String({ description: "What worked, what didn't" }),
-      adjustments: Type.Array(Type.String(), { description: "Suggested prompt improvements" }),
-      role: Type.Optional(Type.String({ description: "Your role (e.g. developer, architect, analyst)" })),
-      taskName: Type.Optional(Type.String({ description: "Your task/worker name (e.g. bmad-tech-spec)" })),
+      adjustments: Type.Array(Type.String(), {
+        description: "Suggested prompt improvements",
+      }),
+      role: Type.Optional(
+        Type.String({
+          description: "Your role (e.g. developer, architect, analyst)",
+        }),
+      ),
+      taskName: Type.Optional(
+        Type.String({
+          description: "Your task/worker name (e.g. bmad-tech-spec)",
+        }),
+      ),
     }),
     renderCall(args: any, theme: any) {
       const r = Math.max(1, Math.min(5, args.rating));
@@ -5292,9 +6764,22 @@ export default function (pi: ExtensionAPI) {
       const d = result.details as Record<string, unknown>;
       const rating = d.rating as number;
       const stars = "\u2605".repeat(rating) + "\u2606".repeat(5 - rating);
-      return new Text(theme.fg("success", stars) + theme.fg("dim", ` for ${d.role}`), 0, 0);
+      return new Text(
+        theme.fg("success", stars) + theme.fg("dim", ` for ${d.role}`),
+        0,
+        0,
+      );
     },
-    async execute(_toolCallId, params: { rating: number; feedback: string; adjustments: string[]; role?: string; taskName?: string }) {
+    async execute(
+      _toolCallId,
+      params: {
+        rating: number;
+        feedback: string;
+        adjustments: string[];
+        role?: string;
+        taskName?: string;
+      },
+    ) {
       const store = await readTemplateStore();
       store.ratings.push({
         role: params.role ?? "unknown",
@@ -5310,7 +6795,12 @@ export default function (pi: ExtensionAPI) {
       }
       await writeTemplateStore(store);
       return {
-        content: [{ type: "text", text: `Template rated ${params.rating}/5 for role "${params.role ?? "unknown"}". Thank you for the feedback.` }],
+        content: [
+          {
+            type: "text",
+            text: `Template rated ${params.rating}/5 for role "${params.role ?? "unknown"}". Thank you for the feedback.`,
+          },
+        ],
         details: { rating: params.rating, role: params.role ?? "unknown" },
       };
     },
@@ -5333,14 +6823,29 @@ export default function (pi: ExtensionAPI) {
     // the raw BMAD prompts are designed for interactive use but BMAD
     // workers run without a user present.
     rawPrompt = rawPrompt
-      .replace(/[Ii]nterview the user/g, "Based on existing project documents, fill in")
-      .replace(/[Aa]sk the user (?:about |for |to )?/g, "Infer from available documentation ")
+      .replace(
+        /[Ii]nterview the user/g,
+        "Based on existing project documents, fill in",
+      )
+      .replace(
+        /[Aa]sk the user (?:about |for |to )?/g,
+        "Infer from available documentation ",
+      )
       .replace(/[Aa]sk which /g, "Determine which ")
       .replace(/[Cc]onfirm with the user/g, "Verify against existing documents")
-      .replace(/[Dd]iscuss with the user/g, "Analyze based on available context")
-      .replace(/[Pp]resent for (?:user )?review\b.*$/gm, "Save the document for harness review")
+      .replace(
+        /[Dd]iscuss with the user/g,
+        "Analyze based on available context",
+      )
+      .replace(
+        /[Pp]resent for (?:user )?review\b.*$/gm,
+        "Save the document for harness review",
+      )
       .replace(/and present for review$/gm, "and save the document")
-      .replace(/[Gg]ather .*?from the user/g, "Infer from existing project documents")
+      .replace(
+        /[Gg]ather .*?from the user/g,
+        "Infer from existing project documents",
+      )
       .replace(
         /[Ss]uggest the next recommended workflow to the user/g,
         "Mark your goal as complete — the harness manager handles workflow sequencing",
@@ -5350,7 +6855,11 @@ export default function (pi: ExtensionAPI) {
     // conflicting with our autonomous "## When Complete" section below.
     rawPrompt = rawPrompt.replace(/### When Complete\n[\s\S]*$/, "").trimEnd();
 
-    const goalFilePath = resolve(cwd, PI_AGENT_DIR, `${BMAD_PREFIX}${spec.workflowName}.md`);
+    const goalFilePath = resolve(
+      cwd,
+      PI_AGENT_DIR,
+      `${BMAD_PREFIX}${spec.workflowName}.md`,
+    );
     const workerName = `${BMAD_PREFIX}${spec.workflowName}`;
     const inboxPath = resolve(cwd, MAILBOX_DIR, workerName);
     const role = getRole(spec.role);
@@ -5370,7 +6879,7 @@ export default function (pi: ExtensionAPI) {
       "---",
       "",
       // Role-based tool policy for BMAD workers
-      ...((() => {
+      ...(() => {
         const toolPolicy = getToolPolicy(spec.role);
         if (toolPolicy) {
           return [
@@ -5383,7 +6892,7 @@ export default function (pi: ExtensionAPI) {
           ];
         }
         return [];
-      })()),
+      })(),
       "## Harness Worker Instructions",
       `- When you complete a goal, edit your goal file at \`${goalFilePath}\` to change \`- [ ]\` to \`- [x]\``,
       "- After completing each goal, immediately update the goal file so the manager can track progress",
@@ -5425,7 +6934,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("harness:launch", {
     description:
-      "Read .pi-agent/*.md goals, create worktrees, spawn workers + manager. Supports --max-workers N --stagger <ms> --model-routes <path> --heartbeat <ms> --dashboard.",
+      "Read .pi-agent/*.md goals, create worktrees, spawn workers + manager. Supports --max-workers N --stagger <ms> --backend pi|claude --claude-model <id> --claude-budget <usd> --model-routes <path> --heartbeat <ms> --dashboard.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -5442,6 +6951,24 @@ export default function (pi: ExtensionAPI) {
           { triggerTurn: false },
         );
         return;
+      }
+
+      // Load .harness-config.json at launch time (CLI flags override below)
+      try {
+        const configPath = join(cwd, HARNESS_CONFIG_FILE);
+        const raw = JSON.parse(await readFile(configPath, "utf-8"));
+        const validated = validateRuntimeConfig(raw);
+        if (validated) {
+          if (validated.backend) effectiveBackend = validated.backend;
+          if (validated.claudeConfig)
+            effectiveClaudeConfig = validated.claudeConfig;
+          if (validated.maxWorkers !== undefined)
+            effectiveMaxWorkers = validated.maxWorkers;
+          if (validated.staggerMs !== undefined)
+            effectiveStaggerMs = validated.staggerMs;
+        }
+      } catch {
+        /* no config file — use defaults */
       }
 
       // Parse --max-workers, --stagger, --model-routes, --heartbeat, --dashboard flags
@@ -5461,6 +6988,29 @@ export default function (pi: ExtensionAPI) {
       effectiveMaxWorkers = maxWorkers;
       effectiveStaggerMs = staggerMs;
 
+      // Backend selection (CLI overrides config file)
+      const backendFlag = remaining.match(/--backend\s+(pi|claude)/);
+      if (backendFlag) {
+        effectiveBackend = backendFlag[1] as SessionBackend;
+      }
+      if (effectiveBackend === "claude") {
+        const claudeModelFlag = remaining.match(/--claude-model\s+(\S+)/);
+        const claudePermFlag = remaining.match(
+          /--claude-permission-mode\s+(\S+)/,
+        );
+        const claudeBudgetFlag = remaining.match(
+          /--claude-budget\s+(\d+(?:\.\d+)?)/,
+        );
+        effectiveClaudeConfig = {
+          ...effectiveClaudeConfig,
+          ...(claudeModelFlag && { model: claudeModelFlag[1] }),
+          ...(claudePermFlag && { permissionMode: claudePermFlag[1] }),
+          ...(claudeBudgetFlag && {
+            maxBudgetUsd: parseFloat(claudeBudgetFlag[1]),
+          }),
+        };
+      }
+
       // Feature 1: Model routes
       const modelRoutesFlag = remaining.match(/--model-routes\s+(\S+)/);
       if (modelRoutesFlag) {
@@ -5469,7 +7019,10 @@ export default function (pi: ExtensionAPI) {
           await mkdir(piAgentDir(), { recursive: true });
           await atomicWriteFile(join(cwd, MODEL_ROUTES_FILE), routesContent);
         } catch (e) {
-          ctx.ui.notify(`Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`, "warning");
+          ctx.ui.notify(
+            `Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`,
+            "warning",
+          );
         }
       }
 
@@ -5481,7 +7034,10 @@ export default function (pi: ExtensionAPI) {
           intervalMs: parseInt(heartbeatFlag[1], 10),
         };
         await mkdir(piAgentDir(), { recursive: true });
-        await atomicWriteFile(join(cwd, HEARTBEAT_CONFIG_FILE), JSON.stringify(hbConfig, null, 2) + "\n");
+        await atomicWriteFile(
+          join(cwd, HEARTBEAT_CONFIG_FILE),
+          JSON.stringify(hbConfig, null, 2) + "\n",
+        );
       }
 
       // Feature 10: Dashboard
@@ -5495,6 +7051,10 @@ export default function (pi: ExtensionAPI) {
         );
         return;
       }
+
+      // Reset account rotation state for fresh launch
+      accountSpawnIndex = 0;
+      accountAssignments.clear();
 
       // Clean up leftover stop signal from previous runs
       try {
@@ -5537,14 +7097,19 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
         // Warn about unknown dependencies
-        const unknownDeps = config.dependsOn.filter(dep => !configs.find(c => c.name === dep));
+        const unknownDeps = config.dependsOn.filter(
+          (dep) => !configs.find((c) => c.name === dep),
+        );
         if (unknownDeps.length > 0) {
-          ctx.ui.notify(`Warning: "${config.name}" has unknown dependencies: ${unknownDeps.join(", ")}`, "warning");
+          ctx.ui.notify(
+            `Warning: "${config.name}" has unknown dependencies: ${unknownDeps.join(", ")}`,
+            "warning",
+          );
         }
-        const unmetDeps = config.dependsOn.filter(dep => {
-          const depConfig = configs.find(c => c.name === dep);
+        const unmetDeps = config.dependsOn.filter((dep) => {
+          const depConfig = configs.find((c) => c.name === dep);
           if (!depConfig) return true; // Unknown dependency = unmet (safe default)
-          return !depConfig.goals.every(g => g.completed);
+          return !depConfig.goals.every((g) => g.completed);
         });
         if (unmetDeps.length === 0) {
           ready.push(config);
@@ -5568,7 +7133,9 @@ export default function (pi: ExtensionAPI) {
 
         // Stagger spawning to avoid resource burst
         if (i < toSpawn.length - 1 && effectiveStaggerMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, effectiveStaggerMs));
+          await new Promise((resolve) =>
+            setTimeout(resolve, effectiveStaggerMs),
+          );
         }
       }
 
@@ -5581,7 +7148,10 @@ export default function (pi: ExtensionAPI) {
             queue.items.push({
               id,
               topic: config.name,
-              description: `Overflow from --max-workers: ${config.goals.filter((g) => !g.completed).map((g) => g.text).join("; ")}`,
+              description: `Overflow from --max-workers: ${config.goals
+                .filter((g) => !g.completed)
+                .map((g) => g.text)
+                .join("; ")}`,
               goals: config.goals
                 .filter((g) => !g.completed)
                 .map((g) => g.text),
@@ -5701,19 +7271,27 @@ export default function (pi: ExtensionAPI) {
       for (const c of configs) {
         const session = sessions.get(c.name);
         if (session) {
-          const tmuxAlive = session.tmuxSession ? await tmuxHasSession(session.tmuxSession) : false;
-          activeWorkers.push(`${c.name} (tmux: ${tmuxAlive ? "alive" : "dead"})`);
+          const tmuxAlive = session.tmuxSession
+            ? await tmuxHasSession(session.tmuxSession)
+            : false;
+          activeWorkers.push(
+            `${c.name} (tmux: ${tmuxAlive ? "alive" : "dead"})`,
+          );
         } else {
           goalFilesOnly.push(c.name);
         }
       }
-      const managerTmuxAlive = managerTmuxSession ? await tmuxHasSession(managerTmuxSession) : false;
-      const workerInfo = activeWorkers.length > 0
-        ? `\nActive workers: ${activeWorkers.join(", ")}`
-        : "";
-      const goalOnlyInfo = goalFilesOnly.length > 0
-        ? `\nGoal files only (no worker): ${goalFilesOnly.join(", ")}`
-        : "";
+      const managerTmuxAlive = managerTmuxSession
+        ? await tmuxHasSession(managerTmuxSession)
+        : false;
+      const workerInfo =
+        activeWorkers.length > 0
+          ? `\nActive workers: ${activeWorkers.join(", ")}`
+          : "";
+      const goalOnlyInfo =
+        goalFilesOnly.length > 0
+          ? `\nGoal files only (no worker): ${goalFilesOnly.join(", ")}`
+          : "";
       const tmuxInfo = loopActive
         ? `\nManager tmux: ${managerTmuxAlive ? "alive" : "dead"} | Server: \`tmux -L ${TMUX_SERVER}\``
         : "";
@@ -5787,16 +7365,31 @@ export default function (pi: ExtensionAPI) {
 
       // Clean up BMAD prompt files if they exist
       try {
-        await rm(join(cwd, PI_AGENT_DIR, ".prompts"), { recursive: true, force: true });
+        await rm(join(cwd, PI_AGENT_DIR, ".prompts"), {
+          recursive: true,
+          force: true,
+        });
       } catch {
         // May not exist
       }
 
       // Clean up auto mode files
-      for (const f of [AUTO_MODE_FILE, SCOUT_ANALYSIS_FILE, SCOUT_REPORT_FILE]) {
-        try { await rm(join(cwd, f)); } catch { /* may not exist */ }
+      for (const f of [
+        AUTO_MODE_FILE,
+        SCOUT_ANALYSIS_FILE,
+        SCOUT_REPORT_FILE,
+      ]) {
+        try {
+          await rm(join(cwd, f));
+        } catch {
+          /* may not exist */
+        }
       }
-      try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+      try {
+        await rm(join(piAgentDir(), goalFileName("scout")));
+      } catch {
+        /* may not exist */
+      }
 
       loopActive = false;
       invalidateCache();
@@ -5806,8 +7399,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("harness:init", {
-    description:
-      "Scaffold .pi-agent/ directory with mailbox structure",
+    description: "Scaffold .pi-agent/ directory with mailbox structure",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -5888,7 +7480,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("harness:recover", {
-    description: "Respawn a stale or dead manager session. Use --force to reset recovery counters.",
+    description:
+      "Respawn a stale or dead manager session. Use --force to reset recovery counters.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -5922,7 +7515,9 @@ export default function (pi: ExtensionAPI) {
         const errorLogPath = join(managerDirPath(), ".pi-agent-errors.log");
         const prevPath = join(cwd, ".pi-agent-errors.log.prev");
         await copyFile(errorLogPath, prevPath);
-      } catch { /* no error log to preserve */ }
+      } catch {
+        /* no error log to preserve */
+      }
 
       // Clean up old manager directory
       try {
@@ -5943,7 +7538,10 @@ export default function (pi: ExtensionAPI) {
       await persistState();
 
       ctx.ui.setStatus("harness", "harness: active");
-      ctx.ui.notify(force ? "Manager respawned (counters reset)" : "Manager respawned", "info");
+      ctx.ui.notify(
+        force ? "Manager respawned (counters reset)" : "Manager respawned",
+        "info",
+      );
     },
   });
 
@@ -6121,13 +7719,22 @@ export default function (pi: ExtensionAPI) {
 
       // Remove orphaned worktrees not in in-memory sessions (crash recovery)
       try {
-        const wtList = await pi.exec("git", ["worktree", "list", "--porcelain"], { cwd });
+        const wtList = await pi.exec(
+          "git",
+          ["worktree", "list", "--porcelain"],
+          { cwd },
+        );
         const blocks = (wtList.stdout ?? "").split("\n\n").filter(Boolean);
         for (const block of blocks) {
           const pathMatch = block.match(/^worktree\s+(.+)$/m);
           if (!pathMatch) continue;
           const wtPath = pathMatch[1];
-          if (wtPath.includes(WORKTREE_DIR) && !Array.from(sessions.values()).some(s => s.worktreePath === wtPath)) {
+          if (
+            wtPath.includes(WORKTREE_DIR) &&
+            !Array.from(sessions.values()).some(
+              (s) => s.worktreePath === wtPath,
+            )
+          ) {
             try {
               const rmArgs = ["worktree", "remove", wtPath];
               if (force) rmArgs.push("--force");
@@ -6137,8 +7744,14 @@ export default function (pi: ExtensionAPI) {
               const wtName = wtPath.split("/").pop();
               if (wtName) {
                 try {
-                  await pi.exec("git", ["branch", force ? "-D" : "-d", `pi-agent/${wtName}`], { cwd });
-                } catch { /* branch may not exist or already deleted */ }
+                  await pi.exec(
+                    "git",
+                    ["branch", force ? "-D" : "-d", `pi-agent/${wtName}`],
+                    { cwd },
+                  );
+                } catch {
+                  /* branch may not exist or already deleted */
+                }
               }
             } catch {
               failed.push(`orphaned: ${wtPath}`);
@@ -6152,17 +7765,27 @@ export default function (pi: ExtensionAPI) {
       // Remove any remaining pi-agent/* branches (may remain from
       // manager-spawned workers or queued workflows that never had worktrees)
       try {
-        const branchResult = await pi.exec("git", ["branch", "--list", "pi-agent/*"], { cwd });
+        const branchResult = await pi.exec(
+          "git",
+          ["branch", "--list", "pi-agent/*"],
+          { cwd },
+        );
         const branches = (branchResult.stdout ?? "")
           .split("\n")
           .map((b: string) => b.trim())
           .filter(Boolean);
         for (const branch of branches) {
           try {
-            await pi.exec("git", ["branch", force ? "-D" : "-d", branch], { cwd });
-          } catch { /* branch may be checked out or already deleted */ }
+            await pi.exec("git", ["branch", force ? "-D" : "-d", branch], {
+              cwd,
+            });
+          } catch {
+            /* branch may be checked out or already deleted */
+          }
         }
-      } catch { /* git branch list may fail */ }
+      } catch {
+        /* git branch list may fail */
+      }
 
       // Remove manager directory
       try {
@@ -6200,7 +7823,10 @@ export default function (pi: ExtensionAPI) {
 
       // Remove BMAD pre-generated prompts, mode file, and manager directory
       try {
-        await rm(join(cwd, PI_AGENT_DIR, ".prompts"), { recursive: true, force: true });
+        await rm(join(cwd, PI_AGENT_DIR, ".prompts"), {
+          recursive: true,
+          force: true,
+        });
       } catch {
         // May not exist
       }
@@ -6216,10 +7842,22 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Remove auto mode files
-      for (const f of [AUTO_MODE_FILE, SCOUT_ANALYSIS_FILE, SCOUT_REPORT_FILE]) {
-        try { await rm(join(cwd, f)); } catch { /* may not exist */ }
+      for (const f of [
+        AUTO_MODE_FILE,
+        SCOUT_ANALYSIS_FILE,
+        SCOUT_REPORT_FILE,
+      ]) {
+        try {
+          await rm(join(cwd, f));
+        } catch {
+          /* may not exist */
+        }
       }
-      try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+      try {
+        await rm(join(piAgentDir(), goalFileName("scout")));
+      } catch {
+        /* may not exist */
+      }
 
       // Remove goal files, worker state sidecars, and manager instructions
       try {
@@ -6230,19 +7868,34 @@ export default function (pi: ExtensionAPI) {
             f.endsWith(".state.json") ||
             f === ".manager-instructions.md"
           ) {
-            try { await rm(join(piAgentDir(), f)); } catch { /* best effort */ }
+            try {
+              await rm(join(piAgentDir(), f));
+            } catch {
+              /* best effort */
+            }
           }
         }
-      } catch { /* .pi-agent may not exist */ }
+      } catch {
+        /* .pi-agent may not exist */
+      }
 
       // Remove .pi-agent/ directory if empty (or only contains empty worktrees/ dir)
       try {
-        try { await rm(join(piAgentDir(), "worktrees"), { recursive: true, force: true }); } catch { /* may not exist */ }
+        try {
+          await rm(join(piAgentDir(), "worktrees"), {
+            recursive: true,
+            force: true,
+          });
+        } catch {
+          /* may not exist */
+        }
         const remaining = await readdir(piAgentDir());
         if (remaining.length === 0) {
           await rm(piAgentDir(), { recursive: true, force: true });
         }
-      } catch { /* best effort */ }
+      } catch {
+        /* best effort */
+      }
 
       // Kill entire tmux server
       await tmuxKillServer();
@@ -6254,6 +7907,8 @@ export default function (pi: ExtensionAPI) {
       managerSpawnedAt = null;
       managerTmuxSession = null;
       managerRecoveryAttempts = 0;
+      accountSpawnIndex = 0;
+      accountAssignments.clear();
       invalidateCache();
       ctx.ui.setStatus("harness", undefined);
 
@@ -6266,9 +7921,7 @@ export default function (pi: ExtensionAPI) {
             removed.length > 0
               ? `Removed worktrees: ${removed.join(", ")}`
               : "No worktrees to remove.",
-            failed.length > 0
-              ? `Failed to remove: ${failed.join(", ")}`
-              : "",
+            failed.length > 0 ? `Failed to remove: ${failed.join(", ")}` : "",
             "State files and mailboxes cleared.",
           ]
             .filter((l) => l.length > 0)
@@ -6281,7 +7934,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("harness:attach", {
-    description: "Attach to a worker or manager tmux session: /harness:attach <name|manager>",
+    description:
+      "Attach to a worker or manager tmux session: /harness:attach <name|manager>",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       const target = (args ?? "").trim();
@@ -6289,33 +7943,45 @@ export default function (pi: ExtensionAPI) {
       if (!target) {
         // List available sessions
         const available = await tmuxListSessions();
-        pi.sendMessage({
-          customType: "harness-sessions",
-          content: available.length > 0
-            ? `Available sessions:\n${available.map(s => `- ${s}`).join("\n")}\n\nRun: \`tmux -L ${TMUX_SERVER} attach -t <name>\``
-            : "No active tmux sessions.",
-          display: true,
-        }, { triggerTurn: false });
+        pi.sendMessage(
+          {
+            customType: "harness-sessions",
+            content:
+              available.length > 0
+                ? `Available sessions:\n${available.map((s) => `- ${s}`).join("\n")}\n\nRun: \`tmux -L ${TMUX_SERVER} attach -t <name>\``
+                : "No active tmux sessions.",
+            display: true,
+          },
+          { triggerTurn: false },
+        );
         return;
       }
 
-      const sessionName = target === "manager" ? "harness-manager" : `worker-${target}`;
+      const sessionName =
+        target === "manager" ? "harness-manager" : `worker-${target}`;
       const alive = await tmuxHasSession(sessionName);
       if (!alive) {
-        ctx.ui.notify(`Session "${sessionName}" not found or not running`, "warning");
+        ctx.ui.notify(
+          `Session "${sessionName}" not found or not running`,
+          "warning",
+        );
         return;
       }
 
-      pi.sendMessage({
-        customType: "harness-attach",
-        content: `To attach: \`tmux -L ${TMUX_SERVER} attach -t ${sessionName}\``,
-        display: true,
-      }, { triggerTurn: false });
+      pi.sendMessage(
+        {
+          customType: "harness-attach",
+          content: `To attach: \`tmux -L ${TMUX_SERVER} attach -t ${sessionName}\``,
+          display: true,
+        },
+        { triggerTurn: false },
+      );
     },
   });
 
   pi.registerCommand("harness:logs", {
-    description: "Show recent output from a worker or manager: /harness:logs <name|manager> [lines]",
+    description:
+      "Show recent output from a worker or manager: /harness:logs <name|manager> [lines]",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       const parts = (args ?? "").trim().split(/\s+/);
@@ -6327,18 +7993,25 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const sessionName = target === "manager" ? "harness-manager" : `worker-${target}`;
+      const sessionName =
+        target === "manager" ? "harness-manager" : `worker-${target}`;
       const output = await tmuxCapture(sessionName, lines);
       if (!output) {
-        ctx.ui.notify(`No output from "${sessionName}" (session may be dead)`, "warning");
+        ctx.ui.notify(
+          `No output from "${sessionName}" (session may be dead)`,
+          "warning",
+        );
         return;
       }
 
-      pi.sendMessage({
-        customType: "harness-logs",
-        content: `## Logs: ${sessionName}\n\n\`\`\`\n${output}\n\`\`\``,
-        display: true,
-      }, { triggerTurn: false });
+      pi.sendMessage(
+        {
+          customType: "harness-logs",
+          content: `## Logs: ${sessionName}\n\n\`\`\`\n${output}\n\`\`\``,
+          display: true,
+        },
+        { triggerTurn: false },
+      );
     },
   });
 
@@ -6497,7 +8170,8 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage(
           {
             customType: "harness-trace",
-            content: "No trace log found. Trace logging begins automatically when the harness runs.",
+            content:
+              "No trace log found. Trace logging begins automatically when the harness runs.",
             display: true,
           },
           { triggerTurn: false },
@@ -6548,9 +8222,10 @@ export default function (pi: ExtensionAPI) {
       pi.sendMessage(
         {
           customType: "harness-trace",
-          content: lines.length > 0
-            ? `## Trace Log (${lines.length}/${entries.length} entries)\n\n\`\`\`\n${lines.join("\n")}\n\`\`\``
-            : "No matching trace entries.",
+          content:
+            lines.length > 0
+              ? `## Trace Log (${lines.length}/${entries.length} entries)\n\n\`\`\`\n${lines.join("\n")}\n\`\`\``
+              : "No matching trace entries.",
           display: true,
         },
         { triggerTurn: false },
@@ -6559,7 +8234,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("harness:dashboard", {
-    description: "Show comprehensive harness dashboard with all workers, queue, and health",
+    description:
+      "Show comprehensive harness dashboard with all workers, queue, and health",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -6575,18 +8251,31 @@ export default function (pi: ExtensionAPI) {
       lines.push("### Manager");
       lines.push("| Field | Value |");
       lines.push("|-------|-------|");
-      const mgrTmuxAlive = managerTmuxSession ? await tmuxHasSession(managerTmuxSession) : false;
-      lines.push(`| Status | ${managerStatus?.status ?? "unknown"} (tmux: ${mgrTmuxAlive ? "alive" : "dead"}) |`);
-      lines.push(`| Recovery | ${managerRecoveryAttempts}/${MAX_MANAGER_RECOVERY} attempts |`);
+      const mgrTmuxAlive = managerTmuxSession
+        ? await tmuxHasSession(managerTmuxSession)
+        : false;
+      lines.push(
+        `| Status | ${managerStatus?.status ?? "unknown"} (tmux: ${mgrTmuxAlive ? "alive" : "dead"}) |`,
+      );
+      lines.push(
+        `| Recovery | ${managerRecoveryAttempts}/${MAX_MANAGER_RECOVERY} attempts |`,
+      );
       lines.push(`| Stale count | ${managerStaleCount} |`);
 
       // Show error log
       let errorLines: string[] = [];
       try {
-        const errorLog = await readFile(join(cwd, MANAGER_DIR, ".pi-agent-errors.log"), "utf-8");
+        const errorLog = await readFile(
+          join(cwd, MANAGER_DIR, ".pi-agent-errors.log"),
+          "utf-8",
+        );
         errorLines = errorLog.trim().split("\n").filter(Boolean);
-      } catch { /* no errors */ }
-      lines.push(`| Errors | ${errorLines.length > 0 ? errorLines.length + " logged" : "none"} |`);
+      } catch {
+        /* no errors */
+      }
+      lines.push(
+        `| Errors | ${errorLines.length > 0 ? errorLines.length + " logged" : "none"} |`,
+      );
       lines.push("");
 
       // --- Workers Section ---
@@ -6628,27 +8317,33 @@ export default function (pi: ExtensionAPI) {
         }
 
         const mergeStr = sidecar?.mergeStatus ?? "—";
-        const done = config.goals.filter(g => g.completed).length;
+        const done = config.goals.filter((g) => g.completed).length;
         workerRows.push(
           `| ${config.name} | ${done}/${config.goals.length} | ${statusStr} | ${tmuxStr} | ${lastActivityStr} | ${mergeStr} |`,
         );
       }
 
-      lines.push(`### Workers (${activeCount} active, ${stalledCount} stalled, ${deadCount} dead)`);
+      lines.push(
+        `### Workers (${activeCount} active, ${stalledCount} stalled, ${deadCount} dead)`,
+      );
       lines.push("| Worker | Goals | Status | Tmux | Last Activity | Merge |");
       lines.push("|--------|-------|--------|------|---------------|-------|");
       lines.push(...workerRows);
       lines.push("");
 
       // --- Queue Section ---
-      const pending = queue.items.filter(i => i.status === "pending");
-      const dispatched = queue.items.filter(i => i.status === "dispatched");
-      lines.push(`### Queue (${pending.length} pending, ${dispatched.length} dispatched)`);
+      const pending = queue.items.filter((i) => i.status === "pending");
+      const dispatched = queue.items.filter((i) => i.status === "dispatched");
+      lines.push(
+        `### Queue (${pending.length} pending, ${dispatched.length} dispatched)`,
+      );
       if (queue.items.length > 0) {
         lines.push("| Item | Assigned | Status |");
         lines.push("|------|----------|--------|");
         for (const item of queue.items) {
-          lines.push(`| ${item.topic} | ${item.assignedTo ?? "—"} | ${item.status} |`);
+          lines.push(
+            `| ${item.topic} | ${item.assignedTo ?? "—"} | ${item.status} |`,
+          );
         }
       } else {
         lines.push("No queue items.");
@@ -6658,7 +8353,7 @@ export default function (pi: ExtensionAPI) {
       // --- Questions Section ---
       const allUnanswered: Array<{ worker: string; question: string }> = [];
       for (const config of configs) {
-        for (const q of config.questions?.filter(q => !q.answered) ?? []) {
+        for (const q of config.questions?.filter((q) => !q.answered) ?? []) {
           allUnanswered.push({ worker: config.name, question: q.text });
         }
       }
@@ -6687,7 +8382,9 @@ export default function (pi: ExtensionAPI) {
       if (parentInbox.length > 0) {
         lines.push(`### Parent Inbox (${parentInbox.length} message(s))`);
         for (const { message } of parentInbox) {
-          lines.push(`- **[${message.type}]** from ${message.from}: ${JSON.stringify(message.payload)}`);
+          lines.push(
+            `- **[${message.type}]** from ${message.from}: ${JSON.stringify(message.payload)}`,
+          );
         }
       }
 
@@ -6741,7 +8438,14 @@ export default function (pi: ExtensionAPI) {
             `- **${s.id}** [${s.enabled ? "enabled" : "disabled"}] ${s.cron} — ${s.objective ?? "auto"} (max ${s.maxWorkers} workers, ${s.maxIterations} iterations)`,
           );
         }
-        pi.sendMessage({ customType: "harness-schedule", content: lines.join("\n"), display: true }, { triggerTurn: false });
+        pi.sendMessage(
+          {
+            customType: "harness-schedule",
+            content: lines.join("\n"),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
         return;
       }
 
@@ -6757,7 +8461,8 @@ export default function (pi: ExtensionAPI) {
         const atMatch = (args ?? "").match(/--at\s+(\S+)/);
         if (atMatch) schedule.cron = atMatch[1];
         const focusMatch = (args ?? "").match(/--focus\s+([\w,]+)/);
-        if (focusMatch) schedule.focus = focusMatch[1].split(",") as ScoutCategory[];
+        if (focusMatch)
+          schedule.focus = focusMatch[1].split(",") as ScoutCategory[];
         const maxMatch = (args ?? "").match(/--max-workers\s+(\d+)/);
         if (maxMatch) schedule.maxWorkers = parseInt(maxMatch[1], 10);
         const iterMatch = (args ?? "").match(/--max-iterations\s+(\d+)/);
@@ -6776,16 +8481,25 @@ export default function (pi: ExtensionAPI) {
         const schedules = await readSchedule();
         schedules.push(schedule);
         await writeSchedule(schedules);
-        ctx.ui.notify(`Schedule added: ${schedule.id} (${schedule.cron})`, "info");
+        ctx.ui.notify(
+          `Schedule added: ${schedule.id} (${schedule.cron})`,
+          "info",
+        );
         return;
       }
 
       if (subCmd === "remove") {
         const id = parts[1];
-        if (!id) { ctx.ui.notify("Usage: /harness:schedule remove <id>", "warning"); return; }
+        if (!id) {
+          ctx.ui.notify("Usage: /harness:schedule remove <id>", "warning");
+          return;
+        }
         const schedules = await readSchedule();
         const idx = schedules.findIndex((s) => s.id === id);
-        if (idx === -1) { ctx.ui.notify(`Schedule "${id}" not found.`, "warning"); return; }
+        if (idx === -1) {
+          ctx.ui.notify(`Schedule "${id}" not found.`, "warning");
+          return;
+        }
         schedules.splice(idx, 1);
         await writeSchedule(schedules);
         ctx.ui.notify(`Schedule "${id}" removed.`, "info");
@@ -6794,17 +8508,26 @@ export default function (pi: ExtensionAPI) {
 
       if (subCmd === "enable" || subCmd === "disable") {
         const id = parts[1];
-        if (!id) { ctx.ui.notify(`Usage: /harness:schedule ${subCmd} <id>`, "warning"); return; }
+        if (!id) {
+          ctx.ui.notify(`Usage: /harness:schedule ${subCmd} <id>`, "warning");
+          return;
+        }
         const schedules = await readSchedule();
         const schedule = schedules.find((s) => s.id === id);
-        if (!schedule) { ctx.ui.notify(`Schedule "${id}" not found.`, "warning"); return; }
+        if (!schedule) {
+          ctx.ui.notify(`Schedule "${id}" not found.`, "warning");
+          return;
+        }
         schedule.enabled = subCmd === "enable";
         await writeSchedule(schedules);
         ctx.ui.notify(`Schedule "${id}" ${subCmd}d.`, "info");
         return;
       }
 
-      ctx.ui.notify("Usage: /harness:schedule <add|list|remove|enable|disable>", "warning");
+      ctx.ui.notify(
+        "Usage: /harness:schedule <add|list|remove|enable|disable>",
+        "warning",
+      );
     },
   });
 
@@ -6822,7 +8545,10 @@ export default function (pi: ExtensionAPI) {
       const trimmed = (args ?? "").trim();
       const focusMatch = trimmed.match(/--focus\s+(\S+)/);
       if (focusMatch) {
-        focusAreas = focusMatch[1].split(",").map((a) => a.trim()).filter(Boolean);
+        focusAreas = focusMatch[1]
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean);
       }
 
       ctx.ui.notify("Scanning repository...", "info");
@@ -6841,15 +8567,30 @@ export default function (pi: ExtensionAPI) {
       ];
 
       if (snapshot.existingTasks.length > 0) {
-        snapshotLines.push(`**Existing tasks:** ${snapshot.existingTasks.join(", ")}`, "");
+        snapshotLines.push(
+          `**Existing tasks:** ${snapshot.existingTasks.join(", ")}`,
+          "",
+        );
       }
 
       if (snapshot.recentCommits.length > 0) {
-        snapshotLines.push("### Recent Commits", "", ...snapshot.recentCommits.map((c) => `- ${c}`), "");
+        snapshotLines.push(
+          "### Recent Commits",
+          "",
+          ...snapshot.recentCommits.map((c) => `- ${c}`),
+          "",
+        );
       }
 
       if (snapshot.fileTree) {
-        snapshotLines.push("### File Tree (top 2 levels)", "", "```", snapshot.fileTree, "```", "");
+        snapshotLines.push(
+          "### File Tree (top 2 levels)",
+          "",
+          "```",
+          snapshot.fileTree,
+          "```",
+          "",
+        );
       }
 
       if (focusAreas) {
@@ -6877,7 +8618,11 @@ export default function (pi: ExtensionAPI) {
       ];
 
       pi.sendMessage(
-        { customType: "harness-discover", content: instructions.join("\n"), display: true },
+        {
+          customType: "harness-discover",
+          content: instructions.join("\n"),
+          display: true,
+        },
         { triggerTurn: true },
       );
     },
@@ -6886,7 +8631,8 @@ export default function (pi: ExtensionAPI) {
   // --- Live Config Reload Command ---
 
   pi.registerCommand("harness:config", {
-    description: "Show current harness runtime configuration and live-reloadable settings.",
+    description:
+      "Show current harness runtime configuration and live-reloadable settings.",
     handler: async (_args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -6899,19 +8645,34 @@ export default function (pi: ExtensionAPI) {
 
       let configOnDisk: HarnessRuntimeConfig | null = null;
       try {
-        const raw = JSON.parse(await readFile(join(cwd, HARNESS_CONFIG_FILE), "utf-8"));
+        const raw = JSON.parse(
+          await readFile(join(cwd, HARNESS_CONFIG_FILE), "utf-8"),
+        );
         configOnDisk = validateRuntimeConfig(raw);
-      } catch { /* no file */ }
+      } catch {
+        /* no file */
+      }
 
-      const maxWSource = configOnDisk?.maxWorkers !== undefined ? ".harness-config.json" : "CLI / default";
-      const staggerSource = configOnDisk?.staggerMs !== undefined ? ".harness-config.json" : "CLI / default";
-      lines.push(`| maxWorkers | ${effectiveMaxWorkers === Infinity ? "∞ (no limit)" : effectiveMaxWorkers} | ${maxWSource} |`);
+      const maxWSource =
+        configOnDisk?.maxWorkers !== undefined
+          ? ".harness-config.json"
+          : "CLI / default";
+      const staggerSource =
+        configOnDisk?.staggerMs !== undefined
+          ? ".harness-config.json"
+          : "CLI / default";
+      lines.push(
+        `| maxWorkers | ${effectiveMaxWorkers === Infinity ? "∞ (no limit)" : effectiveMaxWorkers} | ${maxWSource} |`,
+      );
       lines.push(`| staggerMs | ${effectiveStaggerMs} | ${staggerSource} |`);
       lines.push("");
 
       // Model routes summary
       try {
-        const routesContent = await readFile(join(cwd, MODEL_ROUTES_FILE), "utf-8");
+        const routesContent = await readFile(
+          join(cwd, MODEL_ROUTES_FILE),
+          "utf-8",
+        );
         const routes = JSON.parse(routesContent) as ModelRoute[];
         lines.push(`**Model routes**: ${routes.length} route(s) configured`);
       } catch {
@@ -6919,10 +8680,16 @@ export default function (pi: ExtensionAPI) {
       }
 
       lines.push("");
-      lines.push('Edit `.pi-agent/.harness-config.json` to change — auto-detected on next cycle.');
+      lines.push(
+        "Edit `.pi-agent/.harness-config.json` to change — auto-detected on next cycle.",
+      );
 
       pi.sendMessage(
-        { customType: "harness-config", content: lines.join("\n"), display: true },
+        {
+          customType: "harness-config",
+          content: lines.join("\n"),
+          display: true,
+        },
         { triggerTurn: false },
       );
     },
@@ -6931,7 +8698,8 @@ export default function (pi: ExtensionAPI) {
   // --- Feature 8: Sandbox Command ---
 
   pi.registerCommand("harness:sandbox", {
-    description: "Configure sandboxed worker execution. Sub-commands: on, off, config.",
+    description:
+      "Configure sandboxed worker execution. Sub-commands: on, off, config.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -6946,13 +8714,23 @@ export default function (pi: ExtensionAPI) {
           memoryLimit: "2g",
         };
         await mkdir(piAgentDir(), { recursive: true });
-        await atomicWriteFile(join(cwd, SANDBOX_CONFIG_FILE), JSON.stringify(config, null, 2) + "\n");
-        ctx.ui.notify("Sandbox enabled. Workers will run inside Docker containers.", "info");
+        await atomicWriteFile(
+          join(cwd, SANDBOX_CONFIG_FILE),
+          JSON.stringify(config, null, 2) + "\n",
+        );
+        ctx.ui.notify(
+          "Sandbox enabled. Workers will run inside Docker containers.",
+          "info",
+        );
         return;
       }
 
       if (subCmd === "off") {
-        try { await rm(join(cwd, SANDBOX_CONFIG_FILE)); } catch { /* may not exist */ }
+        try {
+          await rm(join(cwd, SANDBOX_CONFIG_FILE));
+        } catch {
+          /* may not exist */
+        }
         ctx.ui.notify("Sandbox disabled.", "info");
         return;
       }
@@ -6961,11 +8739,18 @@ export default function (pi: ExtensionAPI) {
       try {
         const content = await readFile(join(cwd, SANDBOX_CONFIG_FILE), "utf-8");
         pi.sendMessage(
-          { customType: "harness-sandbox", content: `## Sandbox Config\n\n\`\`\`json\n${content}\`\`\``, display: true },
+          {
+            customType: "harness-sandbox",
+            content: `## Sandbox Config\n\n\`\`\`json\n${content}\`\`\``,
+            display: true,
+          },
           { triggerTurn: false },
         );
       } catch {
-        ctx.ui.notify("No sandbox config. Use `/harness:sandbox on` to enable.", "info");
+        ctx.ui.notify(
+          "No sandbox config. Use `/harness:sandbox on` to enable.",
+          "info",
+        );
       }
     },
   });
@@ -6974,7 +8759,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("harness:bmad", {
     description:
-      "Run full BMAD methodology via harness workers. Supports --max-workers N, --stagger MS, --init, --level N, --model-routes, --heartbeat, --dashboard.",
+      "Run full BMAD methodology via harness workers. Supports --max-workers N, --stagger MS, --backend pi|claude, --claude-model, --claude-budget, --init, --level N, --model-routes, --heartbeat, --dashboard.",
     handler: async (args, ctx) => {
       cwd = ctx.cwd;
       lastCtx = ctx;
@@ -6985,6 +8770,24 @@ export default function (pi: ExtensionAPI) {
           "warning",
         );
         return;
+      }
+
+      // Load .harness-config.json at launch time (CLI flags override below)
+      try {
+        const configPath = join(cwd, HARNESS_CONFIG_FILE);
+        const raw = JSON.parse(await readFile(configPath, "utf-8"));
+        const validated = validateRuntimeConfig(raw);
+        if (validated) {
+          if (validated.backend) effectiveBackend = validated.backend;
+          if (validated.claudeConfig)
+            effectiveClaudeConfig = validated.claudeConfig;
+          if (validated.maxWorkers !== undefined)
+            effectiveMaxWorkers = validated.maxWorkers;
+          if (validated.staggerMs !== undefined)
+            effectiveStaggerMs = validated.staggerMs;
+        }
+      } catch {
+        /* no config file — use defaults */
       }
 
       // Parse flags
@@ -7006,6 +8809,29 @@ export default function (pi: ExtensionAPI) {
       effectiveMaxWorkers = maxWorkers;
       effectiveStaggerMs = staggerMs;
 
+      // Backend selection
+      const backendFlag = remaining.match(/--backend\s+(pi|claude)/);
+      if (backendFlag) {
+        effectiveBackend = backendFlag[1] as SessionBackend;
+      }
+      if (effectiveBackend === "claude") {
+        const claudeModelFlag = remaining.match(/--claude-model\s+(\S+)/);
+        const claudePermFlag = remaining.match(
+          /--claude-permission-mode\s+(\S+)/,
+        );
+        const claudeBudgetFlag = remaining.match(
+          /--claude-budget\s+(\d+(?:\.\d+)?)/,
+        );
+        effectiveClaudeConfig = {
+          ...effectiveClaudeConfig,
+          ...(claudeModelFlag && { model: claudeModelFlag[1] }),
+          ...(claudePermFlag && { permissionMode: claudePermFlag[1] }),
+          ...(claudeBudgetFlag && {
+            maxBudgetUsd: parseFloat(claudeBudgetFlag[1]),
+          }),
+        };
+      }
+
       const hasInitFlag = /--init\b/.test(remaining);
 
       // Parse --level flag (default: 2)
@@ -7023,7 +8849,10 @@ export default function (pi: ExtensionAPI) {
           await mkdir(piAgentDir(), { recursive: true });
           await atomicWriteFile(join(cwd, MODEL_ROUTES_FILE), routesContent);
         } catch (e) {
-          ctx.ui.notify(`Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`, "warning");
+          ctx.ui.notify(
+            `Failed to load model routes: ${e instanceof Error ? e.message : String(e)}`,
+            "warning",
+          );
         }
       }
 
@@ -7035,7 +8864,10 @@ export default function (pi: ExtensionAPI) {
           intervalMs: parseInt(heartbeatFlag[1], 10),
         };
         await mkdir(piAgentDir(), { recursive: true });
-        await atomicWriteFile(join(cwd, HEARTBEAT_CONFIG_FILE), JSON.stringify(hbConfig, null, 2) + "\n");
+        await atomicWriteFile(
+          join(cwd, HEARTBEAT_CONFIG_FILE),
+          JSON.stringify(hbConfig, null, 2) + "\n",
+        );
       }
 
       // Feature 10: Dashboard (shared with /harness:launch)
@@ -7054,29 +8886,48 @@ export default function (pi: ExtensionAPI) {
           let projectName = "";
           let projectType = "web-app";
           try {
-            const pkg = JSON.parse(await readFile(join(cwd, "package.json"), "utf-8"));
+            const pkg = JSON.parse(
+              await readFile(join(cwd, "package.json"), "utf-8"),
+            );
             projectName = pkg.name || "";
-          } catch { /* no package.json */ }
+          } catch {
+            /* no package.json */
+          }
           if (!projectName) {
             try {
-              const pyproject = await readFile(join(cwd, "pyproject.toml"), "utf-8");
+              const pyproject = await readFile(
+                join(cwd, "pyproject.toml"),
+                "utf-8",
+              );
               const nameMatch = pyproject.match(/^name\s*=\s*"([^"]+)"/m);
               if (nameMatch) projectName = nameMatch[1];
-            } catch { /* no pyproject.toml */ }
+            } catch {
+              /* no pyproject.toml */
+            }
           }
           if (!projectName) {
             projectName = cwd.split("/").pop() || "project";
           }
 
           // Auto-detect project type from files
-          try { await stat(join(cwd, "package.json")); projectType = "web-app"; }
-          catch {
-            try { await stat(join(cwd, "pyproject.toml")); projectType = "api"; }
-            catch {
-              try { await stat(join(cwd, "go.mod")); projectType = "api"; }
-              catch {
-                try { await stat(join(cwd, "Cargo.toml")); projectType = "library"; }
-                catch { projectType = "web-app"; }
+          try {
+            await stat(join(cwd, "package.json"));
+            projectType = "web-app";
+          } catch {
+            try {
+              await stat(join(cwd, "pyproject.toml"));
+              projectType = "api";
+            } catch {
+              try {
+                await stat(join(cwd, "go.mod"));
+                projectType = "api";
+              } catch {
+                try {
+                  await stat(join(cwd, "Cargo.toml"));
+                  projectType = "library";
+                } catch {
+                  projectType = "web-app";
+                }
               }
             }
           }
@@ -7097,7 +8948,10 @@ export default function (pi: ExtensionAPI) {
             project_type: projectType,
             project_level: String(initLevel),
           });
-          await writeFile(join(cwd, "docs", "bmm-workflow-status.yaml"), statusContent);
+          await writeFile(
+            join(cwd, "docs", "bmm-workflow-status.yaml"),
+            statusContent,
+          );
 
           ctx.ui.notify(
             `BMAD initialized: ${projectName} (${projectType}, level ${initLevel})`,
@@ -7149,10 +9003,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Reset account rotation state for fresh launch
+      accountSpawnIndex = 0;
+      accountAssignments.clear();
+
       // Clean up leftover stop signal
       try {
         await rm(join(cwd, STOP_SIGNAL_FILE));
-      } catch { /* no signal to clean */ }
+      } catch {
+        /* no signal to clean */
+      }
 
       // Generate goal files and prompt files for each workflow
       const promptsDir = join(piAgentDir(), ".prompts");
@@ -7182,7 +9042,11 @@ export default function (pi: ExtensionAPI) {
         );
 
         // Pre-generate prompt file
-        const promptContent = buildBmadWorkerPrompt(spec, bmadConfig, bmadStatus);
+        const promptContent = buildBmadWorkerPrompt(
+          spec,
+          bmadConfig,
+          bmadStatus,
+        );
         await atomicWriteFile(
           join(promptsDir, `${workerName}.md`),
           promptContent,
@@ -7242,14 +9106,46 @@ export default function (pi: ExtensionAPI) {
 
         // Spawn tmux session
         const tmuxName = `worker-${sanitizeTmuxName(config.name)}`;
-        const cmd = `pi -p "$(cat .pi-agent-prompt.md)"`;
+        let mcpConfigFile: string | null = null;
+        if (effectiveBackend === "claude") {
+          mcpConfigFile = await buildMcpConfigForWorker(
+            session.worktreePath,
+            effectiveClaudeConfig?.mcpServers,
+            effectiveClaudeConfig?.mcpConfigPath,
+          );
+          if (mcpConfigFile && !effectiveClaudeConfig?.mcpConfigPath) {
+            await addToWorktreeExclude(
+              session.worktreePath,
+              ".claude-mcp-config.json",
+            );
+          }
+        }
+        const cmd = buildWorkerCommand(
+          effectiveBackend,
+          "",
+          effectiveClaudeConfig,
+          undefined,
+          mcpConfigFile,
+        );
+
+        // Account rotation: switch before spawn
+        const bmadAcctAssignment = await switchAccountBeforeSpawn(config.name);
+
         await tmuxNewSession(tmuxName, cmd, session.worktreePath);
 
         session.tmuxSession = tmuxName;
         session.spawned = true;
         session.spawnedAt = new Date();
 
-        hlog("worker.spawn", { name: config.name, role: config.role, goals: config.goals.filter((g) => !g.completed).length });
+        hlog("worker.spawn", {
+          name: config.name,
+          role: config.role,
+          goals: config.goals.filter((g) => !g.completed).length,
+          backend: effectiveBackend,
+          ...(bmadAcctAssignment && {
+            accountNumber: bmadAcctAssignment.accountNumber,
+          }),
+        });
 
         await writeWorkerState(config.name, {
           name: config.name,
@@ -7261,13 +9157,21 @@ export default function (pi: ExtensionAPI) {
           mergeStatus: "pending",
           dependsOn: config.dependsOn ?? [],
           dependenciesMet: true,
+          ...(bmadAcctAssignment && {
+            accountNumber: bmadAcctAssignment.accountNumber,
+            accountEmail: bmadAcctAssignment.email,
+          }),
         });
 
         // Update .bmad-mode.json workflow status
-        const modeData = bmadModeData.workflows.find((w) => w.name === config.name);
+        const modeData = bmadModeData.workflows.find(
+          (w) => w.name === config.name,
+        );
         if (modeData) modeData.status = "active";
 
-        launched.push(`${config.name} (Phase ${dag.find((s) => `${BMAD_PREFIX}${s.workflowName}` === config.name)?.phase})`);
+        launched.push(
+          `${config.name} (Phase ${dag.find((s) => `${BMAD_PREFIX}${s.workflowName}` === config.name)?.phase})`,
+        );
 
         if (i < toSpawn.length - 1 && effectiveStaggerMs > 0) {
           await new Promise((r) => setTimeout(r, effectiveStaggerMs));
@@ -7423,21 +9327,45 @@ export default function (pi: ExtensionAPI) {
         if (scoutSession) {
           try {
             await removeWorktree(scoutSession, true);
-          } catch { /* may not exist */ }
+          } catch {
+            /* may not exist */
+          }
           sessions.delete("scout");
         }
         // Clean up auto mode files
-        try { await rm(join(cwd, AUTO_MODE_FILE)); } catch { /* may not exist */ }
-        try { await rm(join(cwd, SCOUT_ANALYSIS_FILE)); } catch { /* may not exist */ }
-        try { await rm(join(cwd, SCOUT_REPORT_FILE)); } catch { /* may not exist */ }
-        try { await rm(join(piAgentDir(), goalFileName("scout"))); } catch { /* may not exist */ }
+        try {
+          await rm(join(cwd, AUTO_MODE_FILE));
+        } catch {
+          /* may not exist */
+        }
+        try {
+          await rm(join(cwd, SCOUT_ANALYSIS_FILE));
+        } catch {
+          /* may not exist */
+        }
+        try {
+          await rm(join(cwd, SCOUT_REPORT_FILE));
+        } catch {
+          /* may not exist */
+        }
+        try {
+          await rm(join(piAgentDir(), goalFileName("scout")));
+        } catch {
+          /* may not exist */
+        }
 
         // If in executing phase, also stop the harness
         if (autoState.phase === "executing") {
           // Write stop signal for manager
           try {
-            await writeFile(join(cwd, STOP_SIGNAL_FILE), new Date().toISOString() + "\n", "utf-8");
-          } catch { /* best effort */ }
+            await writeFile(
+              join(cwd, STOP_SIGNAL_FILE),
+              new Date().toISOString() + "\n",
+              "utf-8",
+            );
+          } catch {
+            /* best effort */
+          }
           for (const [, session] of sessions) {
             if (session.tmuxSession) {
               await tmuxKillSession(session.tmuxSession);
@@ -7491,7 +9419,9 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("No auto mode analysis to modify", "info");
           return;
         }
-        const idx = autoState.scoutAnalysis.findings.findIndex((f) => f.id === findingId);
+        const idx = autoState.scoutAnalysis.findings.findIndex(
+          (f) => f.id === findingId,
+        );
         if (idx === -1) {
           ctx.ui.notify(
             `Finding "${findingId}" not found. Available: ${autoState.scoutAnalysis.findings.map((f) => f.id).join(", ")}`,
@@ -7515,8 +9445,29 @@ export default function (pi: ExtensionAPI) {
       // --- Main /harness:auto command ---
 
       if (loopActive) {
-        ctx.ui.notify("Harness is already active. Stop it first with /harness:stop.", "warning");
+        ctx.ui.notify(
+          "Harness is already active. Stop it first with /harness:stop.",
+          "warning",
+        );
         return;
+      }
+
+      // Load .harness-config.json at launch time (CLI flags override below)
+      try {
+        const configPath = join(cwd, HARNESS_CONFIG_FILE);
+        const raw = JSON.parse(await readFile(configPath, "utf-8"));
+        const validated = validateRuntimeConfig(raw);
+        if (validated) {
+          if (validated.backend) effectiveBackend = validated.backend;
+          if (validated.claudeConfig)
+            effectiveClaudeConfig = validated.claudeConfig;
+          if (validated.maxWorkers !== undefined)
+            effectiveMaxWorkers = validated.maxWorkers;
+          if (validated.staggerMs !== undefined)
+            effectiveStaggerMs = validated.staggerMs;
+        }
+      } catch {
+        /* no config file — use defaults */
       }
 
       // Parse flags
@@ -7539,6 +9490,29 @@ export default function (pi: ExtensionAPI) {
       effectiveMaxWorkers = maxWorkers;
       effectiveStaggerMs = staggerMs;
 
+      // Backend selection
+      const backendFlag = remaining.match(/--backend\s+(pi|claude)/);
+      if (backendFlag) {
+        effectiveBackend = backendFlag[1] as SessionBackend;
+      }
+      if (effectiveBackend === "claude") {
+        const claudeModelFlag = remaining.match(/--claude-model\s+(\S+)/);
+        const claudePermFlag = remaining.match(
+          /--claude-permission-mode\s+(\S+)/,
+        );
+        const claudeBudgetFlag = remaining.match(
+          /--claude-budget\s+(\d+(?:\.\d+)?)/,
+        );
+        effectiveClaudeConfig = {
+          ...effectiveClaudeConfig,
+          ...(claudeModelFlag && { model: claudeModelFlag[1] }),
+          ...(claudePermFlag && { permissionMode: claudePermFlag[1] }),
+          ...(claudeBudgetFlag && {
+            maxBudgetUsd: parseFloat(claudeBudgetFlag[1]),
+          }),
+        };
+      }
+
       if (remaining.includes("--yes")) autoApprove = true;
 
       const focusMatch = remaining.match(/--focus\s+([\w,]+)/);
@@ -7547,13 +9521,14 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Extract objective: everything that's not a flag
-      const objective = remaining
-        .replace(/--max-workers\s+\d+/g, "")
-        .replace(/--max-iterations\s+\d+/g, "")
-        .replace(/--stagger\s+\d+/g, "")
-        .replace(/--yes/g, "")
-        .replace(/--focus\s+[\w,]+/g, "")
-        .trim() || undefined;
+      const objective =
+        remaining
+          .replace(/--max-workers\s+\d+/g, "")
+          .replace(/--max-iterations\s+\d+/g, "")
+          .replace(/--stagger\s+\d+/g, "")
+          .replace(/--yes/g, "")
+          .replace(/--focus\s+[\w,]+/g, "")
+          .trim() || undefined;
 
       const autoConfig: AutoModeConfig = {
         objective,
@@ -7573,15 +9548,27 @@ export default function (pi: ExtensionAPI) {
         planApproved: false,
       };
 
+      // Reset account rotation state for fresh launch
+      accountSpawnIndex = 0;
+      accountAssignments.clear();
+
       // Clean up leftover stop signal
-      try { await rm(join(cwd, STOP_SIGNAL_FILE)); } catch { /* no signal */ }
+      try {
+        await rm(join(cwd, STOP_SIGNAL_FILE));
+      } catch {
+        /* no signal */
+      }
 
       await mkdir(piAgentDir(), { recursive: true });
       await mkdir(mailboxPath(cwd, "parent"), { recursive: true });
       await mkdir(mailboxPath(cwd, "manager"), { recursive: true });
       await writeAutoModeState(autoState);
 
-      hlog("auto.scout.start", { objective: autoConfig.objective, focus: autoConfig.focus }, "info");
+      hlog(
+        "auto.scout.start",
+        { objective: autoConfig.objective, focus: autoConfig.focus },
+        "info",
+      );
       await spawnScout(autoConfig);
       loopActive = true;
       await persistState();
@@ -7593,12 +9580,16 @@ export default function (pi: ExtensionAPI) {
           content: [
             "## Auto Mode: Scout Deployed",
             "",
-            objective ? `**Objective:** ${objective}` : "**Objective:** General codebase evaluation",
+            objective
+              ? `**Objective:** ${objective}`
+              : "**Objective:** General codebase evaluation",
             focus ? `**Focus:** ${focus.join(", ")}` : "",
             `**Max workers:** ${maxWorkers} | **Max iterations:** ${maxIterations}`,
             "",
             "Scout worker is evaluating the codebase. Workers will be launched automatically when scouting completes.",
-          ].filter(Boolean).join("\n"),
+          ]
+            .filter(Boolean)
+            .join("\n"),
           display: true,
         },
         { triggerTurn: false },

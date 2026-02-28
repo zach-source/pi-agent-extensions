@@ -731,6 +731,117 @@ All harness tools have compact terminal rendering via `renderCall`/`renderResult
 | `harness_read_messages` | `5 message(s)` | Full message content |
 | `harness_rate_template` | `★★★★☆ for developer` | — |
 
+## Backend Selection
+
+Workers can run using either Pi or Claude Code as the CLI backend:
+
+| Flag | Config Key | Values | Default |
+|------|-----------|--------|---------|
+| `--backend <pi\|claude>` | `backend` | `"pi"`, `"claude"` | `"pi"` |
+| `--claude-model <id>` | `claudeConfig.model` | any model ID | (none) |
+| `--claude-permission-mode <mode>` | `claudeConfig.permissionMode` | `"plan"`, `"default"`, etc. | (none) |
+| `--claude-budget <usd>` | `claudeConfig.maxBudgetUsd` | number | (none) |
+
+### MCP Server Filtering
+
+When using the Claude backend, only auth-free MCP servers are included by default (`context7`, `graphiti`).
+This is enforced via `--mcp-config <file>` flags on every `claude -p` invocation.
+
+The harness reads `~/.claude/mcp_servers.json`, filters to only the allowed server names, and writes a
+per-worktree `.claude-mcp-config.json` file (git-excluded) that Claude Code loads.
+
+To customize which servers are included:
+
+```json
+{
+  "backend": "claude",
+  "claudeConfig": {
+    "mcpServers": ["context7", "graphiti", "sequential-thinking"]
+  }
+}
+```
+
+Or provide a custom MCP config file:
+```json
+{
+  "backend": "claude",
+  "claudeConfig": {
+    "mcpConfigPath": "/path/to/my-mcp-config.json"
+  }
+}
+```
+
+### Example
+
+```
+/harness:launch --backend claude --claude-model claude-sonnet-4-5-20250514 --claude-budget 5
+```
+
+Or via `.pi-agent/.harness-config.json`:
+```json
+{
+  "backend": "claude",
+  "claudeConfig": {
+    "model": "claude-sonnet-4-5-20250514",
+    "permissionMode": "bypassPermissions",
+    "maxBudgetUsd": 5
+  }
+}
+```
+
+## Account Rotation
+
+When using the Claude backend with multiple OAuth accounts (managed by `ccswitch`), the harness can round-robin accounts across worker spawns to distribute usage and avoid rate limits.
+
+### How It Works
+
+1. Workers spawn serially with a stagger delay (default 5000ms)
+2. Before each spawn, the harness calls `ccswitch --switch-to N` to switch the global Keychain credentials
+3. The next `claude -p` process inherits the switched account's OAuth token
+4. Account assignments are persisted in `.launch-state.json` and shown in `harness_status`
+
+### Configuration
+
+Add `accountRotation` to `claudeConfig` in `.pi-agent/.harness-config.json`:
+
+```json
+{
+  "backend": "claude",
+  "claudeConfig": {
+    "model": "claude-sonnet-4-5-20250514",
+    "permissionMode": "bypassPermissions",
+    "maxBudgetUsd": 5,
+    "accountRotation": {
+      "enabled": true,
+      "strategy": "round-robin",
+      "usageThresholdUsd": 50.0
+    }
+  }
+}
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `enabled` | boolean | Enable/disable rotation |
+| `strategy` | `"round-robin"` | Rotation strategy (only round-robin for now) |
+| `usageThresholdUsd` | number (optional) | Skip accounts above this cumulative cost |
+| `ccswitchPath` | string (optional) | Path to ccswitch binary (default: `"ccswitch"`) |
+| `sequenceFilePath` | string (optional) | Override `~/.claude-switch-backup/sequence.json` |
+
+### Usage Tracking
+
+Cumulative per-account cost and session data is stored in `.pi-agent/.usage-tracking.json`. This file persists across runs (not deleted by `/harness:cleanup`).
+
+When `usageThresholdUsd` is set, accounts above the threshold are skipped during rotation. If all accounts exceed the threshold, all are used (work is never blocked).
+
+The `harness_status` tool includes an account usage report and worker-to-account mapping when rotation is enabled.
+
+### Prerequisites
+
+- `ccswitch` must be installed and configured with your accounts
+- Sequence file at `~/.claude-switch-backup/sequence.json` must exist
+- Only works with `backend: "claude"` (ignored for Pi backend)
+
 ## Tips
 
 - **Start small**: Launch 2-3 workers first to understand the flow

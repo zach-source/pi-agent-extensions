@@ -6,7 +6,11 @@ import { tmpdir } from "os";
 // Mock @mariozechner/pi-tui (runtime-only Pi dependency)
 vi.mock("@mariozechner/pi-tui", () => ({
   Text: class MockText {
-    constructor(public text: string, public x: number, public y: number) {}
+    constructor(
+      public text: string,
+      public x: number,
+      public y: number,
+    ) {}
   },
 }));
 
@@ -120,6 +124,23 @@ import {
   MAX_HARNESS_LOG_LINES,
   HARNESS_LOG_KEEP_LINES,
   type HarnessLogEntry,
+  type SessionBackend,
+  type ClaudeBackendConfig,
+  buildWorkerCommand,
+  buildManagerLoopCommand,
+  buildMcpConfigForWorker,
+  DEFAULT_CLAUDE_MCP_SERVERS,
+  // Account rotation
+  readCcswitchSequence,
+  getAvailableAccounts,
+  resolveAccountForWorker,
+  buildUsageReport,
+  USAGE_TRACKING_FILE,
+  type AccountRotationConfig,
+  type CcswitchAccount,
+  type CcswitchSequence,
+  type UsageTrackingStore,
+  type AccountUsageEntry,
 } from "./submodule-launcher.js";
 import initExtension from "./submodule-launcher.js";
 import { WORKFLOW_DEFS } from "./bmad.js";
@@ -843,7 +864,10 @@ describe("turn_end", () => {
     await mock.emit("turn_end", {}, ctx);
 
     // Should set "done" status with goal count preserved
-    expect(ctx.ui.setStatus).toHaveBeenCalledWith("harness", "harness: 3/3 goals, done");
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: 3/3 goals, done",
+    );
 
     // Verify state was persisted as inactive
     const state: LaunchState = JSON.parse(
@@ -1483,8 +1507,12 @@ describe("/harness:recover command", () => {
     await cmd.handler("", ctx);
 
     // Should have spawned a new manager via tmux
-    const tmuxCalls = mock.api.exec.mock.calls.filter((c: any) => c[0] === "tmux");
-    const newSessionCalls = tmuxCalls.filter((c: any) => c[1]?.includes("new-session"));
+    const tmuxCalls = mock.api.exec.mock.calls.filter(
+      (c: any) => c[0] === "tmux",
+    );
+    const newSessionCalls = tmuxCalls.filter((c: any) =>
+      c[1]?.includes("new-session"),
+    );
     expect(newSessionCalls.length).toBe(1);
     expect(newSessionCalls[0][1]).toContain("harness-manager");
 
@@ -3090,7 +3118,9 @@ describe("harness_queue tool", () => {
     await mkdir(piDir, { recursive: true });
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -3126,7 +3156,9 @@ describe("harness_queue tool", () => {
     await mkdir(piDir, { recursive: true });
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -3258,7 +3290,10 @@ describe("/harness:queue command", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:queue")!;
-    await cmd.handler("add-e2e-tests Write checkout tests, Test payment flow", ctx);
+    await cmd.handler(
+      "add-e2e-tests Write checkout tests, Test payment flow",
+      ctx,
+    );
 
     const queue = await readQueue(tmpDir);
     expect(queue.items).toHaveLength(1);
@@ -3279,7 +3314,10 @@ describe("/harness:queue command", () => {
     await mock.emit("session_start", {}, ctx);
 
     const cmd = mock.getCommand("harness:queue")!;
-    await cmd.handler("--role tester --priority 3 security-tests Write XSS test", ctx);
+    await cmd.handler(
+      "--role tester --priority 3 security-tests Write XSS test",
+      ctx,
+    );
 
     const queue = await readQueue(tmpDir);
     expect(queue.items[0].topic).toBe("security-tests");
@@ -3543,9 +3581,7 @@ describe("turn_end parent inbox check", () => {
 
     // Verify the question was deleted from inbox
     const remaining = await readMailbox(tmpDir, "parent");
-    const questionMsgs = remaining.filter(
-      (m) => m.message.type === "question",
-    );
+    const questionMsgs = remaining.filter((m) => m.message.type === "question");
     expect(questionMsgs).toHaveLength(0);
   });
 
@@ -3715,11 +3751,16 @@ describe("/harness:cleanup command", () => {
     await mkdir(piDir, { recursive: true });
     await mkdir(join(tmpDir, MAILBOX_DIR, "parent"), { recursive: true });
     await writeFile(join(tmpDir, QUEUE_FILE), '{"items":[]}');
-    await writeFile(join(tmpDir, REGISTRY_FILE), '{"workers":{},"updatedAt":""}');
+    await writeFile(
+      join(tmpDir, REGISTRY_FILE),
+      '{"workers":{},"updatedAt":""}',
+    );
     await writeFile(join(tmpDir, STOP_SIGNAL_FILE), "stop");
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -3730,8 +3771,12 @@ describe("/harness:cleanup command", () => {
 
     // State files should be removed
     await expect(readFile(join(tmpDir, QUEUE_FILE), "utf-8")).rejects.toThrow();
-    await expect(readFile(join(tmpDir, REGISTRY_FILE), "utf-8")).rejects.toThrow();
-    await expect(readFile(join(tmpDir, STOP_SIGNAL_FILE), "utf-8")).rejects.toThrow();
+    await expect(
+      readFile(join(tmpDir, REGISTRY_FILE), "utf-8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(join(tmpDir, STOP_SIGNAL_FILE), "utf-8"),
+    ).rejects.toThrow();
 
     // Status bar cleared
     expect(ctx.ui.setStatus).toHaveBeenCalledWith("harness", undefined);
@@ -3767,7 +3812,10 @@ describe("/harness:cleanup command", () => {
         },
       },
     });
-    await writeFile(join(tmpDir, LAUNCH_STATE_FILE), JSON.stringify(launchState));
+    await writeFile(
+      join(tmpDir, LAUNCH_STATE_FILE),
+      JSON.stringify(launchState),
+    );
 
     // Mock git status to return dirty output
     mock.api.exec.mockImplementation(async (cmd: string, args: string[]) => {
@@ -3817,7 +3865,9 @@ describe("manager auto-recovery", () => {
     // Set up active harness with a stale manager (no status file)
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
     await writeFile(
       join(tmpDir, PI_AGENT_DIR, "task-a.md"),
@@ -3829,7 +3879,10 @@ describe("manager auto-recovery", () => {
 
     // First stale cycle — should just set status
     await mock.emit("turn_end", {}, ctx);
-    expect(ctx.ui.setStatus).toHaveBeenCalledWith("harness", "harness: manager stale");
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: manager stale",
+    );
 
     // Second stale cycle — should trigger auto-recovery
     ctx.ui.setStatus.mockClear();
@@ -3842,13 +3895,18 @@ describe("manager auto-recovery", () => {
       }),
       expect.anything(),
     );
-    expect(ctx.ui.setStatus).toHaveBeenCalledWith("harness", "harness: manager recovering");
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "harness",
+      "harness: manager recovering",
+    );
   });
 
   it("stops auto-recovery after MAX_MANAGER_RECOVERY attempts with backoff", async () => {
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
     await writeFile(
       join(tmpDir, PI_AGENT_DIR, "task-b.md"),
@@ -3914,7 +3972,9 @@ describe("writeRunSummary via /harness:stop", () => {
     );
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -3945,7 +4005,9 @@ describe("writeRunSummary via /harness:stop", () => {
     );
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -4106,7 +4168,9 @@ describe("manager prompt improvements", () => {
     const instructions = buildManagerInstructions(configs, "/tmp/base");
 
     expect(instructions).toContain("FIRST: Read your mailbox");
-    expect(instructions).toContain("process all messages before doing anything else");
+    expect(instructions).toContain(
+      "process all messages before doing anything else",
+    );
   });
 
   it("includes self-health reporting instruction in static instructions", () => {
@@ -4123,7 +4187,9 @@ describe("manager prompt improvements", () => {
     ];
     const instructions = buildManagerInstructions(configs, "/tmp/base");
 
-    expect(instructions).toContain("write a status_report to the parent mailbox");
+    expect(instructions).toContain(
+      "write a status_report to the parent mailbox",
+    );
   });
 });
 
@@ -4162,7 +4228,9 @@ describe("/harness:status with worker info", () => {
 
     expect(mock.api.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        content: expect.stringContaining("Goal files only (no worker): orphan-task"),
+        content: expect.stringContaining(
+          "Goal files only (no worker): orphan-task",
+        ),
       }),
       expect.anything(),
     );
@@ -4264,7 +4332,7 @@ describe("tmux helpers", () => {
     expect(loopCmd).toContain("while true");
     expect(loopCmd).toContain("sleep 60"); // default heartbeat interval (60s)
     expect(loopCmd).toContain("stop-signal");
-    expect(loopCmd).toContain('.pi-agent-prompt.md');
+    expect(loopCmd).toContain(".pi-agent-prompt.md");
   });
 
   it("stop command kills worker and manager tmux sessions", async () => {
@@ -4322,7 +4390,9 @@ describe("tmux helpers", () => {
 
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -4637,7 +4707,9 @@ describe("/harness:attach command", () => {
     expect(mock.api.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         customType: "harness-attach",
-        content: expect.stringContaining("tmux -L pi-harness attach -t worker-api"),
+        content: expect.stringContaining(
+          "tmux -L pi-harness attach -t worker-api",
+        ),
       }),
       { triggerTurn: false },
     );
@@ -4654,7 +4726,9 @@ describe("/harness:attach command", () => {
 
     expect(mock.api.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        content: expect.stringContaining("tmux -L pi-harness attach -t harness-manager"),
+        content: expect.stringContaining(
+          "tmux -L pi-harness attach -t harness-manager",
+        ),
       }),
       { triggerTurn: false },
     );
@@ -5035,7 +5109,9 @@ describe("item #1: manager loop exit-code checking", () => {
 
     expect(loopCmd).toContain("exit_code=$?");
     expect(loopCmd).toContain("consecutive_failures");
-    expect(loopCmd).toContain(`consecutive_failures -ge ${MAX_CONSECUTIVE_FAILURES}`);
+    expect(loopCmd).toContain(
+      `consecutive_failures -ge ${MAX_CONSECUTIVE_FAILURES}`,
+    );
     expect(loopCmd).toContain(".pi-agent-errors.log");
     expect(loopCmd).toContain("sleep 30"); // failure sleep (intervalMs / 2000)
     expect(loopCmd).toContain("sleep 60"); // success sleep (default heartbeat intervalMs / 1000)
@@ -5210,7 +5286,9 @@ describe("item #3: cache invalidation", () => {
       JSON.stringify({
         status: "running",
         updatedAt: new Date().toISOString(),
-        submodules: { "cache-test": { completed: 0, total: 1, allDone: false } },
+        submodules: {
+          "cache-test": { completed: 0, total: 1, allDone: false },
+        },
         stallCount: 0,
       }),
     );
@@ -5219,7 +5297,7 @@ describe("item #3: cache invalidation", () => {
     await mock.emit("turn_end", {}, ctx);
 
     // Update both manager status AND goal file (simulate worker completing)
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 50));
     await writeFile(
       statusPath,
       JSON.stringify({
@@ -5335,7 +5413,10 @@ describe("item #5: recovery improvements", () => {
     await recoverCmd.handler("--force", ctx);
 
     // Should have called notify for respawn (--force appends "(counters reset)")
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Manager respawned (counters reset)", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Manager respawned (counters reset)",
+      "info",
+    );
 
     await rm(tmpDir, { recursive: true, force: true });
   });
@@ -5477,7 +5558,8 @@ describe("item #7: worker spawn staggering", () => {
 // ---------------------------------------------------------------------------
 describe("item #8: worker dependencies", () => {
   it("parseGoalFile parses depends_on header", () => {
-    const content = "# dep-test\npath: services/api\ndepends_on: auth, db\n\n## Goals\n- [ ] Build API\n";
+    const content =
+      "# dep-test\npath: services/api\ndepends_on: auth, db\n\n## Goals\n- [ ] Build API\n";
     const config = parseGoalFile(content, "dep-test.md");
     expect(config.dependsOn).toEqual(["auth", "db"]);
   });
@@ -5666,7 +5748,9 @@ describe("item #10: /harness:dashboard command", () => {
       JSON.stringify({
         status: "running",
         updatedAt: new Date().toISOString(),
-        submodules: { "dash-worker": { completed: 1, total: 2, allDone: false } },
+        submodules: {
+          "dash-worker": { completed: 1, total: 2, allDone: false },
+        },
         stallCount: 0,
       }),
     );
@@ -5814,8 +5898,23 @@ describe("/harness:dashboard output", () => {
     // Create a queue file
     const queue = {
       items: [
-        { id: "1", topic: "task-1", description: "Do thing 1", priority: 1, assignedTo: "worker-a", status: "dispatched", createdAt: new Date().toISOString() },
-        { id: "2", topic: "task-2", description: "Do thing 2", priority: 2, status: "pending", createdAt: new Date().toISOString() },
+        {
+          id: "1",
+          topic: "task-1",
+          description: "Do thing 1",
+          priority: 1,
+          assignedTo: "worker-a",
+          status: "dispatched",
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "2",
+          topic: "task-2",
+          description: "Do thing 2",
+          priority: 2,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        },
       ],
     };
     await writeFile(join(tmpDir, QUEUE_FILE), JSON.stringify(queue));
@@ -6190,7 +6289,8 @@ describe("depends_on unknown dependency handling", () => {
 
     // Should warn about unknown dependency
     const warnings = ctx.ui.notify.mock.calls.filter(
-      (c: any[]) => c[1] === "warning" && String(c[0]).includes("unknown dependencies"),
+      (c: any[]) =>
+        c[1] === "warning" && String(c[0]).includes("unknown dependencies"),
     );
     expect(warnings.length).toBe(1);
     expect(warnings[0][0]).toContain("nonexistent");
@@ -6228,7 +6328,9 @@ describe("merged flag accuracy", () => {
 
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -6269,7 +6371,9 @@ describe("non-question inbox messages", () => {
 
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
     await writeFile(
       join(tmpDir, MANAGER_STATUS_FILE),
@@ -6331,7 +6435,9 @@ describe("harness:stop sets session.spawned = false", () => {
 
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -6442,7 +6548,9 @@ describe("stall detection normalization", () => {
     );
     await writeFile(
       join(tmpDir, LAUNCH_STATE_FILE),
-      JSON.stringify(makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) })),
+      JSON.stringify(
+        makeLaunchState({ managerCwd: join(tmpDir, MANAGER_DIR) }),
+      ),
     );
 
     const ctx = createMockContext({ cwd: tmpDir });
@@ -6505,7 +6613,9 @@ describe("issue #20: .pi-agent-prompt.md excluded from git in worktrees", () => 
     // Read the exclude file and verify both files are listed
     try {
       excludeContent = await readFile(join(gitDir, "info", "exclude"), "utf-8");
-    } catch { /* may not exist */ }
+    } catch {
+      /* may not exist */
+    }
     expect(excludeContent).toContain("heartbeat.md");
     expect(excludeContent).toContain(".pi-agent-prompt.md");
   });
@@ -6551,7 +6661,10 @@ describe("issue #21: mergeWorktree uses force removal after successful merge", (
 
     // Find the worktree remove call after merge
     const removeCall = gitCalls.find(
-      (args) => args[0] === "worktree" && args[1] === "remove" && args.includes("--force"),
+      (args) =>
+        args[0] === "worktree" &&
+        args[1] === "remove" &&
+        args.includes("--force"),
     );
     expect(removeCall).toBeDefined();
 
@@ -6590,7 +6703,11 @@ describe("issue #23: merge conflict detection via exitCode (not just exceptions)
       }
       // Return non-zero exitCode WITHOUT throwing (simulates pi.exec behavior)
       if (cmd === "git" && args[0] === "merge" && args[1] !== "--abort") {
-        return { stdout: "", stderr: "CONFLICT (content): merge conflict in file.txt", exitCode: 1 };
+        return {
+          stdout: "",
+          stderr: "CONFLICT (content): merge conflict in file.txt",
+          exitCode: 1,
+        };
       }
       if (cmd === "git" && args[0] === "merge" && args[1] === "--abort") {
         mergeAborted = true;
@@ -6691,11 +6808,18 @@ describe("issue #24: worker prompt mentions .pi-agent-prompt.md", () => {
     // Read the prompt file that was written to the worktree
     const worktreePath = join(tmpDir, WORKTREE_DIR, "prompt-test");
     try {
-      promptContent = await readFile(join(worktreePath, ".pi-agent-prompt.md"), "utf-8");
-    } catch { /* file may not exist if worktree mock doesn't create dirs */ }
+      promptContent = await readFile(
+        join(worktreePath, ".pi-agent-prompt.md"),
+        "utf-8",
+      );
+    } catch {
+      /* file may not exist if worktree mock doesn't create dirs */
+    }
 
     expect(promptContent).toContain(".pi-agent-prompt.md");
-    expect(promptContent).toContain("do NOT commit or stage heartbeat.md or .pi-agent-prompt.md");
+    expect(promptContent).toContain(
+      "do NOT commit or stage heartbeat.md or .pi-agent-prompt.md",
+    );
   });
 });
 
@@ -6722,7 +6846,12 @@ describe("issue #22: orphaned worktree cleanup also deletes branches", () => {
       if (cmd === "git") gitCalls.push([...args]);
 
       // Return porcelain worktree list with an orphaned entry
-      if (cmd === "git" && args[0] === "worktree" && args[1] === "list" && args[2] === "--porcelain") {
+      if (
+        cmd === "git" &&
+        args[0] === "worktree" &&
+        args[1] === "list" &&
+        args[2] === "--porcelain"
+      ) {
         return {
           stdout: `worktree ${tmpDir}\nbranch refs/heads/main\n\nworktree ${orphanedPath}\nbranch refs/heads/pi-agent/orphaned-worker\n`,
           stderr: "",
@@ -6746,14 +6875,20 @@ describe("issue #22: orphaned worktree cleanup also deletes branches", () => {
 
     // Should have called `git worktree remove <orphaned-path> --force`
     const wtRemove = gitCalls.find(
-      (args) => args[0] === "worktree" && args[1] === "remove" && args[2] === orphanedPath,
+      (args) =>
+        args[0] === "worktree" &&
+        args[1] === "remove" &&
+        args[2] === orphanedPath,
     );
     expect(wtRemove).toBeDefined();
     expect(wtRemove).toContain("--force");
 
     // Should have called `git branch -D pi-agent/orphaned-worker`
     const branchDelete = gitCalls.find(
-      (args) => args[0] === "branch" && args[1] === "-D" && args[2] === "pi-agent/orphaned-worker",
+      (args) =>
+        args[0] === "branch" &&
+        args[1] === "-D" &&
+        args[2] === "pi-agent/orphaned-worker",
     );
     expect(branchDelete).toBeDefined();
   });
@@ -6766,23 +6901,78 @@ describe("issue #22: orphaned worktree cleanup also deletes branches", () => {
 describe("buildBmadWorkflowDag", () => {
   // Minimal workflow defs matching the shape expected by buildBmadWorkflowDag
   const MOCK_WORKFLOW_DEFS = [
-    { name: "product-brief", phase: 1, agent: "Business Analyst", description: "Create product brief" },
-    { name: "brainstorm", phase: 1, agent: "Creative Intelligence", description: "Brainstorming session" },
-    { name: "research", phase: 1, agent: "Creative Intelligence", description: "Market research" },
+    {
+      name: "product-brief",
+      phase: 1,
+      agent: "Business Analyst",
+      description: "Create product brief",
+    },
+    {
+      name: "brainstorm",
+      phase: 1,
+      agent: "Creative Intelligence",
+      description: "Brainstorming session",
+    },
+    {
+      name: "research",
+      phase: 1,
+      agent: "Creative Intelligence",
+      description: "Market research",
+    },
     { name: "prd", phase: 2, agent: "Product Manager", description: "PRD" },
-    { name: "tech-spec", phase: 2, agent: "Product Manager", description: "Tech spec" },
-    { name: "create-ux-design", phase: 2, agent: "UX Designer", description: "UX design" },
-    { name: "architecture", phase: 3, agent: "System Architect", description: "Architecture" },
-    { name: "solutioning-gate-check", phase: 3, agent: "System Architect", description: "Gate check" },
-    { name: "sprint-planning", phase: 4, agent: "Scrum Master", description: "Sprint planning" },
-    { name: "create-story", phase: 4, agent: "Scrum Master", description: "Create stories" },
-    { name: "dev-story", phase: 4, agent: "Developer", description: "Develop story" },
+    {
+      name: "tech-spec",
+      phase: 2,
+      agent: "Product Manager",
+      description: "Tech spec",
+    },
+    {
+      name: "create-ux-design",
+      phase: 2,
+      agent: "UX Designer",
+      description: "UX design",
+    },
+    {
+      name: "architecture",
+      phase: 3,
+      agent: "System Architect",
+      description: "Architecture",
+    },
+    {
+      name: "solutioning-gate-check",
+      phase: 3,
+      agent: "System Architect",
+      description: "Gate check",
+    },
+    {
+      name: "sprint-planning",
+      phase: 4,
+      agent: "Scrum Master",
+      description: "Sprint planning",
+    },
+    {
+      name: "create-story",
+      phase: 4,
+      agent: "Scrum Master",
+      description: "Create stories",
+    },
+    {
+      name: "dev-story",
+      phase: 4,
+      agent: "Developer",
+      description: "Develop story",
+    },
   ];
 
   it("L0 returns 4-workflow chain", () => {
     const dag = buildBmadWorkflowDag(0, [], MOCK_WORKFLOW_DEFS);
     const names = dag.map((s) => s.workflowName);
-    expect(names).toEqual(["tech-spec", "sprint-planning", "create-story", "dev-story"]);
+    expect(names).toEqual([
+      "tech-spec",
+      "sprint-planning",
+      "create-story",
+      "dev-story",
+    ]);
   });
 
   it("L1 includes product-brief", () => {
@@ -6853,7 +7043,9 @@ describe("buildBmadWorkflowDag", () => {
     // Cycle detection via Kahn's algorithm is built into buildBmadWorkflowDag.
     // If the hardcoded BMAD_DEPENDENCY_MAP had a cycle, this would throw.
     for (const level of [0, 1, 2, 3]) {
-      expect(() => buildBmadWorkflowDag(level, [], MOCK_WORKFLOW_DEFS)).not.toThrow();
+      expect(() =>
+        buildBmadWorkflowDag(level, [], MOCK_WORKFLOW_DEFS),
+      ).not.toThrow();
     }
   });
 });
@@ -6928,7 +7120,12 @@ describe("buildManagerInstructions with bmadMode", () => {
       projectName: "TestProject",
       statusFile: "docs/bmm-workflow-status.yaml",
       workflows: [
-        { name: "bmad-prd", workflowName: "prd", phase: 2, dependsOn: ["bmad-product-brief"] },
+        {
+          name: "bmad-prd",
+          workflowName: "prd",
+          phase: 2,
+          dependsOn: ["bmad-product-brief"],
+        },
       ],
     };
     const result = buildManagerInstructions(configs, "/tmp/test", bmadMode);
@@ -6980,7 +7177,10 @@ describe("buildScoutPrompt", () => {
   });
 
   it("includes focus filter when provided", () => {
-    const prompt = buildScoutPrompt("/tmp/test", undefined, ["tests", "security"]);
+    const prompt = buildScoutPrompt("/tmp/test", undefined, [
+      "tests",
+      "security",
+    ]);
     expect(prompt).toContain("## Focus Areas");
     expect(prompt).toContain("tests, security");
   });
@@ -7081,7 +7281,11 @@ describe("buildPlanFromAnalysis", () => {
   it("splits findings with dependsOn into queued", () => {
     const findings = [
       makeFinding({ id: "base-work", severity: "high" }),
-      makeFinding({ id: "dependent-work", severity: "high", dependsOn: ["base-work"] }),
+      makeFinding({
+        id: "dependent-work",
+        severity: "high",
+        dependsOn: ["base-work"],
+      }),
     ];
     const analysis = makeAnalysis(findings);
     const result = buildPlanFromAnalysis(analysis, 10);
@@ -7160,15 +7364,23 @@ describe("/harness:auto flag parsing (pure logic)", () => {
       focus = focusMatch[1].split(",").filter(Boolean) as ScoutCategory[];
     }
 
-    const objective = input
-      .replace(/--max-workers\s+\d+/g, "")
-      .replace(/--max-iterations\s+\d+/g, "")
-      .replace(/--stagger\s+\d+/g, "")
-      .replace(/--yes/g, "")
-      .replace(/--focus\s+[\w,]+/g, "")
-      .trim() || undefined;
+    const objective =
+      input
+        .replace(/--max-workers\s+\d+/g, "")
+        .replace(/--max-iterations\s+\d+/g, "")
+        .replace(/--stagger\s+\d+/g, "")
+        .replace(/--yes/g, "")
+        .replace(/--focus\s+[\w,]+/g, "")
+        .trim() || undefined;
 
-    return { maxWorkers, maxIterations, staggerMs, autoApprove, focus, objective };
+    return {
+      maxWorkers,
+      maxIterations,
+      staggerMs,
+      autoApprove,
+      focus,
+      objective,
+    };
   }
 
   it("parses all flags correctly", () => {
@@ -7279,7 +7491,9 @@ describe("Feature 1: resolveModelForWorker", () => {
       { model: "claude-opus-4-6", roles: ["architect", "analyst"] },
       { model: "default", roles: ["developer"] },
     ];
-    expect(resolveModelForWorker(routes, "architect", "my-task")).toBe("claude-opus-4-6");
+    expect(resolveModelForWorker(routes, "architect", "my-task")).toBe(
+      "claude-opus-4-6",
+    );
     expect(resolveModelForWorker(routes, "developer", "my-task")).toBeNull();
   });
 
@@ -7288,7 +7502,9 @@ describe("Feature 1: resolveModelForWorker", () => {
       { model: "claude-opus-4-6", taskPattern: "^security-" },
       { model: "default", roles: ["developer", "architect"] },
     ];
-    expect(resolveModelForWorker(routes, "developer", "security-audit")).toBe("claude-opus-4-6");
+    expect(resolveModelForWorker(routes, "developer", "security-audit")).toBe(
+      "claude-opus-4-6",
+    );
     expect(resolveModelForWorker(routes, "developer", "auth-api")).toBeNull();
   });
 
@@ -7320,7 +7536,12 @@ describe("Feature 1: resolveModelForWorker", () => {
 // ---------------------------------------------------------------------------
 describe("tokenize", () => {
   it("splits on whitespace and punctuation", () => {
-    expect(tokenize("Hello, world! Foo-bar")).toEqual(["hello", "world", "foo", "bar"]);
+    expect(tokenize("Hello, world! Foo-bar")).toEqual([
+      "hello",
+      "world",
+      "foo",
+      "bar",
+    ]);
   });
 
   it("returns empty array for empty string", () => {
@@ -7373,19 +7594,31 @@ describe("computeBM25", () => {
 describe("Feature 2: searchMemories (BM25)", () => {
   const memories: HarnessMemory[] = [
     {
-      id: "1", timestamp: "2024-01-01", source: "worker-a",
-      category: "decision", content: "Use PostgreSQL for the database",
-      tags: ["database", "postgres"], relevance: 0.8,
+      id: "1",
+      timestamp: "2024-01-01",
+      source: "worker-a",
+      category: "decision",
+      content: "Use PostgreSQL for the database",
+      tags: ["database", "postgres"],
+      relevance: 0.8,
     },
     {
-      id: "2", timestamp: "2024-01-02", source: "worker-b",
-      category: "error", content: "API rate limit hit on external service",
-      tags: ["api", "rate-limit"], relevance: 0.6,
+      id: "2",
+      timestamp: "2024-01-02",
+      source: "worker-b",
+      category: "error",
+      content: "API rate limit hit on external service",
+      tags: ["api", "rate-limit"],
+      relevance: 0.6,
     },
     {
-      id: "3", timestamp: "2024-01-03", source: "worker-a",
-      category: "pattern", content: "Repository pattern works well for data layer",
-      tags: ["pattern", "repository"], relevance: 0.9,
+      id: "3",
+      timestamp: "2024-01-03",
+      source: "worker-a",
+      category: "pattern",
+      content: "Repository pattern works well for data layer",
+      tags: ["pattern", "repository"],
+      relevance: 0.9,
     },
   ];
 
@@ -7430,14 +7663,22 @@ describe("Feature 2: searchMemories (BM25)", () => {
   it("ranks by term frequency", () => {
     const mems: HarnessMemory[] = [
       {
-        id: "a", timestamp: "2024-01-01", source: "w",
-        category: "insight", content: "database database database query optimization",
-        tags: [], relevance: 0.5,
+        id: "a",
+        timestamp: "2024-01-01",
+        source: "w",
+        category: "insight",
+        content: "database database database query optimization",
+        tags: [],
+        relevance: 0.5,
       },
       {
-        id: "b", timestamp: "2024-01-01", source: "w",
-        category: "insight", content: "database connection pooling",
-        tags: [], relevance: 0.5,
+        id: "b",
+        timestamp: "2024-01-01",
+        source: "w",
+        category: "insight",
+        content: "database connection pooling",
+        tags: [],
+        relevance: 0.5,
       },
     ];
     const results = searchMemories(mems, "database");
@@ -7530,10 +7771,17 @@ describe("Feature 2: memory tools", () => {
     // Pre-populate memory
     const store: MemoryStore = {
       version: 1,
-      memories: [{
-        id: "test-1", timestamp: "2024-01-01", source: "test",
-        category: "decision", content: "Use TypeScript", tags: ["typescript"], relevance: 1.0,
-      }],
+      memories: [
+        {
+          id: "test-1",
+          timestamp: "2024-01-01",
+          source: "test",
+          category: "decision",
+          content: "Use TypeScript",
+          tags: ["typescript"],
+          relevance: 1.0,
+        },
+      ],
     };
     await writeFile(join(tmpDir, MEMORY_FILE), JSON.stringify(store));
 
@@ -7620,7 +7868,9 @@ describe("Feature 5: inter-agent communication tools", () => {
 
   it("harness_read_messages reads and deletes", async () => {
     // Pre-populate mailbox
-    await sendMailboxMessage(tmpDir, "parent", "worker-a", "status_report", { status: "ok" });
+    await sendMailboxMessage(tmpDir, "parent", "worker-a", "status_report", {
+      status: "ok",
+    });
 
     const tool = mock.getTool("harness_read_messages");
     const result = await tool!.execute("tc1", {});
@@ -7655,8 +7905,22 @@ describe("Feature 6: getTemplateOverrides", () => {
     const store: TemplateStore = {
       version: 1,
       ratings: [
-        { role: "tester", taskName: "t1", rating: 2, feedback: "too vague", timestamp: "2024-01-01", adjustments: ["Be more specific about test requirements"] },
-        { role: "tester", taskName: "t2", rating: 1, feedback: "missing context", timestamp: "2024-01-02", adjustments: ["Include project structure info"] },
+        {
+          role: "tester",
+          taskName: "t1",
+          rating: 2,
+          feedback: "too vague",
+          timestamp: "2024-01-01",
+          adjustments: ["Be more specific about test requirements"],
+        },
+        {
+          role: "tester",
+          taskName: "t2",
+          rating: 1,
+          feedback: "missing context",
+          timestamp: "2024-01-02",
+          adjustments: ["Include project structure info"],
+        },
       ],
       roleOverrides: {},
     };
@@ -7669,8 +7933,22 @@ describe("Feature 6: getTemplateOverrides", () => {
     const store: TemplateStore = {
       version: 1,
       ratings: [
-        { role: "developer", taskName: "t1", rating: 4, feedback: "good", timestamp: "2024-01-01", adjustments: [] },
-        { role: "developer", taskName: "t2", rating: 5, feedback: "great", timestamp: "2024-01-02", adjustments: [] },
+        {
+          role: "developer",
+          taskName: "t1",
+          rating: 4,
+          feedback: "good",
+          timestamp: "2024-01-01",
+          adjustments: [],
+        },
+        {
+          role: "developer",
+          taskName: "t2",
+          rating: 5,
+          feedback: "great",
+          timestamp: "2024-01-02",
+          adjustments: [],
+        },
       ],
       roleOverrides: {},
     };
@@ -7714,14 +7992,22 @@ describe("Feature 6: harness_rate_template tool", () => {
 describe("Feature 7: isScheduleDue", () => {
   it("daily schedule is due when not run today", () => {
     const schedule: ScheduledRun = {
-      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: "daily",
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
     };
     expect(isScheduleDue(schedule, new Date())).toBe(true);
   });
 
   it("daily schedule is not due when run recently", () => {
     const schedule: ScheduledRun = {
-      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: "daily",
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
       lastRunAt: new Date().toISOString(),
     };
     expect(isScheduleDue(schedule, new Date())).toBe(false);
@@ -7729,7 +8015,11 @@ describe("Feature 7: isScheduleDue", () => {
 
   it("disabled schedule is never due", () => {
     const schedule: ScheduledRun = {
-      id: "s1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: false,
+      id: "s1",
+      cron: "daily",
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: false,
     };
     expect(isScheduleDue(schedule, new Date())).toBe(false);
   });
@@ -7739,7 +8029,11 @@ describe("Feature 7: isScheduleDue", () => {
     const hh = String(now.getHours()).padStart(2, "0");
     const mm = String(now.getMinutes()).padStart(2, "0");
     const schedule: ScheduledRun = {
-      id: "s1", cron: `${hh}:${mm}`, maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: `${hh}:${mm}`,
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
     };
     expect(isScheduleDue(schedule, now)).toBe(true);
   });
@@ -7749,7 +8043,11 @@ describe("Feature 7: isScheduleDue", () => {
     const hh = String(now.getHours()).padStart(2, "0");
     const mm = String(now.getMinutes()).padStart(2, "0");
     const schedule: ScheduledRun = {
-      id: "s1", cron: `${hh}:${mm}`, maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: `${hh}:${mm}`,
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
       lastRunAt: now.toISOString(),
     };
     expect(isScheduleDue(schedule, now)).toBe(false);
@@ -7757,14 +8055,22 @@ describe("Feature 7: isScheduleDue", () => {
 
   it("hourly schedule is due when not run in last hour", () => {
     const schedule: ScheduledRun = {
-      id: "s1", cron: "hourly", maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: "hourly",
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
     };
     expect(isScheduleDue(schedule, new Date())).toBe(true);
   });
 
   it("weekly schedule is due when not run in last week", () => {
     const schedule: ScheduledRun = {
-      id: "s1", cron: "weekly", maxWorkers: 3, maxIterations: 1, enabled: true,
+      id: "s1",
+      cron: "weekly",
+      maxWorkers: 3,
+      maxIterations: 1,
+      enabled: true,
       lastRunAt: new Date(Date.now() - 8 * 86_400_000).toISOString(),
     };
     expect(isScheduleDue(schedule, new Date())).toBe(true);
@@ -7804,7 +8110,13 @@ describe("Feature 7: /harness:schedule command", () => {
   it("list shows schedules", async () => {
     // Pre-populate
     const schedules: ScheduledRun[] = [
-      { id: "test-1", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true },
+      {
+        id: "test-1",
+        cron: "daily",
+        maxWorkers: 3,
+        maxIterations: 1,
+        enabled: true,
+      },
     ];
     await writeFile(join(tmpDir, SCHEDULE_FILE), JSON.stringify(schedules));
 
@@ -7820,7 +8132,13 @@ describe("Feature 7: /harness:schedule command", () => {
 
   it("remove deletes a schedule", async () => {
     const schedules: ScheduledRun[] = [
-      { id: "to-remove", cron: "daily", maxWorkers: 3, maxIterations: 1, enabled: true },
+      {
+        id: "to-remove",
+        cron: "daily",
+        maxWorkers: 3,
+        maxIterations: 1,
+        enabled: true,
+      },
     ];
     await writeFile(join(tmpDir, SCHEDULE_FILE), JSON.stringify(schedules));
 
@@ -7912,7 +8230,11 @@ describe("Feature 8: /harness:sandbox command", () => {
     await cmd.handler("off", ctx);
 
     let exists = true;
-    try { await readFile(join(tmpDir, SANDBOX_CONFIG_FILE)); } catch { exists = false; }
+    try {
+      await readFile(join(tmpDir, SANDBOX_CONFIG_FILE));
+    } catch {
+      exists = false;
+    }
     expect(exists).toBe(false);
   });
 });
@@ -7944,7 +8266,10 @@ describe("Feature 9: trigger processing", () => {
       config: { maxWorkers: 2 },
       createdAt: new Date().toISOString(),
     };
-    await writeFile(join(tmpDir, TRIGGERS_DIR, "t1.json"), JSON.stringify(trigger));
+    await writeFile(
+      join(tmpDir, TRIGGERS_DIR, "t1.json"),
+      JSON.stringify(trigger),
+    );
 
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -7960,7 +8285,7 @@ describe("Feature 9: trigger processing", () => {
 
     // Trigger file should be deleted
     const files = await readdir(join(tmpDir, TRIGGERS_DIR));
-    expect(files.filter(f => f.endsWith(".json"))).toHaveLength(0);
+    expect(files.filter((f) => f.endsWith(".json"))).toHaveLength(0);
   });
 
   it("ignores malformed trigger files", async () => {
@@ -8008,14 +8333,21 @@ describe("Feature 2: /harness:forget command", () => {
 
   it("clears memory store", async () => {
     // Pre-populate
-    await writeFile(join(tmpDir, MEMORY_FILE), JSON.stringify({ version: 1, memories: [{ id: "1" }] }));
+    await writeFile(
+      join(tmpDir, MEMORY_FILE),
+      JSON.stringify({ version: 1, memories: [{ id: "1" }] }),
+    );
 
     const cmd = mock.getCommand("harness:forget")!;
     const ctx = createMockContext({ cwd: tmpDir });
     await cmd.handler("", ctx);
 
     let exists = true;
-    try { await readFile(join(tmpDir, MEMORY_FILE)); } catch { exists = false; }
+    try {
+      await readFile(join(tmpDir, MEMORY_FILE));
+    } catch {
+      exists = false;
+    }
     expect(exists).toBe(false);
   });
 });
@@ -8036,7 +8368,7 @@ describe("Deterministic Operations: goal counting from goal files", () => {
     ].join("\n");
     const config = parseGoalFile(goalContent, "test-worker.md");
     expect(config.goals.length).toBe(3);
-    expect(config.goals.filter(g => g.completed).length).toBe(2);
+    expect(config.goals.filter((g) => g.completed).length).toBe(2);
   });
 
   it("parseGoalFile counts unanswered questions", () => {
@@ -8052,7 +8384,7 @@ describe("Deterministic Operations: goal counting from goal files", () => {
       "- ! How many replicas? → 3",
     ].join("\n");
     const config = parseGoalFile(goalContent, "test-worker.md");
-    const unanswered = config.questions.filter(q => !q.answered).length;
+    const unanswered = config.questions.filter((q) => !q.answered).length;
     expect(unanswered).toBe(1);
   });
 });
@@ -8072,8 +8404,9 @@ describe("Deterministic Operations: auto-merge guards", () => {
       "- ? Unanswered question",
     ].join("\n");
     const config = parseGoalFile(goalContent, "worker-a.md");
-    const allGoalsDone = config.goals.every(g => g.completed);
-    const hasUnanswered = (config.questions?.filter(q => !q.answered).length ?? 0) > 0;
+    const allGoalsDone = config.goals.every((g) => g.completed);
+    const hasUnanswered =
+      (config.questions?.filter((q) => !q.answered).length ?? 0) > 0;
     expect(allGoalsDone).toBe(true);
     expect(hasUnanswered).toBe(true);
     // Auto-merge would skip this worker because hasUnanswered is true
@@ -8089,20 +8422,16 @@ describe("Deterministic Operations: auto-merge guards", () => {
       "- [x] Also done",
     ].join("\n");
     const config = parseGoalFile(goalContent, "worker-b.md");
-    const allGoalsDone = config.goals.every(g => g.completed);
-    const hasUnanswered = (config.questions?.filter(q => !q.answered).length ?? 0) > 0;
+    const allGoalsDone = config.goals.every((g) => g.completed);
+    const hasUnanswered =
+      (config.questions?.filter((q) => !q.answered).length ?? 0) > 0;
     expect(allGoalsDone).toBe(true);
     expect(hasUnanswered).toBe(false);
     // Auto-merge would proceed for this worker
   });
 
   it("skips workers with no goals", () => {
-    const goalContent = [
-      "# worker-c",
-      "path: .",
-      "",
-      "## Goals",
-    ].join("\n");
+    const goalContent = ["# worker-c", "path: .", "", "## Goals"].join("\n");
     const config = parseGoalFile(goalContent, "worker-c.md");
     expect(config.goals.length).toBe(0);
     // Auto-merge skips when goals.length === 0
@@ -8115,13 +8444,27 @@ describe("Deterministic Operations: queue dispatch logic", () => {
     await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
     const queue = {
       items: [
-        { id: "q1", topic: "task-a", description: "desc", priority: 10, status: "pending" as const, createdAt: new Date().toISOString() },
-        { id: "q2", topic: "task-b", description: "desc", priority: 5, status: "dispatched" as const, createdAt: new Date().toISOString() },
+        {
+          id: "q1",
+          topic: "task-a",
+          description: "desc",
+          priority: 10,
+          status: "pending" as const,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: "q2",
+          topic: "task-b",
+          description: "desc",
+          priority: 5,
+          status: "dispatched" as const,
+          createdAt: new Date().toISOString(),
+        },
       ],
     };
     await writeFile(join(tmpDir, QUEUE_FILE), JSON.stringify(queue));
     const loaded = await readQueue(tmpDir);
-    const pending = loaded.items.filter(i => i.status === "pending");
+    const pending = loaded.items.filter((i) => i.status === "pending");
     expect(pending.length).toBe(1);
     expect(pending[0].topic).toBe("task-a");
     await rm(tmpDir, { recursive: true, force: true });
@@ -8132,7 +8475,14 @@ describe("Deterministic Operations: queue dispatch logic", () => {
     await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
     const queue = {
       items: [
-        { id: "q1", topic: "task-a", description: "desc", priority: 10, status: "dispatched" as const, createdAt: new Date().toISOString() },
+        {
+          id: "q1",
+          topic: "task-a",
+          description: "desc",
+          priority: 10,
+          status: "dispatched" as const,
+          createdAt: new Date().toISOString(),
+        },
       ],
     };
     await writeFile(join(tmpDir, QUEUE_FILE), JSON.stringify(queue));
@@ -8165,9 +8515,13 @@ describe("Live Config Reload: validateRuntimeConfig", () => {
 
   it("accepts boundary values", () => {
     expect(validateRuntimeConfig({ maxWorkers: 1 })).toEqual({ maxWorkers: 1 });
-    expect(validateRuntimeConfig({ maxWorkers: 50 })).toEqual({ maxWorkers: 50 });
+    expect(validateRuntimeConfig({ maxWorkers: 50 })).toEqual({
+      maxWorkers: 50,
+    });
     expect(validateRuntimeConfig({ staggerMs: 0 })).toEqual({ staggerMs: 0 });
-    expect(validateRuntimeConfig({ staggerMs: 60000 })).toEqual({ staggerMs: 60000 });
+    expect(validateRuntimeConfig({ staggerMs: 60000 })).toEqual({
+      staggerMs: 60000,
+    });
   });
 
   it("rejects maxWorkers below 1", () => {
@@ -8213,13 +8567,18 @@ describe("Live Config Reload: validateRuntimeConfig", () => {
   });
 
   it("ignores unknown fields and validates known fields", () => {
-    const result = validateRuntimeConfig({ maxWorkers: 5, unknownField: "ignored" });
+    const result = validateRuntimeConfig({
+      maxWorkers: 5,
+      unknownField: "ignored",
+    });
     expect(result).toEqual({ maxWorkers: 5 });
   });
 
   it("returns null if any known field is invalid even if others are valid", () => {
     expect(validateRuntimeConfig({ maxWorkers: 5, staggerMs: -1 })).toBeNull();
-    expect(validateRuntimeConfig({ maxWorkers: 0, staggerMs: 3000 })).toBeNull();
+    expect(
+      validateRuntimeConfig({ maxWorkers: 0, staggerMs: 3000 }),
+    ).toBeNull();
   });
 });
 
@@ -8257,14 +8616,34 @@ describe("buildRepoSnapshot", () => {
 
     // Create a .pi-agent dir with a goal file
     await mkdir(join(tmpDir, PI_AGENT_DIR), { recursive: true });
-    await writeFile(join(tmpDir, PI_AGENT_DIR, "my-task.md"), "# my-task\npath: .\n", "utf-8");
+    await writeFile(
+      join(tmpDir, PI_AGENT_DIR, "my-task.md"),
+      "# my-task\npath: .\n",
+      "utf-8",
+    );
 
     const mockPi = {
       exec: vi.fn().mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "find") return Promise.resolve({ stdout: ".\n./src\n./tests", stderr: "", exitCode: 0 });
-        if (cmd === "git" && args[0] === "log") return Promise.resolve({ stdout: "abc123 initial commit\ndef456 add feature", stderr: "", exitCode: 0 });
-        if (cmd === "git" && args[0] === "branch") return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
-        if (cmd === "grep") return Promise.resolve({ stdout: "./src/index.ts:3", stderr: "", exitCode: 0 });
+        if (cmd === "find")
+          return Promise.resolve({
+            stdout: ".\n./src\n./tests",
+            stderr: "",
+            exitCode: 0,
+          });
+        if (cmd === "git" && args[0] === "log")
+          return Promise.resolve({
+            stdout: "abc123 initial commit\ndef456 add feature",
+            stderr: "",
+            exitCode: 0,
+          });
+        if (cmd === "git" && args[0] === "branch")
+          return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
+        if (cmd === "grep")
+          return Promise.resolve({
+            stdout: "./src/index.ts:3",
+            stderr: "",
+            exitCode: 0,
+          });
         return Promise.resolve({ stdout: "", stderr: "", exitCode: 0 });
       }),
     };
@@ -8322,7 +8701,8 @@ describe("/harness:discover command", () => {
 
   it("sends message with triggerTurn: true", async () => {
     mock.api.exec.mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "git" && args[0] === "branch") return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
+      if (cmd === "git" && args[0] === "branch")
+        return Promise.resolve({ stdout: "main", stderr: "", exitCode: 0 });
       return Promise.resolve({ stdout: "", stderr: "", exitCode: 0 });
     });
 
@@ -8449,7 +8829,11 @@ describe("event auto-logging", () => {
     await mock.emit("session_start", {}, ctx);
 
     // Emit a tool_call event
-    await mock.emit("tool_call", { toolName: "harness_status", input: { foo: "bar" } }, ctx);
+    await mock.emit(
+      "tool_call",
+      { toolName: "harness_status", input: { foo: "bar" } },
+      ctx,
+    );
 
     // Give fire-and-forget a tick
     await new Promise((r) => setTimeout(r, 50));
@@ -8460,7 +8844,10 @@ describe("event auto-logging", () => {
       .map((l) => JSON.parse(l) as HarnessLogEntry)
       .find((e) => e.event === "tool.call");
     expect(toolEntry).toBeDefined();
-    expect(toolEntry!.data).toMatchObject({ tool: "harness_status", foo: "bar" });
+    expect(toolEntry!.data).toMatchObject({
+      tool: "harness_status",
+      foo: "bar",
+    });
   });
 
   it("turn_start event logs turn.start entry with token usage", async () => {
@@ -8478,7 +8865,10 @@ describe("event auto-logging", () => {
       .find((e) => e.event === "turn.start");
     expect(turnStart).toBeDefined();
     expect(turnStart!.level).toBe("debug");
-    expect(turnStart!.data).toMatchObject({ tokens: expect.any(Number), percent: expect.any(Number) });
+    expect(turnStart!.data).toMatchObject({
+      tokens: expect.any(Number),
+      percent: expect.any(Number),
+    });
   });
 
   it("session_start logs session.start entry", async () => {
@@ -8522,7 +8912,11 @@ describe("/harness:trace command", () => {
     await mock.emit("session_start", {}, ctx);
 
     // Remove the log file that session_start created
-    try { await rm(join(tmpDir, HARNESS_LOG_FILE)); } catch { /* may not exist */ }
+    try {
+      await rm(join(tmpDir, HARNESS_LOG_FILE));
+    } catch {
+      /* may not exist */
+    }
 
     const cmd = mock.getCommand("harness:trace")!;
     await cmd.handler("", ctx);
@@ -8539,7 +8933,11 @@ describe("/harness:trace command", () => {
   it("displays last N entries", async () => {
     const logPath = join(tmpDir, HARNESS_LOG_FILE);
     const entries = Array.from({ length: 10 }, (_, i) =>
-      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: `evt.${i}` }),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "debug",
+        event: `evt.${i}`,
+      }),
     );
     await writeFile(logPath, entries.join("\n") + "\n", "utf-8");
 
@@ -8561,9 +8959,21 @@ describe("/harness:trace command", () => {
   it("filters by event name", async () => {
     const logPath = join(tmpDir, HARNESS_LOG_FILE);
     const entries = [
-      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: "worker.spawn" }),
-      JSON.stringify({ ts: new Date().toISOString(), level: "info", event: "manager.spawn" }),
-      JSON.stringify({ ts: new Date().toISOString(), level: "debug", event: "worker.merge.ok" }),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "debug",
+        event: "worker.spawn",
+      }),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "info",
+        event: "manager.spawn",
+      }),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "debug",
+        event: "worker.merge.ok",
+      }),
     ];
     await writeFile(logPath, entries.join("\n") + "\n", "utf-8");
 
@@ -8585,7 +8995,11 @@ describe("/harness:trace command", () => {
 
   it("--clear truncates the log file", async () => {
     const logPath = join(tmpDir, HARNESS_LOG_FILE);
-    await writeFile(logPath, '{"ts":"x","level":"debug","event":"test"}\n', "utf-8");
+    await writeFile(
+      logPath,
+      '{"ts":"x","level":"debug","event":"test"}\n',
+      "utf-8",
+    );
 
     const ctx = createMockContext({ cwd: tmpDir });
     await mock.emit("session_start", {}, ctx);
@@ -8625,7 +9039,17 @@ describe("custom tool rendering", () => {
 
     // With data
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "summary" }], details: { submodules: 2, totalGoals: 5, completedGoals: 3, totalQuestions: 1, unansweredQuestions: 1, loopActive: true } },
+      {
+        content: [{ type: "text", text: "summary" }],
+        details: {
+          submodules: 2,
+          totalGoals: 5,
+          completedGoals: 3,
+          totalQuestions: 1,
+          unansweredQuestions: 1,
+          loopActive: true,
+        },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8652,12 +9076,18 @@ describe("custom tool rendering", () => {
   it("harness_update_goal renderCall/renderResult", () => {
     const tool = mock.getTool("harness_update_goal")!;
     expect(tool.renderCall).toBeDefined();
-    const call = tool.renderCall({ action: "add", submodule: "api", goal: "Add auth endpoint" }, mockTheme);
+    const call = tool.renderCall(
+      { action: "add", submodule: "api", goal: "Add auth endpoint" },
+      mockTheme,
+    );
     expect(call.text).toContain("add");
     expect(call.text).toContain("api");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "ok" }], details: { goals: [{ completed: true }, { completed: false }] } },
+      {
+        content: [{ type: "text", text: "ok" }],
+        details: { goals: [{ completed: true }, { completed: false }] },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8674,13 +9104,19 @@ describe("custom tool rendering", () => {
 
   it("harness_add_task renderCall/renderResult", () => {
     const tool = mock.getTool("harness_add_task")!;
-    const call = tool.renderCall({ name: "auth-refactor", goals: ["g1", "g2"], role: "architect" }, mockTheme);
+    const call = tool.renderCall(
+      { name: "auth-refactor", goals: ["g1", "g2"], role: "architect" },
+      mockTheme,
+    );
     expect(call.text).toContain("auth-refactor");
     expect(call.text).toContain("2 goal(s)");
     expect(call.text).toContain("architect");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "ok" }], details: { name: "auth-refactor" } },
+      {
+        content: [{ type: "text", text: "ok" }],
+        details: { name: "auth-refactor" },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8689,12 +9125,18 @@ describe("custom tool rendering", () => {
 
   it("harness_ask renderCall/renderResult", () => {
     const tool = mock.getTool("harness_ask")!;
-    const call = tool.renderCall({ submodule: "api", question: "Which auth provider should we use?" }, mockTheme);
+    const call = tool.renderCall(
+      { submodule: "api", question: "Which auth provider should we use?" },
+      mockTheme,
+    );
     expect(call.text).toContain("api");
     expect(call.text).toContain("Which auth");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "staged" }], details: { unanswered: 3 } },
+      {
+        content: [{ type: "text", text: "staged" }],
+        details: { unanswered: 3 },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8703,13 +9145,19 @@ describe("custom tool rendering", () => {
 
   it("harness_answer renderCall/renderResult", () => {
     const tool = mock.getTool("harness_answer")!;
-    const call = tool.renderCall({ submodule: "api", question: "Auth provider?", answer: "OAuth2" }, mockTheme);
+    const call = tool.renderCall(
+      { submodule: "api", question: "Auth provider?", answer: "OAuth2" },
+      mockTheme,
+    );
     expect(call.text).toContain("api");
     expect(call.text).toContain("Auth provider?");
     expect(call.text).toContain("OAuth2");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "answered" }], details: { remaining: 0 } },
+      {
+        content: [{ type: "text", text: "answered" }],
+        details: { remaining: 0 },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8718,13 +9166,19 @@ describe("custom tool rendering", () => {
 
   it("harness_queue renderCall/renderResult", () => {
     const tool = mock.getTool("harness_queue")!;
-    const call = tool.renderCall({ topic: "refactor-auth", role: "architect", priority: 5 }, mockTheme);
+    const call = tool.renderCall(
+      { topic: "refactor-auth", role: "architect", priority: 5 },
+      mockTheme,
+    );
     expect(call.text).toContain("refactor-auth");
     expect(call.text).toContain("architect");
     expect(call.text).toContain("p=5");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "queued" }], details: { queueLength: 3 } },
+      {
+        content: [{ type: "text", text: "queued" }],
+        details: { queueLength: 3 },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8734,12 +9188,18 @@ describe("custom tool rendering", () => {
 
   it("harness_send renderCall/renderResult", () => {
     const tool = mock.getTool("harness_send")!;
-    const call = tool.renderCall({ to: "manager", type: "directive" }, mockTheme);
+    const call = tool.renderCall(
+      { to: "manager", type: "directive" },
+      mockTheme,
+    );
     expect(call.text).toContain("manager");
     expect(call.text).toContain("directive");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "sent" }], details: { to: "manager", type: "directive" } },
+      {
+        content: [{ type: "text", text: "sent" }],
+        details: { to: "manager", type: "directive" },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
@@ -8761,7 +9221,16 @@ describe("custom tool rendering", () => {
 
     // With messages, expanded
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "msgs" }], details: { count: 2, messages: [{ type: "directive", from: "worker-a" }, { type: "status_report", from: "worker-b" }] } },
+      {
+        content: [{ type: "text", text: "msgs" }],
+        details: {
+          count: 2,
+          messages: [
+            { type: "directive", from: "worker-a" },
+            { type: "status_report", from: "worker-b" },
+          ],
+        },
+      },
       { expanded: true, isPartial: false },
       mockTheme,
     );
@@ -8771,7 +9240,10 @@ describe("custom tool rendering", () => {
 
   it("harness_remember renderCall/renderResult", () => {
     const tool = mock.getTool("harness_remember")!;
-    const call = tool.renderCall({ category: "decision", content: "Use OAuth2 for authentication" }, mockTheme);
+    const call = tool.renderCall(
+      { category: "decision", content: "Use OAuth2 for authentication" },
+      mockTheme,
+    );
     expect(call.text).toContain("decision");
     expect(call.text).toContain("Use OAuth2");
 
@@ -8786,7 +9258,10 @@ describe("custom tool rendering", () => {
 
   it("harness_recall renderCall/renderResult", () => {
     const tool = mock.getTool("harness_recall")!;
-    const call = tool.renderCall({ query: "auth patterns", limit: 5 }, mockTheme);
+    const call = tool.renderCall(
+      { query: "auth patterns", limit: 5 },
+      mockTheme,
+    );
     expect(call.text).toContain("auth patterns");
     expect(call.text).toContain("limit 5");
 
@@ -8800,7 +9275,16 @@ describe("custom tool rendering", () => {
 
     // With memories, expanded
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "ok" }], details: { count: 2, memories: [{ category: "decision", content: "Use OAuth" }, { category: "pattern", content: "Repository pattern" }] } },
+      {
+        content: [{ type: "text", text: "ok" }],
+        details: {
+          count: 2,
+          memories: [
+            { category: "decision", content: "Use OAuth" },
+            { category: "pattern", content: "Repository pattern" },
+          ],
+        },
+      },
       { expanded: true, isPartial: false },
       mockTheme,
     );
@@ -8810,7 +9294,10 @@ describe("custom tool rendering", () => {
 
   it("harness_send_message renderCall/renderResult", () => {
     const tool = mock.getTool("harness_send_message")!;
-    const call = tool.renderCall({ to: "worker-a", message: "Please review the PR", type: "directive" }, mockTheme);
+    const call = tool.renderCall(
+      { to: "worker-a", message: "Please review the PR", type: "directive" },
+      mockTheme,
+    );
     expect(call.text).toContain("worker-a");
     expect(call.text).toContain("directive");
     expect(call.text).toContain("Please review");
@@ -8849,11 +9336,681 @@ describe("custom tool rendering", () => {
     expect(call.text).toContain("developer");
 
     const res = tool.renderResult(
-      { content: [{ type: "text", text: "ok" }], details: { rating: 4, role: "developer" } },
+      {
+        content: [{ type: "text", text: "ok" }],
+        details: { rating: 4, role: "developer" },
+      },
       { expanded: false, isPartial: false },
       mockTheme,
     );
     expect(res.text).toContain("\u2605\u2605\u2605\u2605\u2606");
     expect(res.text).toContain("developer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session Backend: buildWorkerCommand tests
+// ---------------------------------------------------------------------------
+
+describe("buildWorkerCommand", () => {
+  it("pi backend default — no model flag", () => {
+    const result = buildWorkerCommand("pi", "");
+    expect(result).toBe('pi -p "$(cat .pi-agent-prompt.md)"');
+  });
+
+  it("pi backend with model flag", () => {
+    const result = buildWorkerCommand("pi", " --model gpt-4");
+    expect(result).toBe('pi --model gpt-4 -p "$(cat .pi-agent-prompt.md)"');
+  });
+
+  it("claude backend minimal — no config", () => {
+    const result = buildWorkerCommand("claude", "");
+    expect(result).toBe('claude -p "$(cat .pi-agent-prompt.md)"');
+  });
+
+  it("claude backend with model override", () => {
+    const result = buildWorkerCommand(
+      "claude",
+      "",
+      undefined,
+      "claude-sonnet-4-5-20250514",
+    );
+    expect(result).toContain("--model claude-sonnet-4-5-20250514");
+  });
+
+  it("claude backend with permissionMode", () => {
+    const config: ClaudeBackendConfig = { permissionMode: "bypassPermissions" };
+    const result = buildWorkerCommand("claude", "", config);
+    expect(result).toContain("--permission-mode bypassPermissions");
+  });
+
+  it("claude backend with maxBudgetUsd", () => {
+    const config: ClaudeBackendConfig = { maxBudgetUsd: 5 };
+    const result = buildWorkerCommand("claude", "", config);
+    expect(result).toContain("--max-budget-usd 5");
+  });
+
+  it("claude backend with allowedTools", () => {
+    const config: ClaudeBackendConfig = {
+      allowedTools: ["Read", "Write", "Bash"],
+    };
+    const result = buildWorkerCommand("claude", "", config);
+    expect(result).toContain("--allowedTools Read");
+    expect(result).toContain("--allowedTools Write");
+    expect(result).toContain("--allowedTools Bash");
+  });
+
+  it("claude backend with custom claudePath", () => {
+    const config: ClaudeBackendConfig = {
+      claudePath: "/usr/local/bin/claude-custom",
+    };
+    const result = buildWorkerCommand("claude", "", config);
+    expect(result).toMatch(/^\/usr\/local\/bin\/claude-custom -p/);
+  });
+
+  it("claude backend with mcpConfigFile", () => {
+    const result = buildWorkerCommand(
+      "claude",
+      "",
+      undefined,
+      undefined,
+      "/tmp/mcp.json",
+    );
+    expect(result).toContain("--mcp-config /tmp/mcp.json");
+  });
+
+  it("claude backend without mcpConfigFile — no MCP flags", () => {
+    const result = buildWorkerCommand("claude", "", undefined, undefined, null);
+    expect(result).not.toContain("--mcp-config");
+  });
+
+  it("claude backend model: claudeModel overrides config.model", () => {
+    const config: ClaudeBackendConfig = { model: "config-model" };
+    const result = buildWorkerCommand("claude", "", config, "override-model");
+    expect(result).toContain("--model override-model");
+    expect(result).not.toContain("config-model");
+  });
+
+  it("claude backend model: falls back to config.model when claudeModel undefined", () => {
+    const config: ClaudeBackendConfig = { model: "config-model" };
+    const result = buildWorkerCommand("claude", "", config, undefined);
+    expect(result).toContain("--model config-model");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session Backend: buildManagerLoopCommand tests
+// ---------------------------------------------------------------------------
+
+describe("buildManagerLoopCommand", () => {
+  it("pi backend — loop uses pi -p", () => {
+    const result = buildManagerLoopCommand(
+      "pi",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+    );
+    expect(result).toContain('pi -p "$(cat .pi-agent-prompt.md)";');
+    expect(result).toContain("consecutive_failures=0;");
+    expect(result).toContain("while true; do");
+  });
+
+  it("claude backend — loop uses claude -p", () => {
+    const result = buildManagerLoopCommand(
+      "claude",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+    );
+    expect(result).toContain('claude -p "$(cat .pi-agent-prompt.md)";');
+    expect(result).not.toContain("pi -p");
+  });
+
+  it("claude backend with model", () => {
+    const config: ClaudeBackendConfig = { model: "claude-sonnet-4-5-20250514" };
+    const result = buildManagerLoopCommand(
+      "claude",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+      config,
+    );
+    expect(result).toContain("--model claude-sonnet-4-5-20250514");
+  });
+
+  it("claude backend with mcpConfigFile", () => {
+    const result = buildManagerLoopCommand(
+      "claude",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+      undefined,
+      "/tmp/mcp.json",
+    );
+    expect(result).toContain("--mcp-config /tmp/mcp.json");
+  });
+
+  it("stop signal detection preserved in both backends", () => {
+    for (const backend of ["pi", "claude"] as SessionBackend[]) {
+      const result = buildManagerLoopCommand(
+        backend,
+        "/tmp/stop",
+        "/tmp/status.json",
+        "/tmp/errors.log",
+        60,
+        30,
+        5,
+        "",
+      );
+      expect(result).toContain("if [ -f");
+      expect(result).toContain("Stop signal detected");
+    }
+  });
+
+  it("error log uses correct binary name", () => {
+    const piResult = buildManagerLoopCommand(
+      "pi",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+    );
+    expect(piResult).toContain("pi exited with code");
+
+    const claudeResult = buildManagerLoopCommand(
+      "claude",
+      "/tmp/stop",
+      "/tmp/status.json",
+      "/tmp/errors.log",
+      60,
+      30,
+      5,
+      "",
+    );
+    expect(claudeResult).toContain("claude exited with code");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session Backend: buildMcpConfigForWorker tests
+// ---------------------------------------------------------------------------
+
+describe("buildMcpConfigForWorker", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "mcp-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns custom path when mcpConfigPath provided", async () => {
+    const result = await buildMcpConfigForWorker(
+      tmpDir,
+      undefined,
+      "/custom/mcp.json",
+    );
+    expect(result).toBe("/custom/mcp.json");
+  });
+
+  it("returns null when no MCP config file exists", async () => {
+    const result = await buildMcpConfigForWorker(tmpDir);
+    expect(result).toBeNull();
+  });
+
+  it("DEFAULT_CLAUDE_MCP_SERVERS has expected defaults", () => {
+    expect(DEFAULT_CLAUDE_MCP_SERVERS).toContain("context7");
+    expect(DEFAULT_CLAUDE_MCP_SERVERS).toContain("graphiti");
+    expect(DEFAULT_CLAUDE_MCP_SERVERS).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session Backend: validateRuntimeConfig — backend & claudeConfig fields
+// ---------------------------------------------------------------------------
+
+describe("validateRuntimeConfig — backend & claudeConfig", () => {
+  it('accepts backend "pi"', () => {
+    const result = validateRuntimeConfig({ backend: "pi" });
+    expect(result).toEqual({ backend: "pi" });
+  });
+
+  it('accepts backend "claude"', () => {
+    const result = validateRuntimeConfig({ backend: "claude" });
+    expect(result).toEqual({ backend: "claude" });
+  });
+
+  it("rejects invalid backend", () => {
+    expect(validateRuntimeConfig({ backend: "openai" })).toBeNull();
+    expect(validateRuntimeConfig({ backend: 123 })).toBeNull();
+  });
+
+  it("accepts claudeConfig with mcpServers array", () => {
+    const result = validateRuntimeConfig({
+      backend: "claude",
+      claudeConfig: {
+        model: "claude-sonnet-4-5-20250514",
+        mcpServers: ["context7", "graphiti"],
+      },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.claudeConfig!.mcpServers).toEqual(["context7", "graphiti"]);
+  });
+
+  it("rejects claudeConfig with non-object value", () => {
+    expect(validateRuntimeConfig({ claudeConfig: "string" })).toBeNull();
+    expect(validateRuntimeConfig({ claudeConfig: 42 })).toBeNull();
+    expect(validateRuntimeConfig({ claudeConfig: null })).toBeNull();
+  });
+
+  it("rejects claudeConfig with invalid model type", () => {
+    expect(validateRuntimeConfig({ claudeConfig: { model: 123 } })).toBeNull();
+  });
+
+  it("rejects claudeConfig with invalid mcpServers", () => {
+    expect(
+      validateRuntimeConfig({ claudeConfig: { mcpServers: "not-array" } }),
+    ).toBeNull();
+    expect(
+      validateRuntimeConfig({ claudeConfig: { mcpServers: [123] } }),
+    ).toBeNull();
+  });
+
+  it("accepts claudeConfig with maxBudgetUsd", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: { maxBudgetUsd: 5.5 },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.claudeConfig!.maxBudgetUsd).toBe(5.5);
+  });
+
+  it("rejects claudeConfig with non-positive maxBudgetUsd", () => {
+    expect(
+      validateRuntimeConfig({ claudeConfig: { maxBudgetUsd: 0 } }),
+    ).toBeNull();
+    expect(
+      validateRuntimeConfig({ claudeConfig: { maxBudgetUsd: -1 } }),
+    ).toBeNull();
+  });
+
+  it("accepts claudeConfig with allowedTools", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: { allowedTools: ["Read", "Write"] },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.claudeConfig!.allowedTools).toEqual(["Read", "Write"]);
+  });
+
+  it("backend + existing fields work together", () => {
+    const result = validateRuntimeConfig({
+      maxWorkers: 4,
+      staggerMs: 3000,
+      backend: "claude",
+      claudeConfig: { model: "test-model" },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.maxWorkers).toBe(4);
+    expect(result!.backend).toBe("claude");
+    expect(result!.claudeConfig!.model).toBe("test-model");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account Rotation
+// ---------------------------------------------------------------------------
+
+describe("getAvailableAccounts", () => {
+  const baseSequence: CcswitchSequence = {
+    activeAccountNumber: 1,
+    lastUpdated: "2025-01-01T00:00:00Z",
+    sequence: [1, 2, 3],
+    accounts: {
+      "1": { email: "a@test.com", uuid: "u1", added: "2025-01-01" },
+      "2": { email: "b@test.com", uuid: "u2", added: "2025-01-01" },
+      "3": { email: "c@test.com", uuid: "u3", added: "2025-01-01" },
+    },
+  };
+
+  it("returns accounts in sequence order", () => {
+    const accounts = getAvailableAccounts(baseSequence);
+    expect(accounts).toEqual([
+      { number: 1, email: "a@test.com", uuid: "u1" },
+      { number: 2, email: "b@test.com", uuid: "u2" },
+      { number: 3, email: "c@test.com", uuid: "u3" },
+    ]);
+  });
+
+  it("skips missing accounts in sequence", () => {
+    const seq: CcswitchSequence = {
+      ...baseSequence,
+      sequence: [1, 99, 3],
+    };
+    const accounts = getAvailableAccounts(seq);
+    expect(accounts.length).toBe(2);
+    expect(accounts[0].number).toBe(1);
+    expect(accounts[1].number).toBe(3);
+  });
+
+  it("returns empty for empty sequence", () => {
+    const seq: CcswitchSequence = {
+      ...baseSequence,
+      sequence: [],
+    };
+    expect(getAvailableAccounts(seq)).toEqual([]);
+  });
+});
+
+describe("resolveAccountForWorker", () => {
+  const accounts: CcswitchAccount[] = [
+    { number: 1, email: "a@test.com", uuid: "u1" },
+    { number: 2, email: "b@test.com", uuid: "u2" },
+    { number: 3, email: "c@test.com", uuid: "u3" },
+  ];
+
+  it("round-robin cycles through accounts", () => {
+    expect(resolveAccountForWorker(accounts, 0)?.number).toBe(1);
+    expect(resolveAccountForWorker(accounts, 1)?.number).toBe(2);
+    expect(resolveAccountForWorker(accounts, 2)?.number).toBe(3);
+  });
+
+  it("wraps around on overflow", () => {
+    expect(resolveAccountForWorker(accounts, 3)?.number).toBe(1);
+    expect(resolveAccountForWorker(accounts, 4)?.number).toBe(2);
+    expect(resolveAccountForWorker(accounts, 5)?.number).toBe(3);
+    expect(resolveAccountForWorker(accounts, 6)?.number).toBe(1);
+  });
+
+  it("skips accounts above usage threshold", () => {
+    const usage: UsageTrackingStore = {
+      version: 1,
+      accounts: [
+        {
+          accountNumber: 1,
+          email: "a@test.com",
+          totalCostUsd: 60,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 5,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+      ],
+      updatedAt: "2025-01-01",
+    };
+    // Account 1 is over $50 threshold → should be skipped
+    const result = resolveAccountForWorker(accounts, 0, usage, 50);
+    expect(result?.number).toBe(2); // first eligible below threshold
+  });
+
+  it("falls back to all accounts if all over threshold", () => {
+    const usage: UsageTrackingStore = {
+      version: 1,
+      accounts: [
+        {
+          accountNumber: 1,
+          email: "a@test.com",
+          totalCostUsd: 100,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 5,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+        {
+          accountNumber: 2,
+          email: "b@test.com",
+          totalCostUsd: 100,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 5,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+        {
+          accountNumber: 3,
+          email: "c@test.com",
+          totalCostUsd: 100,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 5,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+      ],
+      updatedAt: "2025-01-01",
+    };
+    // All over threshold → fallback to all
+    const result = resolveAccountForWorker(accounts, 0, usage, 50);
+    expect(result?.number).toBe(1);
+  });
+
+  it("returns null for empty accounts", () => {
+    expect(resolveAccountForWorker([], 0)).toBeNull();
+  });
+
+  it("works with single account", () => {
+    const single = [accounts[0]];
+    expect(resolveAccountForWorker(single, 0)?.number).toBe(1);
+    expect(resolveAccountForWorker(single, 1)?.number).toBe(1);
+    expect(resolveAccountForWorker(single, 99)?.number).toBe(1);
+  });
+
+  it("works with no usage store", () => {
+    const result = resolveAccountForWorker(accounts, 0, null, 50);
+    expect(result?.number).toBe(1);
+  });
+
+  it("ignores threshold of zero", () => {
+    const usage: UsageTrackingStore = {
+      version: 1,
+      accounts: [
+        {
+          accountNumber: 1,
+          email: "a@test.com",
+          totalCostUsd: 100,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 5,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+      ],
+      updatedAt: "2025-01-01",
+    };
+    // threshold 0 should be ignored (no filtering)
+    const result = resolveAccountForWorker(accounts, 0, usage, 0);
+    expect(result?.number).toBe(1);
+  });
+});
+
+describe("readCcswitchSequence", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "ccswitch-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reads valid sequence file", async () => {
+    const seqData: CcswitchSequence = {
+      activeAccountNumber: 1,
+      lastUpdated: "2025-01-01T00:00:00Z",
+      sequence: [1, 2],
+      accounts: {
+        "1": { email: "a@test.com", uuid: "u1", added: "2025-01-01" },
+        "2": { email: "b@test.com", uuid: "u2", added: "2025-01-01" },
+      },
+    };
+    const seqPath = join(tmpDir, "sequence.json");
+    await writeFile(seqPath, JSON.stringify(seqData));
+    const result = await readCcswitchSequence(seqPath);
+    expect(result).not.toBeNull();
+    expect(result!.sequence).toEqual([1, 2]);
+    expect(result!.accounts["1"].email).toBe("a@test.com");
+  });
+
+  it("returns null for missing file", async () => {
+    const result = await readCcswitchSequence(join(tmpDir, "nonexistent.json"));
+    expect(result).toBeNull();
+  });
+
+  it("returns null for malformed JSON", async () => {
+    const seqPath = join(tmpDir, "sequence.json");
+    await writeFile(seqPath, '{"sequence": "not-array"}');
+    const result = await readCcswitchSequence(seqPath);
+    expect(result).toBeNull();
+  });
+});
+
+describe("buildUsageReport", () => {
+  it("returns placeholder for empty store", () => {
+    const store: UsageTrackingStore = {
+      version: 1,
+      accounts: [],
+      updatedAt: "2025-01-01",
+    };
+    expect(buildUsageReport(store)).toBe("No account usage data yet.");
+  });
+
+  it("formats multiple accounts", () => {
+    const store: UsageTrackingStore = {
+      version: 1,
+      accounts: [
+        {
+          accountNumber: 1,
+          email: "a@test.com",
+          totalCostUsd: 12.5,
+          totalInputTokens: 1000,
+          totalOutputTokens: 2000,
+          sessionCount: 3,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+        {
+          accountNumber: 2,
+          email: "b@test.com",
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          sessionCount: 1,
+          lastUsedAt: "2025-01-01",
+          sessions: [],
+        },
+      ],
+      updatedAt: "2025-01-01",
+    };
+    const report = buildUsageReport(store);
+    expect(report).toContain(
+      "Account 1 (a@test.com): $12.50 across 3 session(s)",
+    );
+    expect(report).toContain(
+      "Account 2 (b@test.com): $0.00 across 1 session(s)",
+    );
+  });
+});
+
+describe("validateRuntimeConfig — accountRotation", () => {
+  it("accepts valid accountRotation config", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: {
+        accountRotation: {
+          enabled: true,
+          strategy: "round-robin",
+        },
+      },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.claudeConfig!.accountRotation!.enabled).toBe(true);
+    expect(result!.claudeConfig!.accountRotation!.strategy).toBe("round-robin");
+  });
+
+  it("accepts accountRotation with optional fields", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: {
+        accountRotation: {
+          enabled: true,
+          strategy: "round-robin",
+          usageThresholdUsd: 50.0,
+          ccswitchPath: "/usr/local/bin/ccswitch",
+        },
+      },
+    });
+    expect(result).toBeTruthy();
+    expect(result!.claudeConfig!.accountRotation!.usageThresholdUsd).toBe(50.0);
+    expect(result!.claudeConfig!.accountRotation!.ccswitchPath).toBe(
+      "/usr/local/bin/ccswitch",
+    );
+  });
+
+  it("rejects missing enabled field", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: {
+        accountRotation: {
+          strategy: "round-robin",
+        },
+      },
+    });
+    expect(result).toBeNull();
+  });
+
+  it("rejects invalid strategy", () => {
+    const result = validateRuntimeConfig({
+      claudeConfig: {
+        accountRotation: {
+          enabled: true,
+          strategy: "random",
+        },
+      },
+    });
+    expect(result).toBeNull();
+  });
+
+  it("rejects non-positive usageThresholdUsd", () => {
+    expect(
+      validateRuntimeConfig({
+        claudeConfig: {
+          accountRotation: {
+            enabled: true,
+            strategy: "round-robin",
+            usageThresholdUsd: 0,
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      validateRuntimeConfig({
+        claudeConfig: {
+          accountRotation: {
+            enabled: true,
+            strategy: "round-robin",
+            usageThresholdUsd: -5,
+          },
+        },
+      }),
+    ).toBeNull();
   });
 });
